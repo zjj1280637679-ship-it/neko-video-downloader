@@ -1,441 +1,264 @@
-// 🌸 喵喵切片合并下载姬 - HLS/m3u8 在线解析与合并核心
-// v1.1.0 全修版：AES-128 解密（#EXT-X-KEY）/ 选最高码率 / #EXT-X-MAP + BYTERANGE / 失败上报 / 流式写盘防 OOM
+/* Download UI: only report success after the file writer / Chrome finishes. */
+document.addEventListener("DOMContentLoaded", () => {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+  const sourceUrl = params.get("url") || "";
+  const title = params.get("title") || "视频";
+  let plan = null, controller = null, downloading = false, downloadId = null, objectUrl = null, selectedFile = null, savedBytes = 0;
+  const MEMORY_LIMIT = 256 * 1024 * 1024;
+  $("titleVal").textContent = title;
+  $("urlVal").textContent = sourceUrl || "未提供视频流地址";
+  $("btnStart").disabled = true;
 
-document.addEventListener("DOMContentLoaded", async () => {
-  const params = new URLSearchParams(window.location.search);
-  const m3u8Url = params.get("url") || "";
-  const videoTitle = params.get("title") || "动漫视频";
-
-  const titleVal = document.getElementById("titleVal");
-  const urlVal = document.getElementById("urlVal");
-  const segmentVal = document.getElementById("segmentVal");
-  const progressText = document.getElementById("progressText");
-  const percentText = document.getElementById("percentText");
-  const progressFill = document.getElementById("progressFill");
-  const statusMsg = document.getElementById("statusMsg");
-
-  const btnStart = document.getElementById("btnStart");
-  const btnDownloadM3U8 = document.getElementById("btnDownloadM3U8");
-  const btnCopyUrl = document.getElementById("btnCopyUrl");
-
-  titleVal.textContent = videoTitle;
-  urlVal.textContent = m3u8Url || "未提供 m3u8 地址";
-
-  if (!m3u8Url) {
-    statusMsg.textContent = "错误：缺少视频流地址参数喵 (T_T)";
-    btnStart.disabled = true;
-    return;
+  function setStatus(text, state = "ready") {
+    $("statusMsg").textContent = text;
+    $("statusMsg").dataset.state = state;
   }
-
-  let plan = null; // { segments, initSegments, isFmp4 }
-  let isDownloading = false;
-
-  // ---------- 小工具 ----------
-  function resolveUrl(relative, base) {
+  function setBusy(busy) {
+    downloading = busy;
+    $("btnStart").disabled = busy || !plan;
+    $("btnDownloadM3U8").disabled = busy || !sourceUrl;
+    if ($("btnCancel")) $("btnCancel").disabled = !busy;
+    if ($("btnRetryParse")) $("btnRetryParse").disabled = busy;
+  }
+  function updateProgress({ completed, total, bytes }, startedAt) {
+    savedBytes = bytes;
+    const percent = Math.floor(completed / total * 100);
+    $("progressFill").style.width = `${percent}%`;
+    $("progressFill").parentElement.setAttribute("aria-valuenow", percent);
+    $("percentText").textContent = `${percent}%`;
+    $("progressText").textContent = `${completed} / ${total} 个分片 · ${(bytes / 1048576).toFixed(1)} MB`;
+    if ($("statBytes")) $("statBytes").textContent = `${(bytes / 1048576).toFixed(1)} MB`;
+    if ($("statSpeed")) $("statSpeed").textContent = `${(bytes / 1048576 / Math.max(1, (performance.now() - startedAt) / 1000)).toFixed(1)} MB/s`;
+  }
+  function revokeObjectUrl() {
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    objectUrl = null;
+  }
+  async function parse() {
+    if (downloading) return;
+    plan = null;
+    controller?.abort();
+    controller = new AbortController();
+    const parseSignal = controller.signal;
+    $("btnStart").disabled = true;
+    if ($("btnRetryParse")) $("btnRetryParse").hidden = true;
+    setStatus("正在解析播放清单…", "loading");
     try {
-      return new URL(relative, base).href;
-    } catch (e) {
-      return relative;
+      const client = NekoHls.createClient({ signal: parseSignal, onVariant(variant, count) {
+        if (!parseSignal.aborted) setStatus(`检测到 ${count} 档画质，正在解析可完整保存的最高码率线路…`, "loading");
+      } });
+      const parsedPlan = await client.loadPlan(sourceUrl);
+      if (parseSignal.aborted) return;
+      plan = parsedPlan;
+      if (plan.isFmp4 && (plan.maps.size > 1 || plan.discontinuities)) throw new Error("此 fMP4 线路存在初始化段或时间轴切换，需要重新封装；请更换线路或使用外部下载工具");
+      const duration = Math.round(plan.totalDuration);
+      const time = `${Math.floor(duration / 60)} 分 ${duration % 60} 秒`;
+      const encrypted = plan.segments.some(segment => segment.key) ? " · AES-128" : "";
+      $("segmentVal").textContent = `${plan.segments.length} 个分片 · ${time} · ${plan.isFmp4 ? "MP4" : "TS"}${encrypted}`;
+      $("progressText").textContent = "准备下载";
+      setStatus(`清单已就绪。选择保存位置后开始下载。${plan.discontinuities ? "此线路存在时间轴切换，保存后请检查衔接处。" : ""}`);
+      $("btnStart").disabled = false;
+    } catch (error) {
+      if (error.name === "AbortError" || parseSignal.aborted) return;
+      plan = null;
+      $("segmentVal").textContent = "解析未完成";
+      setStatus(`解析失败：${error.message}`, "error");
+      if ($("btnRetryParse")) $("btnRetryParse").hidden = false;
     }
   }
-
-  // 解析 #EXT-X-KEY / #EXT-X-MAP / #EXT-X-STREAM-INF 这类 key=value 串，正确处理带引号的值
-  function parseAttributes(attrStr) {
-    const attrs = {};
-    const re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/g;
-    let m;
-    while ((m = re.exec(attrStr)) !== null) {
-      let v = m[2];
-      if (v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
-      attrs[m[1]] = v;
-    }
-    return attrs;
-  }
-
-  function hexToBytes(hex) {
-    const clean = String(hex).replace(/^0x/i, "");
-    const padded = clean.padStart(32, "0");
-    const out = new Uint8Array(16);
-    for (let i = 0; i < 16; i++) out[i] = parseInt(padded.slice(i * 2, i * 2 + 2), 16);
-    return out;
-  }
-
-  // HLS 规范：无 IV 时默认 IV = 分片序号的 128 位大端整数
-  function sequenceToIv(seq) {
-    const out = new Uint8Array(16);
-    let n = seq;
-    for (let i = 15; i >= 8; i--) {
-      out[i] = n & 0xff;
-      n = Math.floor(n / 256);
-    }
-    return out;
-  }
-
-  // 按字节范围拉取；服务器若无视 Range 返回 200 全量，则本地切片
-  async function fetchBytes(url, byteRange) {
-    const headers = {};
-    if (byteRange) {
-      headers.Range = `bytes=${byteRange.offset}-${byteRange.offset + byteRange.length - 1}`;
-    }
-    const res = await fetch(url, { headers });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const buf = await res.arrayBuffer();
-    if (byteRange && res.status === 200 && buf.byteLength > byteRange.length) {
-      return buf.slice(byteRange.offset, byteRange.offset + byteRange.length);
-    }
-    return buf;
-  }
-
-  // ---------- 密钥缓存 ----------
-  const keyCache = new Map(); // keyUri -> { bytes, cryptoKey }
-  async function getKey(keyUri) {
-    if (keyCache.has(keyUri)) return keyCache.get(keyUri);
-    const bytes = await fetchBytes(keyUri, null);
-    if (bytes.byteLength !== 16) {
-      throw new Error(`密钥长度异常（${bytes.byteLength} 字节，应为 16）：${keyUri}`);
-    }
-    const cryptoKey = await crypto.subtle.importKey("raw", bytes, { name: "AES-CBC" }, false, ["decrypt"]);
-    const entry = { bytes, cryptoKey };
-    keyCache.set(keyUri, entry);
-    return entry;
-  }
-
-  // ---------- 播放清单规划 ----------
-  // 返回 { segments: [{url, key, iv, mapUri, byteRange, sequence, discontinuity}],
-  //         initSegments: Map(mapUri -> ArrayBuffer), isFmp4 }
-  async function planPlaylist(targetUrl) {
-    const resp = await fetch(targetUrl);
-    if (!resp.ok) throw new Error(`拉取清单失败 HTTP ${resp.status}：${targetUrl}`);
-    const text = await resp.text();
-    const lines = text.split(/\r?\n/).map((l) => l.trim());
-
-    // Master Playlist：收集全部变体，取 BANDWIDTH 最大者（旧版取第一个，常为最低档）
-    if (text.includes("#EXT-X-STREAM-INF")) {
-      const variants = [];
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].startsWith("#EXT-X-STREAM-INF")) {
-          const attrs = parseAttributes(lines[i].slice("#EXT-X-STREAM-INF:".length));
-          let uri = attrs.URI || "";
-          if (!uri) {
-            for (let j = i + 1; j < lines.length; j++) {
-              if (lines[j] && !lines[j].startsWith("#")) {
-                uri = lines[j];
-                break;
-              }
-            }
-          }
-          if (uri) {
-            variants.push({
-              uri: resolveUrl(uri, targetUrl),
-              bandwidth: parseInt(attrs.BANDWIDTH || "0", 10) || 0
-            });
-          }
-        }
-      }
-      if (variants.length === 0) throw new Error("多码率清单中未找到可用变体");
-      variants.sort((a, b) => b.bandwidth - a.bandwidth);
-      statusMsg.textContent = `检测到 ${variants.length} 档码率，自动选最高画质（${variants[0].bandwidth} bps）... (✧ω✧)`;
-      return await planPlaylist(variants[0].uri);
-    }
-
-    // Media Playlist：逐行走状态机
-    const segments = [];
-    const initSegments = new Map();
-    let isFmp4 = false;
-    let sequence = 0;
-    let curKey = null; // { method, uri, keyEntry, ivHex }
-    let curMapUri = null;
-    let pendingByteRange = null; // { length, offset|null }
-    const lastOffsetByUri = new Map();
-    let discontinuity = false;
-
-    for (const line of lines) {
-      if (line.startsWith("#EXT-X-MEDIA-SEQUENCE")) {
-        sequence = parseInt(line.split(":")[1], 10) || 0;
-      } else if (line.startsWith("#EXT-X-KEY")) {
-        const attrs = parseAttributes(line.slice("#EXT-X-KEY:".length));
-        const method = (attrs.METHOD || "NONE").toUpperCase();
-        if (method === "NONE") {
-          curKey = null;
-        } else if (method === "AES-128") {
-          if (attrs.KEYFORMAT && attrs.KEYFORMAT !== "identity") {
-            throw new Error(`不支持的密钥格式 KEYFORMAT=${attrs.KEYFORMAT}`);
-          }
-          const keyUri = resolveUrl(attrs.URI, targetUrl);
-          // 密钥拉不到就直接报错，别等下到一半才炸
-          const keyEntry = await getKey(keyUri);
-          curKey = { method, uri: keyUri, keyEntry, ivHex: attrs.IV || null };
-        } else {
-          throw new Error(`不支持的加密方式 METHOD=${method}（仅支持 AES-128；SAMPLE-AES 需 transmux，暂不支持）`);
-        }
-      } else if (line.startsWith("#EXT-X-MAP")) {
-        const attrs = parseAttributes(line.slice("#EXT-X-MAP:".length));
-        curMapUri = resolveUrl(attrs.URI, targetUrl);
-        isFmp4 = true;
-        if (!initSegments.has(curMapUri)) {
-          let br = null;
-          if (attrs.BYTERANGE) {
-            const parts = attrs.BYTERANGE.split("@");
-            br = { length: parseInt(parts[0], 10), offset: parts[1] !== undefined ? parseInt(parts[1], 10) : 0 };
-          }
-          initSegments.set(curMapUri, await fetchBytes(curMapUri, br));
-        }
-      } else if (line.startsWith("#EXT-X-BYTERANGE")) {
-        const spec = line.slice("#EXT-X-BYTERANGE:".length).trim();
-        const parts = spec.split("@");
-        pendingByteRange = {
-          length: parseInt(parts[0], 10),
-          offset: parts[1] !== undefined ? parseInt(parts[1], 10) : null
-        };
-      } else if (line.startsWith("#EXT-X-DISCONTINUITY")) {
-        discontinuity = true;
-      } else if (line && !line.startsWith("#")) {
-        const url = resolveUrl(line, targetUrl);
-        let byteRange = null;
-        if (pendingByteRange) {
-          let offset = pendingByteRange.offset;
-          if (offset === null) offset = lastOffsetByUri.get(url) || 0;
-          byteRange = { length: pendingByteRange.length, offset };
-          lastOffsetByUri.set(url, offset + pendingByteRange.length);
-          pendingByteRange = null;
-        }
-        const iv = curKey ? (curKey.ivHex ? hexToBytes(curKey.ivHex) : sequenceToIv(sequence)) : null;
-        segments.push({ url, key: curKey, iv, mapUri: curMapUri, byteRange, sequence, discontinuity });
-        if (discontinuity) discontinuity = false;
-        sequence++;
-      }
-    }
-
-    // 无 MAP 的 .m4s 流同样是 fMP4（只是缺初始化段，合并后可能播不了，下方会提示）
-    if (!isFmp4 && segments.some((s) => /\.m4s($|\?)/i.test(s.url))) isFmp4 = true;
-
-    return { segments, initSegments, isFmp4 };
-  }
-
-  async function decryptSegment(buffer, seg) {
-    if (!seg.key) return buffer;
-    try {
-      return await crypto.subtle.decrypt({ name: "AES-CBC", iv: seg.iv }, seg.key.keyEntry.cryptoKey, buffer);
-    } catch (e) {
-      throw new Error(`AES-128 解密失败（分片 #${seg.sequence}）：${e.message}`);
-    }
-  }
-
-  // ---------- 初始解析 ----------
-  statusMsg.textContent = "正在拉取 m3u8 播放清单喵... (◕ᴗ◕✿)";
-  try {
-    plan = await planPlaylist(m3u8Url);
-  } catch (err) {
-    console.error(err);
-    statusMsg.textContent = "解析清单失败: " + err.message + "，请尝试复制直链用外部工具下载喵~";
-    btnStart.disabled = true;
-    plan = { segments: [], initSegments: new Map(), isFmp4: false };
-  }
-
-  if (plan.segments.length > 0) {
-    const encNote = plan.segments.some((s) => s.key) ? "（AES-128 加密，已备好密钥解密）" : "";
-    const mapNote = plan.isFmp4 ? "（fMP4，含初始化段）" : "";
-    segmentVal.textContent = `共解析到 ${plan.segments.length} 个切片${encNote}${mapNote} (预计可合并完整播放)`;
-    statusMsg.textContent = `(=^･ω･^=) 切片清单已准备完毕，共 ${plan.segments.length} 个分段，快点击下载吧！`;
-    if (plan.isFmp4 && plan.initSegments.size === 0) {
-      statusMsg.textContent += " ⚠️ 未检测到初始化段（#EXT-X-MAP），合并后可能无法播放。";
-    }
-  } else {
-    segmentVal.textContent = "未能解析出切片列表 (可能是跨域或密钥限制)";
-    btnStart.disabled = true;
-  }
-
-  // 复制直链按钮
-  btnCopyUrl.addEventListener("click", () => {
-    navigator.clipboard.writeText(m3u8Url).then(() => {
-      alert("📋 视频直链已成功复制喵！(｡♥‿♥｡)\n可以直接粘贴进 PotPlayer / VLC 播放~");
+  function chromeDownload(url, filename) {
+    return new Promise((resolve, reject) => {
+      chrome.downloads.download({ url, filename, saveAs: true }, id => {
+        const error = chrome.runtime.lastError;
+        if (error || id === undefined) reject(new Error(error?.message || "Chrome 未创建下载任务"));
+        else resolve(id);
+      });
     });
-  });
-
-  // 仅下载 m3u8 文件
-  btnDownloadM3U8.addEventListener("click", () => {
-    chrome.downloads.download({
-      url: m3u8Url,
-      filename: `${videoTitle}.m3u8`,
-      saveAs: true
-    });
-  });
-
-  // 按顺序组装 Blob 回退路径的分段（含 MAP 变化时插入新初始化段）
-  function buildBlobParts(chunks, total) {
-    const parts = [];
-    let lastMap = null;
-    for (let i = 0; i < total; i++) {
-      const seg = plan.segments[i];
-      if (plan.isFmp4 && seg.mapUri && seg.mapUri !== lastMap) {
-        const init = plan.initSegments.get(seg.mapUri);
-        if (init) parts.push(init);
-        lastMap = seg.mapUri;
-      }
-      parts.push(chunks[i] || new ArrayBuffer(0));
-    }
-    return parts;
   }
-
-  // 核心：并发分片下载并合并
-  btnStart.addEventListener("click", async () => {
-    if (isDownloading || !plan || plan.segments.length === 0) return;
-    isDownloading = true;
-    btnStart.disabled = true;
-    btnDownloadM3U8.disabled = true;
-
-    const total = plan.segments.length;
-    const ext = plan.isFmp4 ? "mp4" : "ts";
-    const filename = `${videoTitle}.${ext}`;
-    let completed = 0;
-    const failed = []; // { index, url, error }：失败不再静默填 0 字节了事
-    let totalBytes = 0;
-    const chunks = new Array(total);
-
-    statusMsg.textContent = "正在飞速搬运切片中，请保持网页开启喵... (づ｡◕‿‿◕｡)づ";
-
-    function updateProgress() {
-      const percent = Math.floor((completed / total) * 100);
-      progressFill.style.width = `${percent}%`;
-      percentText.textContent = `${percent}%`;
-      const mb = (totalBytes / (1024 * 1024)).toFixed(1);
-      const failNote = failed.length ? `，${failed.length} 个失败` : "";
-      progressText.textContent = `已完成 ${completed} / ${total} 个切片 (${mb} MB${failNote})`;
-    }
-
-    // ---- 写盘：优先流式写盘（File System Access API），不可用时回退内存 Blob ----
-    let writer = null;
-    let useStreaming = false;
-    try {
-      if (typeof window.showSaveFilePicker === "function") {
-        const handle = await window.showSaveFilePicker({ suggestedName: filename });
-        writer = await handle.createWritable();
-        useStreaming = true;
-      }
-    } catch (e) {
-      console.warn("流式写盘不可用，回退内存合并：", e);
-      statusMsg.textContent = "未能打开保存框，改用内存合并（大文件可能占内存）喵...";
-    }
-
-    // 顺序写盘：只允许一个 drain 在跑（写盘顺序 = 分片顺序），写完立即释放内存
-    let nextToWrite = 0;
-    let lastMapWritten = null;
-    let writeChain = Promise.resolve();
-    async function drainWriter() {
-      while (useStreaming && nextToWrite < total && chunks[nextToWrite] !== undefined) {
-        const idx = nextToWrite++;
-        const seg = plan.segments[idx];
-        const buf = chunks[idx];
-        chunks[idx] = undefined;
-        if (plan.isFmp4 && seg.mapUri && seg.mapUri !== lastMapWritten) {
-          const init = plan.initSegments.get(seg.mapUri);
-          if (init) await writer.write(init);
-          lastMapWritten = seg.mapUri;
-        }
-        if (buf.byteLength > 0) await writer.write(buf);
-      }
-    }
-    function scheduleDrain() {
-      writeChain = writeChain.then(drainWriter);
-      return writeChain;
-    }
-
-    // 带重试的切片抓取（含解密）
-    async function fetchSegment(seg, index, retries = 3) {
-      for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-          const raw = await fetchBytes(seg.url, seg.byteRange);
-          const plain = await decryptSegment(raw, seg);
-          chunks[index] = plain;
-          completed++;
-          totalBytes += plain.byteLength;
-          updateProgress();
-          if (useStreaming) await scheduleDrain();
-          return;
-        } catch (err) {
-          if (attempt === retries) {
-            console.error(`切片 ${index} 下载失败:`, err);
-            failed.push({ index, url: seg.url, error: err.message });
-            chunks[index] = new ArrayBuffer(0); // 占位保序，失败清单最后如实上报
-            completed++;
-            updateProgress();
-            if (useStreaming) await scheduleDrain();
-          } else {
-            await new Promise((r) => setTimeout(r, 800));
-          }
-        }
-      }
-    }
-
-    // 控制并发数（5个并发通道，既迅速又不会触发反爬风控）
-    const CONCURRENCY = 5;
-    let currentIdx = 0;
-
-    async function worker() {
-      while (currentIdx < total) {
-        const idx = currentIdx++;
-        await fetchSegment(plan.segments[idx], idx);
-      }
-    }
-
-    const workers = [];
-    for (let i = 0; i < Math.min(CONCURRENCY, total); i++) {
-      workers.push(worker());
-    }
-
-    await Promise.all(workers);
-    await writeChain; // 确保写盘全部落盘
-
-    statusMsg.textContent = "✨ 正在将所有分段无损合成单个视频文件喵... (✧ω✧)";
-    progressText.textContent = "合成中，请稍候...";
-
-    // 汇总失败报告：全部成功 / 部分失败 / 全部失败，三种口径分开说
-    function failureReport() {
-      if (failed.length === 0) return "";
-      const shown = failed.slice(0, 10).map((f) => `#${f.index}`).join("、");
-      const more = failed.length > 10 ? ` 等共 ${failed.length} 个` : "";
-      return ` ⚠️ 有 ${failed.length} 个切片下载失败（${shown}${more}），对应位置会卡顿/缺失，可重试下载。`;
-    }
-
-    try {
-      if (useStreaming) {
-        await writer.close();
-      } else {
-        const mergedBlob = new Blob(buildBlobParts(chunks, total), {
-          type: plan.isFmp4 ? "video/mp4" : "video/mp2t"
+  function waitForDownload(id, signal) {
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      const cleanup = () => { chrome.downloads.onChanged.removeListener(changed); signal.removeEventListener("abort", abort); };
+      const finish = error => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        error ? reject(error) : resolve();
+      };
+      const changed = delta => {
+        if (delta.id !== id) return;
+        if (delta.state?.current === "complete") finish();
+        if (delta.state?.current === "interrupted") finish(new Error(`保存中断：${delta.error?.current || "请重试"}`));
+      };
+      const abort = () => {
+        chrome.downloads.cancel(id, () => {
+          void chrome.runtime.lastError;
+          finish(new DOMException("下载已取消", "AbortError"));
         });
-        const blobUrl = URL.createObjectURL(mergedBlob);
-        const a = document.createElement("a");
-        a.href = blobUrl;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setTimeout(() => {
-          URL.revokeObjectURL(blobUrl);
-        }, 60000);
+      };
+      chrome.downloads.onChanged.addListener(changed);
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) return abort();
+      chrome.downloads.search({ id }, items => {
+        const error = chrome.runtime.lastError;
+        if (error) return finish(new Error(error.message));
+        const item = items?.[0];
+        if (!item) return finish(new Error("找不到 Chrome 下载任务"));
+        if (item.state === "complete") finish();
+        else if (item.state === "interrupted") finish(new Error(`保存中断：${item.error || "请重试"}`));
+      });
+    });
+  }
+  $("btnStart").addEventListener("click", async () => {
+    if (downloading || !plan) return;
+    setBusy(true);
+    controller = new AbortController();
+    const signal = controller.signal;
+    selectedFile = null;
+    downloadId = null;
+    savedBytes = 0;
+    if ($("btnReveal")) $("btnReveal").hidden = true;
+    const filename = NekoHls.safeFilename(title, plan.isFmp4 ? "mp4" : "ts");
+    const startedAt = performance.now();
+    updateProgress({ completed: 0, total: plan.segments.length, bytes: 0 }, startedAt);
+    let writer = null;
+    let temporaryDirectory = null, temporaryName = null, temporaryFile = null;
+    const memoryParts = [];
+    let memoryBytes = 0;
+    try {
+      // Preserve user activation. Cancelling this dialog cancels the operation.
+      if (typeof window.showSaveFilePicker === "function") {
+        try {
+          selectedFile = await window.showSaveFilePicker({ suggestedName: filename, types: [{ description: "视频文件", accept: { [plan.isFmp4 ? "video/mp4" : "video/mp2t"]: [plan.isFmp4 ? ".mp4" : ".ts"] } }] });
+        } catch (error) {
+          // Some extension contexts expose the method but cannot show a picker.
+          // Only unsupported-context failures may fall back; cancellation and
+          // all permission / actual write errors remain terminal.
+          if (!["NotSupportedError", "SecurityError"].includes(error.name)) throw error;
+          selectedFile = null;
+        }
+        if (signal.aborted) throw new DOMException("下载已取消", "AbortError");
+        if (selectedFile) writer = await selectedFile.createWritable();
       }
-
-      if (failed.length === total) {
-        statusMsg.textContent = "下载失败：全部切片都拉取失败，请检查网络或换线路重试喵 (T_T)";
-        progressFill.style.background = "#F44336";
-      } else if (failed.length > 0) {
-        statusMsg.innerHTML =
-          "🎉 <b>下载完成，但有缺失！</b> 文件已保存为 <code>" + filename + "</code> 喵！" + failureReport();
-        progressFill.style.background = "#FF9800";
-        progressText.textContent = `已全部完成 (${(totalBytes / (1024 * 1024)).toFixed(1)} MB)，${failed.length} 个切片失败`;
+      // Extension contexts may not support the user-facing picker. OPFS keeps
+      // large downloads on disk until Chrome has copied the completed file to
+      // the chosen destination. Never enumerate or remove other tasks' files.
+      if (!writer && typeof navigator.storage?.getDirectory === "function") {
+        try { temporaryDirectory = await navigator.storage.getDirectory(); }
+        catch (error) {
+          if (error.name !== "NotSupportedError") throw error;
+        }
+        if (temporaryDirectory) {
+          temporaryName = `neko-download-${crypto.randomUUID()}.part`;
+          temporaryFile = await temporaryDirectory.getFileHandle(temporaryName, { create: true });
+          writer = await temporaryFile.createWritable();
+        }
+      }
+      if (signal.aborted) throw new DOMException("下载已取消", "AbortError");
+      const sink = writer || { async write(bytes) {
+        memoryBytes += bytes.byteLength;
+        if (memoryBytes > MEMORY_LIMIT) throw new Error("当前浏览器无法流式写盘，已达到 256 MB 内存上限。请使用支持保存位置选择的 Chrome，或复制直链到外部下载工具");
+        memoryParts.push(bytes);
+      } };
+      const client = NekoHls.createClient({ signal, onRetry({ attempt }) {
+        setStatus(`网络请求暂时失败，正在第 ${attempt} 次重试…`, "downloading");
+      } });
+      setStatus(temporaryFile ? "正在下载并写入临时文件，完成后选择保存位置。请保持此标签页开启。" : writer ? "正在下载并按顺序写入文件，请保持此标签页开启。" : "正在下载，当前使用内存保存（上限 256 MB）。", "downloading");
+      await client.download(plan, sink, progress => updateProgress(progress, startedAt));
+      if (signal.aborted) throw new DOMException("下载已取消", "AbortError");
+      setStatus("分片已全部接收，正在完成文件保存…", "downloading");
+      if (writer) {
+        await writer.close();
+        writer = null;
+        const file = await (temporaryFile || selectedFile).getFile();
+        if (file.size !== savedBytes) throw new Error("保存后的文件大小与下载数据不一致");
+        if (temporaryFile) {
+          if (signal.aborted) throw new DOMException("下载已取消", "AbortError");
+          objectUrl = URL.createObjectURL(file);
+          downloadId = await chromeDownload(objectUrl, filename);
+          await waitForDownload(downloadId, signal);
+          revokeObjectUrl();
+        }
       } else {
-        statusMsg.innerHTML =
-          "🎉 <b>下载大成功！</b> 文件已保存为 <code>" + filename + "</code> 喵！(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧<br>常见播放器（PotPlayer、VLC、Windows播放器）均可直接流畅播放哦~";
-        progressFill.style.background = "#4CAF50";
-        progressText.textContent = `已全部完成 (${(totalBytes / (1024 * 1024)).toFixed(1)} MB)`;
+        const blob = new Blob(memoryParts, { type: plan.isFmp4 ? "video/mp4" : "video/mp2t" });
+        memoryParts.length = 0;
+        objectUrl = URL.createObjectURL(blob);
+        downloadId = await chromeDownload(objectUrl, filename);
+        await waitForDownload(downloadId, signal);
+        revokeObjectUrl();
       }
-    } catch (e) {
-      statusMsg.textContent = "合并文件出错: " + e.message;
+      setStatus(`已保存：${filename} · ${(savedBytes / 1048576).toFixed(1)} MB。全部 ${plan.segments.length} 个分片下载成功。`, "success");
+      if ($("btnReveal")) {
+        $("btnReveal").hidden = false;
+        $("btnReveal").textContent = downloadId === null ? "检查已保存文件" : "在文件夹中显示";
+      }
+    } catch (error) {
+      if (writer) { try { await writer.abort(); } catch { /* Already closed or disk unavailable. */ } }
+      const cancelled = error.name === "AbortError" || signal.aborted;
+      const reason = error.name === "QuotaExceededError" ? "临时存储空间不足，请释放磁盘空间后重试" : error.message;
+      setStatus(cancelled ? "下载已取消。可重新开始。" : `下载未完成：${reason}。本次下载未标记为完成。`, cancelled ? "cancelled" : "error");
+      revokeObjectUrl();
+      selectedFile = null;
     } finally {
-      btnStart.disabled = false;
-      btnDownloadM3U8.disabled = false;
-      isDownloading = false;
+      memoryParts.length = 0;
+      if (temporaryDirectory && temporaryName && temporaryFile) {
+        try { await temporaryDirectory.removeEntry(temporaryName); }
+        catch (error) {
+          if (error.name !== "NotFoundError") {
+            console.warn("本次下载的临时文件未能清理：", error);
+            $("statusMsg").textContent += " 临时下载缓存未能清理。";
+          }
+        }
+      }
+      setBusy(false);
     }
   });
+  $("btnCancel")?.addEventListener("click", () => controller?.abort(new DOMException("下载已取消", "AbortError")));
+  $("btnRetryParse")?.addEventListener("click", parse);
+  $("btnCopyUrl").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(sourceUrl); setStatus(downloading ? "视频流地址已复制，下载正在继续。" : "视频流地址已复制。", downloading ? "downloading" : "ready"); }
+    catch (error) { setStatus(`复制失败：${error.message}${downloading ? "。下载仍在继续。" : ""}`, downloading ? "downloading" : "error"); }
+  });
+  $("btnDownloadM3U8").addEventListener("click", async () => {
+    if (downloading || !sourceUrl) return;
+    setBusy(true);
+    controller?.abort();
+    controller = new AbortController();
+    const signal = controller.signal;
+    let manifestObjectUrl = null;
+    try {
+      setStatus("正在准备播放清单并转换资源地址…", "downloading");
+      const result = await NekoHls.createClient({ signal }).request(sourceUrl, null, true);
+      const content = NekoHls.absolutizePlaylist(result.text, result.url);
+      manifestObjectUrl = URL.createObjectURL(new Blob([content], { type: "application/vnd.apple.mpegurl" }));
+      if (signal.aborted) throw new DOMException("下载已取消", "AbortError");
+      const id = await chromeDownload(manifestObjectUrl, NekoHls.safeFilename(title, "m3u8"));
+      await waitForDownload(id, signal);
+      setStatus("播放清单已保存，资源地址已转换为完整网址。清单不包含视频数据，播放时仍需联网。", "success");
+    } catch (error) {
+      const cancelled = error.name === "AbortError" || signal.aborted;
+      setStatus(cancelled ? "清单保存已取消。" : `清单保存未完成：${error.message}`, cancelled ? "cancelled" : "error");
+    } finally {
+      if (manifestObjectUrl) URL.revokeObjectURL(manifestObjectUrl);
+      setBusy(false);
+      if (!plan && $("btnRetryParse")) $("btnRetryParse").hidden = false;
+    }
+  });
+  $("btnReveal")?.addEventListener("click", async () => {
+    if (downloadId !== null) { chrome.downloads.show(downloadId); return; }
+    try {
+      if (!selectedFile) return;
+      const file = await selectedFile.getFile();
+      setStatus(`文件检查通过：${file.name} · ${(file.size / 1048576).toFixed(1)} MB。请在选择的保存文件夹中用播放器打开。`, "success");
+    } catch (error) { setStatus(`无法打开文件：${error.message}`, "error"); }
+  });
+  window.addEventListener("beforeunload", event => {
+    if (!downloading) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
+  if (sourceUrl) parse();
+  else { setBusy(false); setStatus("缺少视频流地址，请从插件中选择视频重新打开。", "error"); }
 });

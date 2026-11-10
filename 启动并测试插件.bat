@@ -1,22 +1,25 @@
 @echo off
 chcp 65001 >nul
-title 🌸 喵喵视频下载姬 - 快捷启动测试
+title 喵喵视频下载姬 - 打开测试页
 echo.
-echo ========================================================
-echo    🌸 正在启动加载了【喵喵视频下载姬】的 Google Chrome...
-echo    🎯 目标实验网页: https://www1.ikanbot.com/play/1027358
-echo ========================================================
+echo 喵喵视频下载姬 v1.2.0
+echo 扩展目录：%~dp0
 echo.
-
-set EXT_PATH=%~dp0
-:: 去掉末尾反斜杠
-set EXT_PATH=%EXT_PATH:~0,-1%
-
-start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --load-extension="%EXT_PATH%" --new-window "https://www1.ikanbot.com/play/1027358"
-
-echo Chrome 已启动！请在打开的页面中：
-echo 1. 点击网页中的播放按钮播放视频
-echo 2. 点击浏览器右上角拼图图标或插件图标【🌸 喵喵视频下载姬】
-echo 3. 即可看到捕获的 m3u8 流媒体，支持一键合并下载或复制直链！
+echo 初次安装：在 Chrome 地址栏输入 chrome://extensions/
+echo 开启开发者模式，点击“加载已解压的扩展程序”，选择以上目录。
+echo 更新安装：在同一页面点击扩展卡片上的“重新加载”。
+echo 然后刷新视频页，播放视频，再打开扩展。
 echo.
+echo Chrome 137 起不再支持 --load-extension 自动加载参数。
+echo 本脚本只打开测试页，不会声称扩展已经安装。
+echo.
+set "NEKO_CHROME=%ProgramFiles%\Google\Chrome\Application\chrome.exe"
+if not exist "%NEKO_CHROME%" set "NEKO_CHROME=%LocalAppData%\Google\Chrome\Application\chrome.exe"
+if not exist "%NEKO_CHROME%" set "NEKO_CHROME=%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"
+if not exist "%NEKO_CHROME%" (
+  echo 未找到 Chrome，请手动打开 https://www1.ikanbot.com/play/1027358
+  pause
+  exit /b 1
+)
+start "" "%NEKO_CHROME%" "https://www1.ikanbot.com/play/1027358"
 pause

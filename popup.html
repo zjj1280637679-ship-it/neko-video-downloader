@@ -8,65 +8,41 @@
 </head>
 <body>
   <div class="app-container">
-    <!-- 头部可爱猫耳导航栏 -->
     <header class="header">
-      <div class="cat-ears">
-        <span class="ear left-ear"></span>
-        <span class="ear right-ear"></span>
-      </div>
-      <div class="title-row">
-        <span class="sparkle">✨</span>
-        <h1 class="title">喵喵视频下载姬</h1>
-        <span class="sparkle">✨</span>
-      </div>
-      <p class="subtitle">(◕ᴗ◕✿) 为你捕捉每一帧心动~</p>
+      <div class="brand-mark" aria-hidden="true"><img src="icons/icon48.png" alt=""></div>
+      <div><p class="eyebrow">NEKO · VIDEO COMPANION</p><h1>喵喵视频下载姬</h1><p class="subtitle">把喜欢的画面，好好收藏。</p></div>
+      <span class="header-flower" aria-hidden="true">✿</span>
     </header>
-
-    <!-- 当前网页信息条 -->
-    <div class="page-bar">
-      <span class="page-icon">🌐</span>
-      <span class="page-title" id="pageTitle">正在连接网页...</span>
+    <section class="page-bar" aria-label="当前网页">
+      <span class="page-icon" aria-hidden="true">↗</span>
+      <div class="page-copy"><span class="section-label">当前网页</span><p class="page-title" id="pageTitle">正在连接网页…</p></div>
+    </section>
+    <div class="status-bar" id="statusBar" data-state="loading">
+      <span class="status-radar" aria-hidden="true"></span>
+      <span id="statusText" role="status" aria-live="polite">正在读取视频来源…</span>
+      <button class="btn-icon" id="btnRefresh" title="重新读取视频列表" aria-label="重新读取视频列表">↻</button>
     </div>
-
-    <!-- 极速捕捉状态条 -->
-    <div class="status-bar" id="statusBar">
-      <div class="status-left">
-        <span class="status-radar"></span>
-        <span id="statusText">正在捕捉视频信号中喵... (✧ω✧)</span>
-      </div>
-      <button class="btn-icon" id="btnRefresh" title="强制刷新">🔄</button>
+    <section id="downloadSection" class="download-section" aria-label="最近下载" hidden><div id="downloadList"></div></section>
+    <div class="list-toolbar" id="listToolbar" hidden>
+      <label class="search-wrap"><span aria-hidden="true">⌕</span><input id="mediaSearch" type="search" placeholder="搜索文件名或来源" aria-label="搜索文件名或来源" autocomplete="off"></label>
+      <span id="sourceCount" class="source-count"></span>
     </div>
-
-    <!-- 视频列表容器 -->
-    <main class="media-list" id="mediaList">
-      <!-- 动态渲染 -->
-    </main>
-
-    <!-- 底部可爱版权/提示 -->
-    <footer class="footer">
-      <span>(=^･ω･^=) 极速高频嗅探中 · 仅供学习交流使用哦</span>
-    </footer>
+    <main class="media-list" id="mediaList" aria-label="视频来源"></main>
+    <section class="frames-section" id="framesSection" hidden aria-label="当前网页画面">
+      <div class="frames-header"><span>当前网页画面 <small id="framesCount"></small></span><button class="btn-snap" id="btnSnap">抓拍一帧</button></div>
+      <div class="frames-scroll" id="framesList"></div>
+      <p class="frames-empty-hint" id="framesHint">播放后可抓拍；部分跨域视频不允许截图。</p>
+    </section>
+    <footer class="footer"><span class="footer-cat" aria-hidden="true">(=^･ω･^=)</span><span>先播放，再选择来源下载</span></footer>
   </div>
-
-  <!-- 截图大图预览弹窗 -->
-  <div class="modal" id="imageModal">
+  <div class="modal" id="imageModal" role="dialog" aria-modal="true" aria-labelledby="modalTimeTag" hidden>
     <div class="modal-content">
-      <div class="modal-header">
-        <span class="modal-title" id="modalTimeTag">⏱️ 截屏时间: 00:00</span>
-        <button class="modal-close" id="modalClose">✕</button>
-      </div>
-      <img id="modalImg" class="modal-img" src="" alt="截屏预览">
-      <div class="modal-actions">
-        <button class="btn btn-primary" id="btnSaveFrame">
-          <span>💾</span> 保存该帧截图 (JPG)
-        </button>
-      </div>
+      <div class="modal-header"><span id="modalTimeTag">画面预览</span><button class="btn-icon" id="modalClose" aria-label="关闭画面预览">×</button></div>
+      <img id="modalImg" class="modal-img" alt="视频画面预览">
+      <button class="btn btn-primary" id="btnSaveFrame">保存截图 · JPG</button>
     </div>
   </div>
-
-  <!-- 萌系悬浮 Toast 提示 -->
-  <div class="toast" id="toast"></div>
-
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="popup.js"></script>
 </body>
 </html>

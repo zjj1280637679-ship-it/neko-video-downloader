@@ -1,171 +1,139 @@
-// 🌸 喵喵视频下载姬 - Content Script
-// 负责 DOM 视频检测、完整主视频流嗅探(如 ikanbot lineData)、实时多帧截屏与时间戳
-
-(function () {
-  const capturedFrames = [];
-
-  // 时间格式化：秒 -> mm:ss 或 hh:mm:ss
-  function formatTime(seconds) {
-    if (isNaN(seconds) || seconds < 0) return "00:00";
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = Math.floor(seconds % 60);
-    if (h > 0) {
-      return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
-    }
-    return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+// DOM media discovery and bounded frame sampling. Network capture handles
+// blob/MediaSource players and cross-origin HLS requests.
+(() => {
+  const reported = new Set();
+  const hooked = new WeakSet();
+  const blockedSources = new WeakMap();
+  let capturedFrames = [];
+  let capturedVideo = null;
+  let capturedSource = "";
+  let lastTitle = "";
+  let lastSelectedUrl = "";
+  let scanTimer;
+  const send = message => { try { chrome.runtime.sendMessage(message).catch(() => {}); } catch {} };
+  function absoluteUrl(value) {
+    if (!value) return null;
+    try { const url = new URL(value, document.baseURI); return /^https?:$/.test(url.protocol) ? url.href : null; }
+    catch { return null; }
   }
-
-  // 截取单帧画面
+  function reportUrl(value, { name = "", mime = "", explicitVideo = false, active = false } = {}) {
+    const url = absoluteUrl(value);
+    if (!url || /\.(ts|m4s)(?:$|[?#])/i.test(url)) return;
+    const playlist = /\.m3u8(?:$|[?#])/i.test(url) || /mpegurl/i.test(mime);
+    // data-url also occurs on articles, ads, and navigation. HTTP alone does
+    // not make a URL a media playlist.
+    if (!playlist && !explicitVideo && !/\.(mp4|webm|mov|mkv|flv|m4v|mp3|m4a|aac|ogg)(?:$|[?#])/i.test(url)) return;
+    const key = `${url}|${mime}|${name}`;
+    const selectionChanged = active && lastSelectedUrl !== url;
+    if (active) lastSelectedUrl = url;
+    if (reported.has(key) && !selectionChanged) return;
+    reported.add(key);
+    if (reported.size > 500) reported.delete(reported.values().next().value);
+    send({ action: playlist ? "reportMasterStream" : "reportDOMVideo", url, mime, name, active, title: document.title || "" });
+  }
+  function formatTime(seconds) {
+    const time = Math.max(0, Math.floor(Number(seconds) || 0));
+    const parts = [Math.floor(time / 60) % 60, time % 60];
+    if (time >= 3600) parts.unshift(Math.floor(time / 3600));
+    return parts.map(part => String(part).padStart(2, "0")).join(":");
+  }
+  function videoSource(video) { return video.currentSrc || video.src || ""; }
   function captureVideoFrame(video) {
-    if (!video || video.videoWidth === 0 || video.videoHeight === 0) return null;
+    if (!video) return null;
+    const source = videoSource(video);
+    if (video.readyState < 2 || !video.videoWidth || !video.videoHeight || blockedSources.get(video) === source) return null;
     try {
       const canvas = document.createElement("canvas");
-      const width = 180;
-      const height = Math.round((video.videoHeight / video.videoWidth) * width) || 101;
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(video, 0, 0, width, height);
-      const dataUrl = canvas.toDataURL("image/jpeg", 0.75);
-
-      const currentTime = video.currentTime || 0;
+      const scale = Math.min(240 / video.videoWidth, 160 / video.videoHeight, 1);
+      canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+      canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+      canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
       return {
-        timeStr: formatTime(currentTime),
-        seconds: Math.round(currentTime),
-        dataUrl: dataUrl,
-        timestamp: Date.now()
+        timeStr: formatTime(video.currentTime), seconds: Math.round(video.currentTime),
+        dataUrl: canvas.toDataURL("image/jpeg", 0.75), timestamp: Date.now()
       };
-    } catch (e) {
+    } catch (error) {
+      // A tainted canvas remains so until its source changes. Do not throw on
+      // every timeupdate for the rest of the movie.
+      if (error.name === "SecurityError") blockedSources.set(video, source);
       return null;
     }
   }
-
-  function reportFrames() {
-    if (capturedFrames.length === 0) return;
-    chrome.runtime.sendMessage({
-      action: "reportVideoFrames",
-      frames: capturedFrames
-    }).catch(() => {});
+  function reportFrames() { send({ action: "reportVideoFrames", frames: capturedFrames }); }
+  function selectCaptureSource(video) {
+    const source = videoSource(video);
+    if (capturedVideo === video && capturedSource === source) return;
+    const changed = capturedVideo !== null;
+    capturedVideo = video; capturedSource = source; capturedFrames = [];
+    if (changed) reportFrames();
   }
-
-  function tryCapture(video) {
-    const currentSec = Math.round(video.currentTime || 0);
-    const isDistinct = capturedFrames.every(f => Math.abs(f.seconds - currentSec) >= 2);
-    if (isDistinct && capturedFrames.length < 10) {
-      const frame = captureVideoFrame(video);
-      if (frame) {
-        capturedFrames.push(frame);
-        capturedFrames.sort((a, b) => a.seconds - b.seconds);
-        reportFrames();
-      }
-    }
+  function tryCapture(video, force = false) {
+    if (video.paused && !force) return null;
+    selectCaptureSource(video);
+    const seconds = Math.round(video.currentTime || 0);
+    if (!force && (capturedFrames.length >= 10 || capturedFrames.some(frame => Math.abs(frame.seconds - seconds) < 5))) return null;
+    const frame = captureVideoFrame(video);
+    if (!frame) return null;
+    capturedFrames = capturedFrames.filter(item => item.seconds !== frame.seconds);
+    if (capturedFrames.length >= 10) capturedFrames.shift();
+    capturedFrames.push(frame); capturedFrames.sort((a, b) => a.seconds - b.seconds);
+    reportFrames(); return frame;
   }
-
-  function attachFrameCapture(video) {
-    if (video.__cute_capture_hooked) return;
-    video.__cute_capture_hooked = true;
-
+  function inspectVideo(video) {
+    reportUrl(video.currentSrc || video.src, { explicitVideo: true });
+    video.querySelectorAll("source[src]").forEach(source => reportUrl(source.src, { mime: source.type, explicitVideo: true }));
+    if (hooked.has(video)) return;
+    hooked.add(video);
+    for (const event of ["loadedmetadata", "playing", "emptied"]) video.addEventListener(event, () => {
+      reportUrl(video.currentSrc || video.src, { explicitVideo: true });
+      if (event !== "emptied") tryCapture(video);
+    });
     video.addEventListener("timeupdate", () => tryCapture(video));
-    video.addEventListener("playing", () => tryCapture(video));
     video.addEventListener("seeked", () => tryCapture(video));
-    video.addEventListener("canplay", () => tryCapture(video));
     tryCapture(video);
   }
-
-  // 核心突破：扫描页面 DOM 里的完整播放流地址 (例如爱看机器人 ikanbot 的 lineData udata)
-  function scanMasterStreams() {
-    const title = document.title || "";
-
-    // 针对 ikanbot 等流媒体站点的线路属性
-    const lineElements = document.querySelectorAll("div[name='lineData'], [udata], [data-url]");
-    lineElements.forEach((el) => {
-      const streamUrl = el.getAttribute("udata") || el.getAttribute("data-url");
-      if (streamUrl && (streamUrl.includes(".m3u8") || streamUrl.startsWith("http"))) {
-        const lineName = el.textContent.trim() || "";
-        chrome.runtime.sendMessage({
-          action: "reportMasterStream",
-          url: streamUrl,
-          name: lineName,
-          title: title
-        }).catch(() => {});
-      }
-    });
-
-    // 检查页面 video 标签是否有 m3u8
-    const videos = document.querySelectorAll("video");
-    videos.forEach((video) => {
-      attachFrameCapture(video);
-
-      if (video.src && video.src.includes(".m3u8")) {
-        chrome.runtime.sendMessage({
-          action: "reportMasterStream",
-          url: video.src,
-          title: title
-        }).catch(() => {});
-      }
-
-      // 普通非 blob 直链
-      if (video.src && !video.src.startsWith("blob:") && video.src.startsWith("http")) {
-        // 如果是 ts 切片则不作为独立视频上报
-        if (!video.src.includes(".ts")) {
-          chrome.runtime.sendMessage({
-            action: "reportDOMVideo",
-            url: video.src,
-            title: title
-          }).catch(() => {});
-        }
-      }
-    });
-  }
-
-  // 上报页面标题
-  function reportTitle() {
-    if (window.top === window && document.title) {
-      chrome.runtime.sendMessage({
-        action: "reportPageTitle",
-        title: document.title
-      }).catch(() => {});
+  function scan() {
+    scanTimer = undefined;
+    if (window.top === window && document.title && lastTitle !== document.title) {
+      lastTitle = document.title; send({ action: "reportPageTitle", title: lastTitle });
     }
-  }
-
-  // 响应即时截图
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (msg.action === "captureCurrentFrameNow") {
-      const video = document.querySelector("video");
-      if (video) {
-        const frame = captureVideoFrame(video);
-        if (frame) {
-          const exists = capturedFrames.some(f => f.timeStr === frame.timeStr);
-          if (!exists) {
-            capturedFrames.push(frame);
-            capturedFrames.sort((a, b) => a.seconds - b.seconds);
-          }
-          reportFrames();
-          sendResponse({ success: true, frame });
-          return true;
-        }
-      }
-      sendResponse({ success: false, error: "未找到正在播放的视频画面" });
-      return true;
-    }
-  });
-
-  reportTitle();
-  scanMasterStreams();
-
-  // 深度监听 DOM 动态变化（很多站点点播、切集是异步塞入 lineData 的）
-  const observer = new MutationObserver(() => {
-    scanMasterStreams();
-  });
-
-  if (document.body) {
-    observer.observe(document.body, { childList: true, subtree: true });
-  } else {
-    document.addEventListener("DOMContentLoaded", () => {
-      reportTitle();
-      scanMasterStreams();
-      observer.observe(document.body, { childList: true, subtree: true });
+    document.querySelectorAll("[udata], [data-url]").forEach(element => {
+      // ikanbot renders all episodes and routes. Only the selected episode is
+      // relevant; inactive URLs would otherwise flood the popup with 196 rows.
+      if (element.getAttribute("name") === "lineData" && !element.classList.contains("active")) return;
+      reportUrl(element.getAttribute("udata") || element.getAttribute("data-url"), {
+        name: (element.getAttribute("title") || element.textContent || "").trim().slice(0, 80),
+        active: element.getAttribute("name") === "lineData"
+      });
     });
+    document.querySelectorAll("video").forEach(inspectVideo);
   }
+  function scheduleScan() { if (!scanTimer) scanTimer = setTimeout(scan, 200); }
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.action !== "captureCurrentFrameNow") return;
+    const videos = [...document.querySelectorAll("video")].filter(video => video.readyState >= 2 && video.videoWidth);
+    videos.sort((a, b) => Number(a.paused) - Number(b.paused) || b.videoWidth * b.videoHeight - a.videoWidth * a.videoHeight);
+    const video = videos[0];
+    const frame = video && tryCapture(video, true);
+    sendResponse(frame ? { success: true, frame } : {
+      success: false, error: video && blockedSources.has(video) ? "该视频未允许跨域截图，下载功能不受影响" : "请先播放视频，再抓拍画面"
+    });
+  });
+  const observer = new MutationObserver(records => {
+    // Video clocks, captions and unrelated CSS animations should not trigger a
+    // full scan. Observe selected-route classes and actual media insertions.
+    const selector = "video, source, [udata], [data-url], title";
+    if (records.some(record => {
+      if (record.type === "attributes") return record.attributeName === "class"
+        ? record.target.getAttribute("name") === "lineData"
+        : record.target.matches?.(selector);
+      return record.target.matches?.("title") || [...record.addedNodes].some(node =>
+        node.nodeType === 1 && (node.matches(selector) || node.querySelector(selector)));
+    })) scheduleScan();
+  });
+  observer.observe(document.documentElement, {
+    subtree: true, childList: true, attributes: true, attributeFilter: ["src", "udata", "data-url", "type", "class"]
+  });
+  window.addEventListener("pageshow", scheduleScan);
+  scan();
 })();
