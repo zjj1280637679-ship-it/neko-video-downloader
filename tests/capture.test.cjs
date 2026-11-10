@@ -32,7 +32,10 @@ function makeBackground({ deferRestore = false, restored = {} } = {}) {
   };
   const context = vm.createContext({ chrome, crypto: webcrypto, URL, console, setTimeout(fn) { timers.push(fn); return timers.length; }, clearTimeout() {} });
   vm.runInContext(background, context);
-  const message = (body, sender = {}) => new Promise(resolve => chrome.runtime.onMessage.listeners[0](body, sender, resolve));
+  const message = (body, sender = {}) => new Promise(resolve => {
+    const result = chrome.runtime.onMessage.listeners[0](body, sender, resolve);
+    if (result !== true) resolve(undefined);
+  });
   return { chrome, message, notifications, downloadItems, restore, timers };
 }
 
@@ -73,28 +76,23 @@ test('206 reports total size, fragments are deduplicated, full part_1.mp4 surviv
   assert.equal(result.media.find(item => item.isM3U8).size, 0);
 });
 
-test('DOM metadata enriches a network capture; invalid URL cannot be downloaded', async () => {
+test('DOM metadata enriches a network capture; non-HTTP media is not exposed', async () => {
   const h = makeBackground();
   h.chrome.webRequest.onBeforeRequest.emit({ tabId: 2, url: 'https://cdn.test/index.m3u8', type: 'xmlhttprequest' });
   await h.message({ action: 'reportMasterStream', url: 'https://cdn.test/index.m3u8', name: '第1集', title: 'Title' }, { tab: { id: 2 }, frameId: 0 });
   const result = await h.message({ action: 'getMedia', tabId: 2 });
   assert.equal(result.media.length, 1);
   assert.equal(result.media[0].name, '第1集');
-  assert.equal((await h.message({ action: 'download', url: 'javascript:alert(1)' })).success, false);
-  assert.equal((await h.message({ action: 'download', url: 'https://cdn.test/index.m3u8' })).success, false);
+  await h.message({ action: 'reportDOMVideo', url: 'javascript:alert(1)' }, { tab: { id: 2 } });
+  assert.equal((await h.message({ action: 'getMedia', tabId: 2 })).media.length, 1);
 });
 
-test('direct download is started first, and interrupted/completed only from Chrome state', async () => {
+test('capture handler exposes no legacy download bypass for content-script senders', async () => {
   const h = makeBackground();
-  const start = await h.message({ action: 'download', tabId: 9, url: 'https://cdn.test/movie.mp4', filename: 'movie.mp4' });
-  assert.equal(start.state, 'in_progress');
-  h.downloadItems.set(42, { id: 42, state: 'interrupted', error: 'NETWORK_FAILED', filename: 'movie.mp4' });
-  h.chrome.downloads.onChanged.emit({ id: 42, state: { current: 'interrupted' } });
-  await tick();
-  const status = await h.message({ action: 'getMedia', tabId: 9 });
-  assert.equal(status.downloads[0].state, 'interrupted');
-  assert.equal(status.downloads[0].error, 'NETWORK_FAILED');
-  assert.ok(h.notifications.some(message => message.action === 'downloadStatusUpdated' && message.state === 'interrupted'));
+  const sender = { tab: { id: 9 }, url: 'https://page.test/watch' };
+  assert.equal(await h.message({ action: 'download', url: 'https://cdn.test/movie.mp4', filename: 'movie.mp4' }, sender), undefined);
+  assert.equal(await h.message({ action: 'getDownloadStatus', downloadId: 42 }, sender), undefined);
+  assert.equal(h.chrome.downloadOptions, undefined);
 });
 
 test('changing back to an earlier selected stream promotes it and clears the old active marker', async () => {

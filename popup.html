@@ -7,40 +7,50 @@
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <div class="app-container">
+  <div class="app-container" id="appContent">
     <header class="header">
       <div class="brand-mark" aria-hidden="true"><img src="icons/icon48.png" alt=""></div>
       <div><p class="eyebrow">NEKO · VIDEO COMPANION</p><h1>喵喵视频下载姬</h1><p class="subtitle">把喜欢的画面，好好收藏。</p></div>
-      <span class="header-flower" aria-hidden="true">✿</span>
+      <button class="btn-icon btn-settings" id="btnSettings" title="下载设置" aria-label="下载设置">⚙</button>
     </header>
     <section class="page-bar" aria-label="当前网页">
       <span class="page-icon" aria-hidden="true">↗</span>
       <div class="page-copy"><span class="section-label">当前网页</span><p class="page-title" id="pageTitle">正在连接网页…</p></div>
     </section>
-    <div class="status-bar" id="statusBar" data-state="loading">
-      <span class="status-radar" aria-hidden="true"></span>
-      <span id="statusText" role="status" aria-live="polite">正在读取视频来源…</span>
-      <button class="btn-icon" id="btnRefresh" title="重新读取视频列表" aria-label="重新读取视频列表">↻</button>
-    </div>
-    <section id="downloadSection" class="download-section" aria-label="最近下载" hidden><div id="downloadList"></div></section>
-    <div class="list-toolbar" id="listToolbar" hidden>
-      <label class="search-wrap"><span aria-hidden="true">⌕</span><input id="mediaSearch" type="search" placeholder="搜索文件名或来源" aria-label="搜索文件名或来源" autocomplete="off"></label>
-      <span id="sourceCount" class="source-count"></span>
-    </div>
-    <main class="media-list" id="mediaList" aria-label="视频来源"></main>
-    <section class="frames-section" id="framesSection" hidden aria-label="当前网页画面">
-      <div class="frames-header"><span>当前网页画面 <small id="framesCount"></small></span><button class="btn-snap" id="btnSnap">抓拍一帧</button></div>
-      <div class="frames-scroll" id="framesList"></div>
-      <p class="frames-empty-hint" id="framesHint">播放后可抓拍；部分跨域视频不允许截图。</p>
+    <nav class="view-tabs" role="tablist" aria-label="视频与下载">
+      <button id="sourceTab" class="view-tab" role="tab" aria-selected="true" aria-controls="sourcePanel">视频来源 <span id="sourceTabCount">0</span></button>
+      <button id="jobsTab" class="view-tab" role="tab" aria-selected="false" aria-controls="jobsPanel" tabindex="-1">下载任务 <span id="jobsTabCount">0</span></button>
+    </nav>
+    <section class="view-panel" id="sourcePanel" role="tabpanel" aria-labelledby="sourceTab">
+      <div class="status-bar" id="statusBar" data-state="loading"><span class="status-radar" aria-hidden="true"></span><span id="statusText" role="status" aria-live="polite">正在读取视频来源…</span><button class="btn-icon" id="btnRefresh" title="重新读取视频列表" aria-label="重新读取视频列表">↻</button></div>
+      <div class="list-toolbar" id="listToolbar" hidden><label class="search-wrap"><span aria-hidden="true">⌕</span><input id="mediaSearch" type="search" placeholder="搜索文件名或来源" aria-label="搜索文件名或来源" autocomplete="off"></label><span id="sourceCount" class="source-count"></span></div>
+      <main class="media-list" id="mediaList" aria-label="视频来源"></main>
+      <details class="frames-section" id="framesSection" hidden>
+        <summary>当前网页画面 <small id="framesCount"></small></summary>
+        <div class="frames-header"><span>留住喜欢的一帧</span><button class="btn-snap" id="btnSnap">抓拍一帧</button></div>
+        <div class="frames-scroll" id="framesList"></div><p class="frames-empty-hint" id="framesHint">播放后可抓拍；部分跨域视频不允许截图。</p>
+      </details>
     </section>
-    <footer class="footer"><span class="footer-cat" aria-hidden="true">(=^･ω･^=)</span><span>先播放，再选择来源下载</span></footer>
+    <section class="view-panel" id="jobsPanel" role="tabpanel" aria-labelledby="jobsTab" hidden>
+      <p class="jobs-hint"><span aria-hidden="true">✿</span> 关掉弹窗也会继续下载，下次打开可查看进度。</p>
+      <p id="jobsStatus" class="jobs-status" role="status" aria-live="polite" hidden></p>
+      <div class="job-list" id="jobList" aria-label="最近下载任务"></div>
+    </section>
+    <footer class="footer"><span class="footer-cat" aria-hidden="true">(=^･ω･^=)</span><button id="btnSaveLocation" class="location-link" title="查看下载设置"><span id="saveLocation">保存至 Chrome 默认下载文件夹</span><span aria-hidden="true"> ›</span></button></footer>
   </div>
-  <div class="modal" id="imageModal" role="dialog" aria-modal="true" aria-labelledby="modalTimeTag" hidden>
-    <div class="modal-content">
-      <div class="modal-header"><span id="modalTimeTag">画面预览</span><button class="btn-icon" id="modalClose" aria-label="关闭画面预览">×</button></div>
-      <img id="modalImg" class="modal-img" alt="视频画面预览">
-      <button class="btn btn-primary" id="btnSaveFrame">保存截图 · JPG</button>
-    </div>
+  <div class="modal" id="imageModal" role="dialog" aria-modal="true" aria-labelledby="modalTimeTag" hidden><div class="modal-content"><div class="modal-header"><span id="modalTimeTag">画面预览</span><button class="btn-icon" id="modalClose" aria-label="关闭画面预览">×</button></div><img id="modalImg" class="modal-img" alt="视频画面预览"><button class="btn btn-primary" id="btnSaveFrame">保存截图 · JPG</button></div></div>
+  <div class="modal" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
+    <form class="modal-content settings-content" id="settingsForm">
+      <div class="modal-header"><div><p class="eyebrow">MAKE IT YOURS</p><h2 id="settingsTitle">下载设置</h2></div><button class="btn-icon" type="button" id="settingsClose" aria-label="关闭下载设置">×</button></div>
+      <div class="destination-box"><span class="section-label">保存位置</span><strong>Chrome 默认下载文件夹</strong><button type="button" class="text-button" id="btnChromeSettings">更改 Chrome 下载位置 ↗</button></div>
+      <label class="setting-field" for="subfolder">子文件夹 <span>选填</span></label>
+      <input class="setting-input" id="subfolder" type="text" placeholder="例如：喵喵视频" autocomplete="off" maxlength="160" aria-describedby="folderHint folderPreview">
+      <p class="field-hint" id="folderHint">留空直接保存到默认目录。可用“/”创建多级子文件夹。</p>
+      <p class="folder-preview" id="folderPreview">默认下载文件夹</p>
+      <label class="checkbox-setting"><input id="askWhereToSave" type="checkbox"><span>每次询问保存位置<small>开启后，保存文件前会弹出位置选择框。</small></span></label>
+      <p class="settings-error" id="settingsError" role="alert" hidden></p>
+      <div class="settings-actions"><button type="button" class="btn btn-secondary" id="settingsCancel">取消</button><button type="submit" class="btn btn-primary" id="settingsSave">保存设置</button></div>
+    </form>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="popup.js"></script>

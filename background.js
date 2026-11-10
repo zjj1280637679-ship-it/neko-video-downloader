@@ -1,13 +1,13 @@
-// 喵喵视频下载姬 — MV3 media capture and download state.
+// 喵喵视频下载姬 — MV3 media capture. Downloads belong to the trusted manager.
+if (typeof importScripts === 'function') importScripts('download-manager.js');
 const SESSION_KEYS = {
   media: "neko_tabMedia", titles: "neko_tabTitles", frames: "neko_tabFrames",
-  chunks: "neko_tabChunks", downloads: "neko_downloads"
+  chunks: "neko_tabChunks"
 };
 let tabMediaMap = new Map();
 let tabTitleMap = new Map();
 let tabFramesMap = new Map();
 let tabChunkCountMap = new Map();
-let downloadMap = new Map();
 const chunkUrls = new Map();
 const MAX_MEDIA = 60;
 let saveTimer;
@@ -20,7 +20,6 @@ const restorePromise = chrome.storage.session.get(Object.values(SESSION_KEYS)).t
   tabTitleMap = restore(SESSION_KEYS.titles);
   tabFramesMap = restore(SESSION_KEYS.frames);
   tabChunkCountMap = restore(SESSION_KEYS.chunks);
-  downloadMap = restore(SESSION_KEYS.downloads);
 }).catch(error => console.warn("Neko session restore:", error.message));
 let eventQueue = restorePromise;
 function enqueue(action) {
@@ -35,7 +34,7 @@ function scheduleSave() {
     const snapshot = {
       [SESSION_KEYS.media]: [...tabMediaMap].map(([id, list]) => [id, list.map(({ frames, ...item }) => item)]),
       [SESSION_KEYS.titles]: [...tabTitleMap], [SESSION_KEYS.frames]: [...tabFramesMap],
-      [SESSION_KEYS.chunks]: [...tabChunkCountMap], [SESSION_KEYS.downloads]: [...downloadMap]
+      [SESSION_KEYS.chunks]: [...tabChunkCountMap]
     };
     saveChain = saveChain.then(() => chrome.storage.session.set(snapshot))
       .catch(error => console.warn("Neko session save:", error.message));
@@ -143,24 +142,9 @@ chrome.webRequest.onHeadersReceived.addListener(details => {
     frameId: details.frameId, pageUrl: details.documentUrl || details.initiator || ""
   }));
 }, { urls: ["<all_urls>"] }, ["responseHeaders"]);
-function downloadSnapshot(item, previous = {}) {
-  return {
-    ...previous, downloadId: item.id, state: item.state, error: item.error || "",
-    filename: item.filename || previous.filename || "", bytesReceived: item.bytesReceived || 0,
-    totalBytes: item.totalBytes || 0, url: previous.url || item.finalUrl || item.url || ""
-  };
-}
-async function refreshDownload(downloadId) {
-  const previous = downloadMap.get(downloadId);
-  const [item] = await chrome.downloads.search({ id: downloadId });
-  if (!item) return previous || null;
-  const status = downloadSnapshot(item, previous);
-  if (previous) { downloadMap.set(downloadId, status); scheduleSave(); }
-  return status;
-}
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.action !== "string") return;
-  const supported = ["reportMasterStream", "reportDOMVideo", "reportVideoFrames", "reportPageTitle", "getMedia", "download", "getDownloadStatus"];
+  const supported = ["reportMasterStream", "reportDOMVideo", "reportVideoFrames", "reportPageTitle", "getMedia"];
   if (!supported.includes(message.action)) return;
   const tabId = sender.tab?.id ?? message.tabId;
   enqueue(async () => {
@@ -190,39 +174,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const list = (tabMediaMap.get(tabId) || []).map(item => ({ ...item, frames: [] }));
       const target = firstStreamItem(list);
       if (target) { target.frames = frames; target.chunkCount = chunkCount; }
-      const downloads = [...downloadMap.values()].filter(item => item.tabId === tabId).slice(-10);
-      return { media: list, pageTitle: tabTitleMap.get(tabId) || "当前网页", frames, chunkCount, downloads };
-    }
-    if (message.action === "getDownloadStatus") return await refreshDownload(Number(message.downloadId));
-    if (message.action === "download") {
-      const url = mediaUrl(message.url);
-      if (!url) return { success: false, error: "此地址不是可下载的 HTTP/HTTPS 媒体链接" };
-      if (isPlaylist(url)) return { success: false, error: "HLS 播放列表需要通过合并下载器保存" };
-      const filename = sanitizeFilename(message.filename || "视频.mp4");
-      // Keep capture responsive while Chrome's Save As dialog is open.
-      chrome.downloads.download({ url, filename, saveAs: true }, async downloadId => {
-        if (chrome.runtime.lastError || !Number.isInteger(downloadId)) {
-          sendResponse({ success: false, error: chrome.runtime.lastError?.message || "下载未启动" }); return;
-        }
-        downloadMap.set(downloadId, { downloadId, tabId, url, filename, state: "in_progress", bytesReceived: 0, totalBytes: 0, error: "" });
-        if (downloadMap.size > 40) downloadMap.delete(downloadMap.keys().next().value);
-        scheduleSave(); sendResponse({ success: true, downloadId, state: "in_progress" });
-        try { notify({ action: "downloadStatusUpdated", ...await refreshDownload(downloadId) }); } catch {}
-      });
-      return undefined;
+      return { media: list, pageTitle: tabTitleMap.get(tabId) || "当前网页", frames, chunkCount };
     }
     return { status: "ignored" };
   }).then(result => { if (result !== undefined) sendResponse(result); })
     .catch(error => sendResponse({ success: false, error: error.message }));
   return true;
-});
-chrome.downloads.onChanged.addListener(delta => {
-  if (!delta.state && !delta.error && !delta.filename) return;
-  enqueue(async () => {
-    if (!downloadMap.has(delta.id)) return;
-    const status = await refreshDownload(delta.id);
-    if (status) notify({ action: "downloadStatusUpdated", ...status });
-  });
 });
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.title) enqueue(() => { tabTitleMap.set(tabId, changeInfo.title); scheduleSave(); });
