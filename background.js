@@ -1,13 +1,54 @@
 // 🌸 喵喵视频下载姬 - Background Service Worker (防碎片智能过滤版)
 
 // 缓存每个标签页的媒体列表
-const tabMediaMap = new Map();
+let tabMediaMap = new Map();
 // 缓存网页标题
-const tabTitleMap = new Map();
+let tabTitleMap = new Map();
 // 缓存标签页的视频多帧截屏
-const tabFramesMap = new Map();
+let tabFramesMap = new Map();
 // 记录标签页已侦测到的切片计数
-const tabChunkCountMap = new Map();
+let tabChunkCountMap = new Map();
+
+// ---------- MV3 service worker 内存态持久化 ----------
+// service worker 闲置约 30 秒即被系统回收，内存里的 Map 会丢；写透到 chrome.storage.session，启动时恢复。
+const SESSION_KEYS = {
+  media: "neko_tabMedia",
+  titles: "neko_tabTitles",
+  frames: "neko_tabFrames",
+  chunks: "neko_tabChunks"
+};
+
+function scheduleSave() {
+  // 写透（storage.session 容量 10MB；截屏 dataUrl 总量一般远小于此）
+  chrome.storage.session.set({
+    [SESSION_KEYS.media]: [...tabMediaMap.entries()],
+    [SESSION_KEYS.titles]: [...tabTitleMap.entries()],
+    [SESSION_KEYS.frames]: [...tabFramesMap.entries()],
+    [SESSION_KEYS.chunks]: [...tabChunkCountMap.entries()]
+  }).catch(() => {});
+}
+
+let restorePromise = null;
+function restoreState() {
+  if (restorePromise) return restorePromise;
+  restorePromise = chrome.storage.session
+    .get(Object.values(SESSION_KEYS))
+    .then((data) => {
+      if (data[SESSION_KEYS.media]) tabMediaMap = new Map(data[SESSION_KEYS.media]);
+      if (data[SESSION_KEYS.titles]) tabTitleMap = new Map(data[SESSION_KEYS.titles]);
+      if (data[SESSION_KEYS.frames]) tabFramesMap = new Map(data[SESSION_KEYS.frames]);
+      if (data[SESSION_KEYS.chunks]) tabChunkCountMap = new Map(data[SESSION_KEYS.chunks]);
+    })
+    .catch(() => {});
+  return restorePromise;
+}
+restoreState();
+
+// 切片计数应挂在 m3u8 主流卡片上，而不是 mediaList[0]（[0] 可能是先到的 mp4）
+function firstStreamItem(list) {
+  if (!list || list.length === 0) return null;
+  return list.find((m) => m.isM3U8) || list[0];
+}
 
 // 判断是否是切片碎片 (绝对不应该作为独立视频卡片展示给用户)
 function isFragmentUrl(url, contentType, contentLength) {
@@ -22,14 +63,16 @@ function isFragmentUrl(url, contentType, contentLength) {
   }
 
   // 2. URL 包含典型的切片特征 (.ts, .m4s, seg-1, chunk_01, /hls/.../1 等)
-  const FRAGMENT_REGEX = /(\.(ts|m4s|m4v_frag|f4m|f4f)($|\?))|([/_](seg|segment|chunk|frag|slice|part)[-_0-9])|(\/hls\/.*\/[0-9]+)/i;
+  // 注意：part 必须带分隔符（part-1/part_1）才算切片，part1.mp4 这类正片名不拦
+  const FRAGMENT_REGEX = /(\.(ts|m4s|m4v_frag|f4m|f4f)($|\?))|([/_](seg|segment|chunk|frag|slice)[-_0-9])|([/_]part[-_][0-9])|(\/hls\/.*\/[0-9]+)/i;
   if (FRAGMENT_REGEX.test(url)) {
     return true;
   }
 
-  // 3. 小于 12MB 的数字命名分块 (如 /123.mp4)
+  // 3. 小于 12MB 的数字命名分块 (如 /123.ts)——只拦 .ts/.m4s，.mp4 不拦：
+  // 很多站点的正片短视频就是 /123.mp4 这类数字命名，之前会误伤
   if (contentLength && contentLength > 0 && contentLength < 12 * 1024 * 1024) {
-    if (/\/[0-9]{1,5}\.(mp4|ts|m4s)($|\?)/i.test(url)) {
+    if (/\/[0-9]{1,5}\.(ts|m4s)($|\?)/i.test(url)) {
       return true;
     }
   }
@@ -75,9 +118,11 @@ function addMediaItem(tabId, item) {
     // 如果当前标签页已经有主 m3u8 流，更新其切片计数
     const mediaList = tabMediaMap.get(tabId);
     if (mediaList && mediaList.length > 0) {
-      mediaList[0].chunkCount = currentCount;
+      const target = firstStreamItem(mediaList);
+      if (target) target.chunkCount = currentCount;
       chrome.runtime.sendMessage({ action: "mediaListUpdated", tabId }).catch(() => {});
     }
+    scheduleSave();
     return; // 直接拦截，拒绝展示几MB碎片！
   }
 
@@ -132,6 +177,7 @@ function addMediaItem(tabId, item) {
   }
 
   updateBadge(tabId);
+  scheduleSave();
   chrome.runtime.sendMessage({ action: "mediaListUpdated", tabId }).catch(() => {});
 }
 
@@ -204,13 +250,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  // 接收 DOM 扫描到的普通视频直链（如 <video src> 的 mp4）——之前 content.js 发了这条消息，
+  // background 却没有处理分支，正片直接被丢掉，弹窗里看不到
+  if (message.action === "reportDOMVideo" && tabId) {
+    if (message.title) {
+      tabTitleMap.set(tabId, message.title);
+    }
+    addMediaItem(tabId, {
+      url: message.url,
+      mime: "video/mp4",
+      size: 0,
+      customTitle: message.title
+    });
+    sendResponse({ status: "ok" });
+    return true;
+  }
+
   // 接收多帧截屏
   if (message.action === "reportVideoFrames" && tabId) {
     tabFramesMap.set(tabId, message.frames || []);
     const list = tabMediaMap.get(tabId);
     if (list && list.length > 0) {
-      list[0].frames = message.frames || [];
+      const target = firstStreamItem(list);
+      if (target) target.frames = message.frames || [];
     }
+    scheduleSave();
     chrome.runtime.sendMessage({ action: "framesUpdated", tabId, frames: message.frames }).catch(() => {});
     sendResponse({ status: "ok" });
     return true;
@@ -218,21 +282,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === "reportPageTitle" && tabId) {
     tabTitleMap.set(tabId, message.title);
+    scheduleSave();
     sendResponse({ status: "ok" });
     return true;
   }
 
   if (message.action === "getMedia") {
-    const list = tabMediaMap.get(message.tabId) || [];
-    const pageTitle = tabTitleMap.get(message.tabId) || "当前网页";
-    const frames = tabFramesMap.get(message.tabId) || [];
-    const chunkCount = tabChunkCountMap.get(message.tabId) || 0;
-    
-    if (list.length > 0) {
-      if (frames.length > 0) list[0].frames = frames;
-      list[0].chunkCount = chunkCount;
-    }
-    sendResponse({ media: list, pageTitle, frames, chunkCount });
+    // 先等启动恢复完成，否则 SW 刚被唤醒时列表还是空的
+    restoreState().then(() => {
+      const list = tabMediaMap.get(message.tabId) || [];
+      const pageTitle = tabTitleMap.get(message.tabId) || "当前网页";
+      const frames = tabFramesMap.get(message.tabId) || [];
+      const chunkCount = tabChunkCountMap.get(message.tabId) || 0;
+
+      if (list.length > 0) {
+        const target = firstStreamItem(list);
+        if (target) {
+          if (frames.length > 0) target.frames = frames;
+          target.chunkCount = chunkCount;
+        }
+      }
+      sendResponse({ media: list, pageTitle, frames, chunkCount });
+    });
     return true;
   }
 
@@ -262,6 +333,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     tabFramesMap.delete(tabId);
     tabChunkCountMap.delete(tabId);
     updateBadge(tabId);
+    scheduleSave();
   }
 });
 
@@ -270,4 +342,5 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   tabTitleMap.delete(tabId);
   tabFramesMap.delete(tabId);
   tabChunkCountMap.delete(tabId);
+  scheduleSave();
 });
