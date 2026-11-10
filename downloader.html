@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🌸 喵喵切片合并下载姬 🌸</title>
+  <style>
+    :root {
+      --primary: #FF6B8B;
+      --secondary: #FFAAA6;
+      --bg: #FFF8FA;
+      --card-bg: #FFFFFF;
+      --text: #4A3E3D;
+      --muted: #8C7A78;
+      --border: #FFD1DC;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      padding: 40px 16px;
+      min-height: 100vh;
+    }
+    .container {
+      width: 100%;
+      max-width: 620px;
+      background: var(--card-bg);
+      border-radius: 20px;
+      border: 2px solid var(--border);
+      box-shadow: 0 10px 30px rgba(255, 107, 139, 0.15);
+      padding: 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .header {
+      text-align: center;
+      position: relative;
+    }
+    .header h1 {
+      font-size: 22px;
+      color: var(--primary);
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .header p {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .info-card {
+      background: #FFF0F5;
+      border-radius: 12px;
+      padding: 14px 16px;
+      border: 1px dashed var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      font-size: 13px;
+    }
+    .info-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .info-label {
+      font-weight: 600;
+      color: var(--primary);
+      min-width: 70px;
+    }
+    .info-val {
+      word-break: break-all;
+      color: var(--text);
+    }
+    .progress-box {
+      background: #FAFAFA;
+      border: 1px solid #EEE;
+      border-radius: 14px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .progress-bar-bg {
+      height: 16px;
+      background: #EFEFEF;
+      border-radius: 10px;
+      overflow: hidden;
+      position: relative;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #FFAAA6 0%, #FF6B8B 100%);
+      border-radius: 10px;
+      transition: width 0.2s ease;
+    }
+    .status-msg {
+      font-size: 12.5px;
+      color: var(--muted);
+      text-align: center;
+    }
+    .btn-group {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .btn {
+      flex: 1;
+      min-width: 140px;
+      border: none;
+      border-radius: 20px;
+      padding: 11px 18px;
+      font-size: 13.5px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: all 0.2s ease;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, #FF6B8B 0%, #FF8E9E 100%);
+      color: #FFF;
+      box-shadow: 0 4px 12px rgba(255, 107, 139, 0.35);
+    }
+    .btn-primary:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 16px rgba(255, 107, 139, 0.45);
+    }
+    .btn-secondary {
+      background: linear-gradient(135deg, #A0C4FF 0%, #BDB2FF 100%);
+      color: #FFF;
+      box-shadow: 0 4px 12px rgba(160, 196, 255, 0.35);
+    }
+    .btn-secondary:hover:not(:disabled) {
+      transform: translateY(-2px);
+    }
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .tips {
+      font-size: 12px;
+      color: #A09090;
+      line-height: 1.6;
+      border-top: 1px solid #FFEBF0;
+      padding-top: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🌸 喵喵切片合并下载姬 🌸</h1>
+      <p>(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧ 正在为你将 HLS 流媒体切片合并为单个视频文件喵~</p>
+    </div>
+
+    <div class="info-card">
+      <div class="info-row">
+        <span class="info-label">视频名称:</span>
+        <span class="info-val" id="titleVal">正在解析中...</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">流地址:</span>
+        <span class="info-val" id="urlVal" style="font-size: 11.5px; color: #777;">-</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">切片总数:</span>
+        <span class="info-val" id="segmentVal">正在解析 m3u8 清单...</span>
+      </div>
+    </div>
+
+    <div class="progress-box">
+      <div class="progress-header">
+        <span id="progressText">等待开始...</span>
+        <span id="percentText">0%</span>
+      </div>
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="progressFill"></div>
+      </div>
+      <div class="status-msg" id="statusMsg">(=^･ω･^=) 准备就绪，点击下方按钮开始下载合并吧！</div>
+    </div>
+
+    <div class="btn-group">
+      <button class="btn btn-primary" id="btnStart">
+        <span>✨</span> 开始合并下载 (转为MP4/TS)
+      </button>
+      <button class="btn btn-secondary" id="btnDownloadM3U8">
+        <span>📄</span> 仅保存 m3u8 文件
+      </button>
+      <button class="btn btn-secondary" id="btnCopyUrl">
+        <span>📋</span> 复制 m3u8 直链
+      </button>
+    </div>
+
+    <div class="tips">
+      💡 <b>温馨说明：</b><br>
+      • 本功能会在浏览器内存中将所有切片（.ts）按顺序并发抓取，并直接合并为一个完整的视频文件后自动保存到你的下载目录。<br>
+      • 下载期间请勿关闭此网页标签哦，合成完毕后会自动弹出保存文件窗口喵！(◕ᴗ◕✿)
+    </div>
+  </div>
+
+  <script src="downloader.js"></script>
+</body>
+</html>
