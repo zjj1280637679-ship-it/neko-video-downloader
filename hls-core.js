@@ -137,6 +137,93 @@
       signal?.addEventListener("abort", abort, { once: true });
     });
   }
+  // Compare aggregate successful network goodput over wall-clock windows.
+  // Compare the change in total speed when the concurrent segment count changes;
+  // a small tolerance filters measurement noise, not per-request speed or errors.
+  function createAdaptiveController(config = {}) {
+    const clock = config.now || (globalThis.performance?.now ? globalThis.performance.now.bind(globalThis.performance) : Date.now);
+    const clamp = (value, lower, upper) => Math.max(lower, Math.min(upper, Math.floor(value)));
+    const min = clamp(Number.isFinite(config.min) ? config.min : 1, 1, 8);
+    const max = clamp(Number.isFinite(config.max) ? config.max : 8, min, 8);
+    const automatic = config.mode !== "manual";
+    let width = clamp(Number.isFinite(config.initial) ? config.initial : 2, min, max);
+    const windowMs = Math.max(100, config.windowMs ?? 4000);
+    const minSamples = Math.max(2, Math.floor(config.minSamples ?? 4));
+    const cooldownMs = Math.max(windowMs, config.cooldownMs ?? 12000);
+    const noiseTolerance = config.noiseTolerance ?? config.gainThreshold ?? 0.03;
+    const declineThreshold = config.declineThreshold ?? noiseTolerance;
+    const startedAt = clock();
+    let epoch = startedAt, windowBytes = 0, samples = 0, baseline = null, probe = null;
+    let cooldownUntil = 0, declines = 0, finished = false;
+    let reason = automatic ? "initializing" : "manual";
+    const arrivals = [];
+    function resetWindow(time = clock()) { epoch = time; windowBytes = 0; samples = 0; }
+    function rate(time = clock()) {
+      while (arrivals.length && arrivals[0].time <= time - windowMs) arrivals.shift();
+      const elapsed = Math.min(windowMs, Math.max(0, time - startedAt));
+      return !finished && elapsed > 0 ? arrivals.reduce((total, item) => total + item.bytes, 0) * 1000 / elapsed : 0;
+    }
+    function metrics() {
+      return { bytesPerSecond: rate(), activeConcurrency: width,
+        concurrencyMode: automatic ? "auto" : "manual", concurrencyReason: reason };
+    }
+    function invalidate() {
+      if (!automatic) return metrics();
+      if (probe) width = probe.width;
+      probe = null; baseline = null; declines = 0;
+      reason = "insufficient";
+      resetWindow();
+      return metrics();
+    }
+    function beginProbe(speed, direction) {
+      probe = { width, speed, direction };
+      width += direction;
+      reason = direction > 0 ? "probing" : "decline";
+    }
+    function recordSuccess(bytes, eligible = true) {
+      const time = clock();
+      if (finished || !Number.isFinite(bytes) || bytes <= 0) return metrics();
+      arrivals.push({ time, bytes });
+      if (!automatic) return metrics();
+      if (!eligible) return invalidate();
+      windowBytes += bytes; samples++;
+      const elapsed = time - epoch;
+      if (elapsed < windowMs || samples < minSamples) return metrics();
+      const speed = windowBytes * 1000 / elapsed;
+      resetWindow(time);
+      if (!Number.isFinite(speed) || speed <= 0) return metrics();
+      if (probe) {
+        const gain = probe.direction > 0 ? speed > probe.speed * (1 + noiseTolerance) : speed >= probe.speed * (1 - noiseTolerance);
+        if (gain) { baseline = speed; reason = probe.direction > 0 ? "gain" : "decline"; }
+        else { width = probe.width; baseline = probe.speed; reason = "no-gain"; }
+        probe = null; declines = 0; cooldownUntil = time + cooldownMs;
+      } else if (time < cooldownUntil) {
+        baseline = speed; declines = 0; reason = "cooldown";
+      } else if (baseline !== null && speed < baseline * (1 - declineThreshold)) {
+        declines++;
+        if (declines >= 2) {
+          if (width > min) beginProbe(speed, -1);
+          else {
+            // At the lower bound there is no smaller width to compare. Rebase
+            // after a confirmed total-speed change so this historical rate
+            // cannot prevent future upward probes once conditions stabilize.
+            baseline = speed; cooldownUntil = time + cooldownMs; reason = "cooldown";
+          }
+          declines = 0;
+        } else reason = "steady";
+      } else {
+        baseline = speed; declines = 0;
+        if (width < max) beginProbe(speed, 1);
+        else reason = "steady";
+      }
+      return metrics();
+    }
+    // Retry/backoff consumes the same wall-clock measurement window. An error
+    // itself does not change width, reset the baseline, or discard a probe.
+    function recordFailure() { return metrics(); }
+    function finish() { finished = true; arrivals.length = 0; return metrics(); }
+    return { metrics, recordSuccess, recordFailure, invalidate, finish };
+  }
   function createClient(options = {}) {
     const fetcher = options.fetch || globalThis.fetch.bind(globalThis);
     const cryptoApi = options.crypto || globalThis.crypto;
@@ -154,7 +241,7 @@
       const wait = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - (options.now || Date.now)();
       return Number.isFinite(wait) ? Math.min(30000, Math.max(0, wait)) : 0;
     }
-    async function withRetries(operation, operationSignal, resourceUrl) {
+    async function withRetries(operation, operationSignal, resourceUrl, observer) {
       for (let attempt = 1; attempt <= retries; attempt++) {
         ensureActive(operationSignal);
         let result;
@@ -164,6 +251,7 @@
           ensureActive(operationSignal);
           const error = annotate(cause, { retryable: true, resourceUrl, stage: "request" });
           error.attempts = attempt;
+          observer?.onFailure?.(error);
           if (!error.retryable || attempt >= retries) throw error;
           const base = Math.max(0, options.retryDelayMs ?? 500);
           const cap = Math.max(0, Math.min(30000, options.maxRetryDelayMs ?? 10000));
@@ -258,7 +346,7 @@
         throw error;
       }
     }
-    async function readResource(resource, operationSignal = signal) {
+    async function readResource(resource, operationSignal = signal, observer) {
       return withRetries(async attempt => {
         const cache = attempt > 1 ? "no-store" : undefined;
         const { data: raw, httpStatus } = await requestOnce(resource.url, resource.byteRange, false, operationSignal, cache);
@@ -280,7 +368,7 @@
           if (keyEntry && keyCache.get(resource.key.url) === keyEntry.token) keyCache.delete(resource.key.url);
           throw annotate(error, { retryable: true, resourceUrl: resource.url, httpStatus, stage });
         }
-      }, operationSignal, resource.url);
+      }, operationSignal, resource.url, observer);
     }
     async function readMap(plan, id, operationSignal) {
       if (!mapCache.has(id)) mapCache.set(id, readResource(plan.maps.get(id), operationSignal));
@@ -293,7 +381,17 @@
     async function download(plan, sink, onProgress = () => {}, concurrency = 5, hooks = {}) {
       if (plan.isFmp4 && (plan.maps.size > 1 || plan.discontinuities)) throw new Error("此 fMP4 线路存在初始化段或时间轴切换，需要重新封装；请更换线路或使用外部下载工具");
       let bytes = 0, completed = 0, lastMap = null;
-      const width = Number.isFinite(concurrency) ? Math.max(1, Math.min(8, Math.floor(concurrency))) : 5;
+      const auto = concurrency === "auto" || concurrency?.mode === "auto";
+      const adaptive = createAdaptiveController({ ...(auto && typeof concurrency === "object" ? concurrency : {}),
+        mode: auto ? "auto" : "manual", ...(auto ? {} : { initial: Number.isFinite(concurrency) ? concurrency : 5 }), now: options.now });
+      function emitMetrics(value = adaptive.metrics()) {
+        try { Promise.resolve(options.onMetrics?.(value)).catch(() => {}); } catch { /* Metrics cannot interrupt media work. */ }
+        return value;
+      }
+      emitMetrics();
+      // Keep displayed goodput honest during stalls/backoff without training on
+      // a window that has no new samples. Learning remains completion driven.
+      const metricsTimer = options.onMetrics ? setInterval(() => emitMetrics(), 1000) : null;
       const operation = new AbortController();
       const abort = () => operation.abort(signal.reason || abortError());
       signal?.addEventListener("abort", abort, { once: true });
@@ -319,12 +417,16 @@
             ensureActive(operation.signal);
             if (cached != null) {
               if (Object.prototype.toString.call(cached) !== "[object ArrayBuffer]" || !cached.byteLength) throw new Error("已缓存的分片内容无效");
+              emitMetrics(adaptive.invalidate());
               return { data: cached };
             }
           }
           stage = "request";
-          const data = await readResource(segment, operation.signal);
+          const data = await readResource(segment, operation.signal, { onFailure(error) { emitMetrics(adaptive.recordFailure(error)); } });
           ensureActive(operation.signal);
+          const width = adaptive.metrics().activeConcurrency;
+          const eligible = nextToSchedule < plan.segments.length && plan.segments.length - completed >= width * 2;
+          emitMetrics(adaptive.recordSuccess(data.byteLength, eligible));
           if (hooks.putSegment) {
             stage = "cache-write";
             await hooks.putSegment(index, segment, data);
@@ -339,6 +441,7 @@
         }
       }
       function fillWindow(written) {
+        const width = adaptive.metrics().activeConcurrency;
         while (!firstFailure && !operation.signal.aborted && nextToSchedule < plan.segments.length && nextToSchedule < written + width) {
           const index = nextToSchedule++;
           pending.set(index, readSegment(index));
@@ -377,7 +480,7 @@
           bytes += result.data.byteLength;
           completed++;
           pending.delete(index);
-          onProgress({ bytes, completed, total: plan.segments.length });
+          onProgress({ bytes, completed, total: plan.segments.length, ...emitMetrics() });
           fillWindow(completed);
         }
         return { bytes, completed, total: plan.segments.length };
@@ -388,7 +491,9 @@
         throw error;
       } finally {
         await Promise.allSettled(pending.values());
+        clearInterval(metricsTimer);
         signal?.removeEventListener("abort", abort);
+        emitMetrics(adaptive.finish());
       }
     }
     return { loadPlan, download, readResource, request };
@@ -399,5 +504,5 @@
     if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(name)) name = `_${name}`;
     return `${name}.${extension}`;
   }
-  return { attributes, parsePlaylist, parseIv, sequenceToIv, createClient, safeFilename, absolutizePlaylist };
+  return { attributes, parsePlaylist, parseIv, sequenceToIv, createClient, safeFilename, absolutizePlaylist, createAdaptiveController };
 });

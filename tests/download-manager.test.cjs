@@ -82,7 +82,7 @@ test('content scripts and other extension pages cannot start jobs, save blobs or
 
 test('settings reject absolute and traversal paths while default uses Chrome directory', async () => {
   const h = setup();
-  assert.deepEqual(JSON.parse(JSON.stringify((await h.message({ action: 'getSettings' })).settings)), { subfolder: '', askWhereToSave: false, concurrency: 5 });
+  assert.deepEqual(JSON.parse(JSON.stringify((await h.message({ action: 'getSettings' })).settings)), { subfolder: '', askWhereToSave: false, concurrency: 5, concurrencyMode: 'auto' });
   for (const subfolder of ['C:/Desktop', '../escape', 'Video/../escape', '/root', 'Video//nested', 'CON', 'Video/NUL', 'Video/trailing.']) {
     assert.equal((await h.message({ action: 'saveSettings', settings: { subfolder } })).success, false, subfolder);
   }
@@ -394,4 +394,38 @@ test('history trimming retains every resumable task and new-worker pruning prote
   assert.equal(h.session.neko_jobs_v1.filter(job => job.resumable).length, 23);
   await h.message({ ...hlsRequest, url: 'https://cdn.test/second.m3u8' });
   assert.equal(h.calls.offscreen.filter(call => call.action === 'pruneCaches').length, 1);
+});
+
+test('automatic mode migrates old settings and only explicit manual mode opts out', async () => {
+  const h = setup({ settings: { subfolder: 'Videos', concurrency: 8 } });
+  assert.equal((await h.message({ action: 'getSettings' })).settings.concurrencyMode, 'auto');
+  for (const concurrencyMode of ['fast', null, false, 2]) {
+    assert.equal((await h.message({ action: 'saveSettings', settings: { concurrencyMode } })).success, false);
+  }
+  const first = await h.message(hlsRequest);
+  assert.equal(first.job.concurrencyMode, 'auto');
+  assert.equal(h.calls.offscreen.find(call => call.action === 'runJob').job.concurrencyMode, 'auto');
+  await h.message({ action: 'saveSettings', settings: { concurrencyMode: 'manual', concurrency: 3 } });
+  const second = await h.message({ ...hlsRequest, url: 'https://cdn.test/second.m3u8' });
+  assert.equal(second.job.concurrencyMode, 'manual');
+  assert.equal(second.job.concurrency, 3);
+});
+
+test('job metrics accept only finite nonnegative aggregate rates and bounded concurrency', async () => {
+  const h = setup();
+  const { job } = await h.message(hlsRequest);
+  await h.engine({ action: 'jobProgress', job: { id: job.id, state: 'downloading', bytesPerSecond: 800000,
+    activeConcurrency: 3, concurrencyMode: 'auto', concurrencyReason: 'probing' } });
+  await tick();
+  let current = h.session.neko_jobs_v1.find(item => item.id === job.id);
+  assert.equal(current.bytesPerSecond, 800000); assert.equal(current.activeConcurrency, 3);
+  assert.equal(current.concurrencyReason, 'probing');
+  for (const invalid of [NaN, Infinity, -1, '100']) {
+    await h.engine({ action: 'jobProgress', job: { id: job.id, state: 'downloading', bytesPerSecond: invalid,
+      activeConcurrency: 99, concurrencyMode: 'turbo', concurrencyReason: '<script>' } });
+  }
+  await tick();
+  current = h.session.neko_jobs_v1.find(item => item.id === job.id);
+  assert.equal(current.bytesPerSecond, 800000); assert.equal(current.activeConcurrency, 3);
+  assert.equal(current.concurrencyMode, 'auto'); assert.equal(current.concurrencyReason, 'probing');
 });

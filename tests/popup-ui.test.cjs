@@ -9,12 +9,13 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 // A small DOM double exercises extension messages and state transitions without
 // opening a browser or downloading network content.
 async function setup(options = {}) {
-  let ready;
+  let ready, poll;
   const elements = new Map(), messages = [], downloadCalls = [], runtimeListeners = new Set(), pendingActions = new Map();
   const state = {
     media: options.media || [], frames: options.frames || [], jobs: options.jobs || [],
     settings: options.settings || { subfolder: '', askWhereToSave: false, concurrency: 5 },
-    settingsError: null, nextJob: 1
+    settingsError: null, nextJob: 1, now: 1000,
+    capturePhase: options.capturePhase || (options.media?.length ? 'found' : 'checking'), playback: options.playback || {}, chunkCount: 0
   };
   const document = { hidden: false, activeElement: null, addEventListener(name, fn) { if (name === 'DOMContentLoaded') ready = fn; }, getElementById(id) { assert.ok(elements.has(id), `Missing HTML element ${id}`); return elements.get(id); } };
   class Element {
@@ -55,7 +56,7 @@ async function setup(options = {}) {
       sendMessage(message, callback) {
         messages.push(structuredClone(message));
         switch (message.action) {
-          case 'getMedia': return callback({ media: state.media, frames: state.frames, pageTitle: '测试视频' });
+          case 'getMedia': return callback(state.mediaError ? { success: false, error: state.mediaError } : { media: state.media, frames: state.frames, pageTitle: '测试视频', capturePhase: state.capturePhase, playback: state.playback, chunkCount: state.chunkCount });
           case 'getJobs': return callback({ success: true, jobs: state.jobs });
           case 'getSettings': return callback({ success: true, settings: state.settings });
           case 'saveSettings':
@@ -86,14 +87,18 @@ async function setup(options = {}) {
     tabs: { async query() { return [{ id: 7, title: '测试视频', url: options.tabUrl || 'https://video.test/watch' }]; }, create() { throw new Error('Popup must never open a download page'); } },
     downloads: { async download(value) { downloadCalls.push(value); return 42; } }
   };
-  const context = vm.createContext({ document, chrome, window: { addEventListener() {} }, navigator: { clipboard: { async writeText() {} } }, URL, URLSearchParams, console, queueMicrotask, setTimeout() { return 1; }, clearTimeout() {}, setInterval() { return 2; }, clearInterval() {} });
+  class Clock extends Date { static now() { return state.now; } }
+  const context = vm.createContext({ document, chrome, window: { addEventListener() {} }, navigator: { clipboard: { async writeText() {} } }, URL, URLSearchParams, Date: Clock, console, queueMicrotask, setTimeout() { return 1; }, clearTimeout() {}, setInterval(fn, duration) { assert.equal(duration, 2000); poll = fn; return 2; }, clearInterval() {} });
   vm.runInContext(source, context); await ready(); await tick();
   return {
     elements, messages, downloadCalls, state, document,
     async finishAction(action) { pendingActions.get(action)(); pendingActions.delete(action); await tick(); },
     async click(element) { await (typeof element === 'string' ? elements.get(element) : element).listeners.click?.({ target: element }); await tick(); },
+    async change(id, value) { const element = elements.get(id); element.value = value; await element.listeners.change?.({ target: element }); await tick(); },
     async submit() { await elements.get('settingsForm').listeners.submit({ preventDefault() {} }); await tick(); },
-    async updateJobs() { for (const listener of runtimeListeners) listener({ action: 'jobsUpdated' }); await tick(); }
+    async updateJobs() { for (const listener of runtimeListeners) listener({ action: 'jobsUpdated' }); await tick(); },
+    async updateMedia() { for (const listener of runtimeListeners) listener({ action: 'mediaListUpdated', tabId: 7 }); await tick(); },
+    async advance(ms) { state.now += ms; poll(); await tick(); }
   };
 }
 const media = (isM3U8 = true) => ({ url: `https://cdn.test/video.${isM3U8 ? 'm3u8' : 'mp4'}`, suggestedFilename: `fixture.${isM3U8 ? 'm3u8' : 'mp4'}`, isM3U8, ext: isM3U8 ? 'm3u8' : 'mp4' });
@@ -237,19 +242,38 @@ test('engine retry/backoff text is visible while running and disappears after re
   assert.equal(status.hidden, true, 'A successful job must not display stale retry information');
 });
 
-test('parallel settings default to five and save numeric supported choices', async () => {
+test('automatic concurrency is the default for new and migrated settings', async () => {
+  for (const settings of [{}, { concurrency: 8 }, { concurrency: 3, concurrencyMode: 'auto' }]) {
+    const ui = await setup({ settings }); await ui.click('btnSettings');
+    assert.equal(ui.elements.get('concurrencyMode').value, 'auto');
+    assert.equal(ui.elements.get('concurrencyCountRow').hidden, true);
+    assert.equal(ui.elements.get('concurrency').value, String(settings.concurrency || 5));
+    assert.match(ui.elements.get('concurrencyModeHint').textContent, /总下载速度/);
+    await ui.submit(); assert.equal(ui.state.settings.concurrencyMode, 'auto');
+  }
+});
+
+test('manual concurrency exposes all supported counts and retains its preference when returning to automatic', async () => {
   const ui = await setup({ settings: { subfolder: '', askWhereToSave: false } });
   await ui.click('btnSettings'); assert.equal(ui.elements.get('concurrency').value, '5');
-  for (const concurrency of [1, 2, 3, 5, 8]) {
-    await ui.click('btnSettings'); ui.elements.get('concurrency').value = String(concurrency); await ui.submit();
+  for (const concurrency of [1, 2, 3, 4, 5, 6, 7, 8]) {
+    await ui.click('btnSettings'); await ui.change('concurrencyMode', 'manual');
+    assert.equal(ui.elements.get('concurrencyCountRow').hidden, false);
+    ui.elements.get('concurrency').value = String(concurrency); await ui.submit();
     assert.equal(ui.state.settings.concurrency, concurrency);
+    assert.equal(ui.state.settings.concurrencyMode, 'manual');
     assert.equal(ui.elements.get('settingsModal').hidden, true);
   }
+  await ui.click('btnSettings'); await ui.change('concurrencyMode', 'auto');
+  assert.equal(ui.elements.get('concurrencyCountRow').hidden, true); await ui.submit();
+  assert.equal(ui.state.settings.concurrency, 8);
+  await ui.click('btnSettings'); await ui.change('concurrencyMode', 'manual');
+  assert.equal(ui.elements.get('concurrency').value, '8');
 });
 
 test('invalid concurrency does not reach settings storage, and valid existing values are retained', async () => {
   const ui = await setup({ settings: { subfolder: '', askWhereToSave: false, concurrency: 4 } });
-  await ui.click('btnSettings'); assert.equal(ui.elements.get('concurrency').value, '4');
+  await ui.click('btnSettings'); await ui.change('concurrencyMode', 'manual'); assert.equal(ui.elements.get('concurrency').value, '4');
   await ui.submit(); assert.equal(ui.state.settings.concurrency, 4);
   const before = ui.messages.filter(message => message.action === 'saveSettings').length;
   for (const invalid of ['', '0', '9', '1.5', 'not-a-number']) {
@@ -258,4 +282,96 @@ test('invalid concurrency does not reach settings storage, and valid existing va
     assert.match(ui.elements.get('settingsError').textContent, /1 到 8 之间的整数/);
   }
   assert.equal(ui.messages.filter(message => message.action === 'saveSettings').length, before);
+  await ui.click('btnSettings'); await ui.change('concurrencyMode', 'unexpected'); await ui.submit();
+  assert.match(ui.elements.get('settingsError').textContent, /自动调节或手动固定/);
+  assert.equal(ui.messages.filter(message => message.action === 'saveSettings').length, before);
+});
+
+test('job telemetry reports aggregate network speed and adaptive count without replacing focused controls', async () => {
+  const job = { id: 'adaptive', filename: 'film.ts', state: 'downloading', bytesReceived: 500 * 1024 ** 2, cachedSegments: 498, bytesPerSecond: 1.2 * 1024 ** 2, activeConcurrency: 3, concurrencyMode: 'auto', concurrencyReason: 'probing' };
+  const ui = await setup({ jobs: [job] });
+  const card = ui.elements.get('jobList').querySelector('.job-card'), cancel = card.querySelector('.job-button'); cancel.focus();
+  assert.equal(card.querySelector('.job-telemetry').hidden, false);
+  assert.equal(card.querySelector('.job-speed').textContent, '合计 1.2 MB/s');
+  assert.equal(card.querySelector('.job-concurrency').textContent, '自动 · 3 路');
+  assert.match(card.querySelector('.job-concurrency').title, /比较增加并行数后的总速度/);
+  Object.assign(job, { bytesPerSecond: 0, activeConcurrency: 1, concurrencyReason: 'errors' }); await ui.updateJobs();
+  assert.equal(card.querySelector('.job-speed').textContent, '合计 0 B/s', 'Restored cached bytes cannot become fake transfer speed');
+  assert.match(card.querySelector('.job-concurrency').title, /降低并行数/);
+  assert.equal(ui.document.activeElement, cancel);
+  Object.assign(job, { concurrencyMode: 'manual', activeConcurrency: 8, concurrencyReason: 'manual' }); await ui.updateJobs();
+  assert.equal(card.querySelector('.job-concurrency').textContent, '手动 · 8 路');
+  for (const state of ['queued', 'parsing', 'saving', 'complete', 'interrupted', 'cancelled']) {
+    job.state = state; await ui.updateJobs(); assert.equal(card.querySelector('.job-telemetry').hidden, true, state);
+  }
+});
+
+test('waiting, confirmed playback detection, and finite no-source are distinct capture states', async () => {
+  const ui = await setup({ capturePhase: 'waiting', playback: { hasVideo: true, observed: false, playing: false } });
+  assert.equal(ui.elements.get('statusBar').dataset.state, 'waiting');
+  assert.match(ui.elements.get('statusText').textContent, /请先在网页点击播放/);
+  assert.equal(ui.elements.get('mediaList').querySelector('.empty-box').dataset.phase, 'waiting');
+  ui.state.capturePhase = 'sniffing'; ui.state.playback.observed = true; ui.state.playback.playing = true; ui.state.chunkCount = 1;
+  await ui.updateMedia();
+  assert.equal(ui.elements.get('statusBar').dataset.state, 'sniffing');
+  assert.match(ui.elements.get('mediaList').querySelector('.empty-desc').textContent, /分段请求/);
+  const requests = ui.messages.filter(message => message.action === 'getMedia').length;
+  ui.state.capturePhase = 'no-source'; await ui.advance(10000);
+  assert.equal(ui.messages.filter(message => message.action === 'getMedia').length, requests + 1, 'Polling must refresh discovery, even without an event');
+  assert.equal(ui.elements.get('statusBar').dataset.state, 'no-source');
+  assert.equal(ui.elements.get('mediaList').querySelector('.empty-box').dataset.phase, 'no-source');
+  assert.doesNotMatch(ui.elements.get('statusText').textContent, /正在识别/);
+});
+
+test('preloaded sources are downloadable without claiming playback and cards survive playback transitions', async () => {
+  const ui = await setup({ media: [{ ...media(), active: true }], capturePhase: 'found', playback: { observed: false, hasVideo: true, playing: false, uncertain: false } });
+  const card = ui.elements.get('mediaList').querySelector('.media-card'), button = card.querySelector('.btn-primary');
+  button.focus();
+  assert.match(ui.elements.get('statusText').textContent, /尚未播放/);
+  assert.equal(card.querySelector('.source-number').textContent, '当前线路');
+  assert.equal(button.disabled, false);
+  Object.assign(ui.state.playback, { observed: true, playing: true }); await ui.updateMedia();
+  assert.match(ui.elements.get('statusText').textContent, /正在播放/);
+  assert.equal(card.querySelector('.source-number').textContent, '当前播放');
+  assert.equal(ui.document.activeElement, button);
+  ui.state.playback.playing = false; await ui.updateMedia();
+  assert.match(ui.elements.get('statusText').textContent, /已播放/);
+  assert.equal(card.querySelector('.source-number').textContent, '当前线路');
+  assert.equal(ui.elements.get('mediaList').querySelector('.media-card'), card);
+});
+
+test('unknown player state becomes a static neutral hint, then recovers when observations arrive', async () => {
+  const ui = await setup({ capturePhase: 'checking', playback: { observed: false, uncertain: true } });
+  assert.equal(ui.elements.get('statusBar').dataset.state, 'checking');
+  await ui.advance(6000);
+  assert.equal(ui.elements.get('statusBar').dataset.state, 'unconfirmed');
+  assert.match(ui.elements.get('statusText').textContent, /尚未确认/);
+  assert.doesNotMatch(ui.elements.get('mediaList').querySelector('.empty-desc').textContent, /尚未播放/);
+  await ui.advance(20000); assert.equal(ui.elements.get('statusBar').dataset.state, 'unconfirmed');
+  ui.state.capturePhase = 'waiting'; ui.state.playback = { hasVideo: true, observed: false }; await ui.updateMedia();
+  assert.equal(ui.elements.get('statusBar').dataset.state, 'waiting');
+  ui.state.capturePhase = 'checking'; await ui.updateMedia();
+  assert.equal(ui.elements.get('statusBar').dataset.state, 'checking', 'A new unknown observation starts a fresh short check');
+});
+
+test('no player, unavailable page, and connection failure have separate empty states', async () => {
+  const ui = await setup({ capturePhase: 'no-video', playback: { videoCount: 0, frameCount: 1, uncertain: false } });
+  assert.equal(ui.elements.get('statusBar').dataset.state, 'no-video');
+  assert.match(ui.elements.get('mediaList').querySelector('.empty-title').textContent, /没有播放器/);
+  ui.state.mediaError = '后台未响应'; await ui.updateMedia();
+  assert.equal(ui.elements.get('statusBar').dataset.state, 'error');
+  assert.match(ui.elements.get('mediaList').querySelector('.empty-hint').textContent, /后台未响应/);
+  const unavailable = await setup({ tabUrl: 'chrome://settings/downloads' });
+  assert.equal(unavailable.elements.get('statusBar').dataset.state, 'unavailable');
+  await unavailable.click('btnRefresh');
+  assert.equal(unavailable.elements.get('statusBar').dataset.state, 'unavailable');
+  assert.equal(unavailable.messages.some(message => message.action === 'getMedia'), false);
+});
+
+test('requests or uncertain iframe data never establish playback on their own', async () => {
+  const ui = await setup({ capturePhase: 'sniffing', playback: { observed: false, playing: false, uncertain: true } });
+  assert.equal(ui.elements.get('statusBar').dataset.state, 'checking');
+  ui.state.media = [{ ...media(), active: true }]; ui.state.capturePhase = 'found'; await ui.updateMedia();
+  assert.match(ui.elements.get('statusText').textContent, /播放状态未确认/);
+  assert.equal(ui.elements.get('mediaList').querySelector('.source-number').textContent, '当前线路');
 });

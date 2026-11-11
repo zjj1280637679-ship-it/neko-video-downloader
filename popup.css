@@ -94,3 +94,16 @@
 .concurrency-field .setting-field{margin:0}
 .concurrency-select{width:128px;margin:0;padding:7px 9px;cursor:pointer}
 select{font:inherit}select:focus-visible{outline:3px solid #cba7e0;outline-offset:3px}
+.mode-select{width:163px;font-size:11px}
+.job-telemetry{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:8px;padding-top:7px;border-top:1px solid #f0e8ee;font-size:10px;font-variant-numeric:tabular-nums}
+.job-speed{color:#756071;font-weight:600}
+.job-concurrency{color:#9a6b84;background:#faf0f5;padding:2px 6px;border-radius:5px;white-space:nowrap}
+.status-bar[data-state="waiting"]{color:#a16b40}.status-bar[data-state="waiting"] .status-radar{background:#c69359}
+.status-bar[data-state="sniffing"]{color:#77639a}.status-bar[data-state="sniffing"] .status-radar{background:#9a81ba;animation:capture-pulse 1.3s ease-in-out infinite}
+.status-bar[data-state="checking"] .status-radar{background:#ad9ba8;animation:capture-pulse 1.8s ease-in-out infinite}
+.status-bar[data-state="unconfirmed"] .status-radar,.status-bar[data-state="unavailable"] .status-radar,.status-bar[data-state="no-video"] .status-radar,.status-bar[data-state="no-source"] .status-radar{background:#aaa0a8}
+.empty-box[data-phase="waiting"]{background:#fffbf5;border-color:#e6d6bc}.empty-box[data-phase="waiting"] .empty-cat{background:#f8ead2;color:#a97d44}
+.empty-box[data-phase="sniffing"]{background:#faf7fe;border-color:#d7cae6}.empty-box[data-phase="sniffing"] .empty-cat{background:#eee5f8;color:#8a6fa9}
+.empty-box[data-phase="checking"],.empty-box[data-phase="unconfirmed"],.empty-box[data-phase="unavailable"],.empty-box[data-phase="no-source"]{background:#fcfafc;border-color:#dfd6de}
+.empty-box[data-phase="waiting"] .empty-cat,.empty-box[data-phase="sniffing"] .empty-cat,.empty-box[data-phase="checking"] .empty-cat,.empty-box[data-phase="unconfirmed"] .empty-cat,.empty-box[data-phase="unavailable"] .empty-cat,.empty-box[data-phase="no-source"] .empty-cat{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;font-size:21px}
+@keyframes capture-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.8)}}

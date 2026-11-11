@@ -95,7 +95,7 @@ function fixture(options = {}) {
   } };
   const hls = {
     safeFilename: core.safeFilename,
-    createClient({ signal }) {
+    createClient({ signal, onMetrics }) {
       let source;
       return {
         async loadPlan(url) {
@@ -104,8 +104,8 @@ function fixture(options = {}) {
           if (options.loadPlan) return options.loadPlan(url, signal);
           return { segments: [{}], totalDuration: 5, isFmp4: false, maps: new Map(), discontinuities: 0 };
         },
-        async download(plan, sink, progress) {
-          if (options.download) return options.download(sink, signal, progress, source);
+        async download(plan, sink, progress, concurrency) {
+          if (options.download) return options.download(sink, signal, progress, source, concurrency, onMetrics);
           await sink.write(new Uint8Array([1, 2, 3, 4]).buffer);
           progress({ bytes: 4, completed: 1, total: 1 });
         }
@@ -326,4 +326,26 @@ test('pending save acknowledgement retains source through cancellation until id 
   await until(() => f.status('one').state === 'cancelled');
   assert.equal(f.cancelled.length, 1);
   assert.equal(f.files[0].removed, true);
+});
+
+test('offscreen defaults to adaptive mode, forwards aggregate metrics and clears speed while saving', async () => {
+  for (const config of [{ expected: 'auto' }, { concurrencyMode: 'manual', concurrency: 3, expected: 3 }]) {
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const f = fixture({ async download(sink, _signal, progress, _url, concurrency, onMetrics) {
+      assert.equal(concurrency, config.expected);
+      onMetrics({ bytesPerSecond: 1234567, activeConcurrency: 3, concurrencyMode: config.concurrencyMode || 'auto', concurrencyReason: 'gain' });
+      await gate;
+      await sink.write(new Uint8Array(4).buffer);
+      progress({ bytes: 4, completed: 1, total: 1 });
+    } });
+    f.run('adaptive', config);
+    await until(() => f.status('adaptive').bytesPerSecond === 1234567);
+    assert.equal(f.status('adaptive').activeConcurrency, 3);
+    assert.equal(f.status('adaptive').concurrencyMode, config.concurrencyMode || 'auto');
+    release();
+    await until(() => f.status('adaptive').state === 'complete');
+    assert.equal(f.status('adaptive').bytesPerSecond, 0);
+    assert.equal(f.status('adaptive').activeConcurrency, 0);
+  }
 });

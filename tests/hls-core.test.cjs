@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { webcrypto } = require('node:crypto');
-const { parsePlaylist, parseIv, sequenceToIv, createClient, safeFilename, absolutizePlaylist } = require('../hls-core.js');
+const { parsePlaylist, parseIv, sequenceToIv, createClient, safeFilename, absolutizePlaylist, createAdaptiveController } = require('../hls-core.js');
 const BASE = 'https://fixture.test/video/list.m3u8';
 const playlist = (body, end = true) => `#EXTM3U\n${body}\n${end ? '#EXT-X-ENDLIST' : ''}\n`;
 const segment = name => `#EXTINF:5.5,\n${name}`;
@@ -17,6 +17,229 @@ function collectSink() {
   const chunks = [];
   return { chunks, async write(data) { chunks.push(Buffer.from(data)); } };
 }
+
+function adaptiveClock(extra = {}) {
+  let now = 0;
+  const controller = createAdaptiveController({ now: () => now, ...extra });
+  return { controller, advance(ms) { now += ms; }, window(rate, eligible = true) {
+    for (let index = 0; index < 4; index++) { now += 1000; controller.recordSuccess(rate, eligible); }
+    return controller.metrics();
+  } };
+}
+
+test('automatic concurrency retains more connections when individual rates fall but total goodput rises', () => {
+  const { controller, window } = adaptiveClock();
+  assert.deepEqual(controller.metrics(), { bytesPerSecond: 0, activeConcurrency: 2, concurrencyMode: 'auto', concurrencyReason: 'initializing' });
+  // Two requests at 1 MB/s each establish 2 MB/s total, then probe a third.
+  assert.equal(window(2_000_000).activeConcurrency, 3);
+  // Three at 0.8 MB/s each yield 2.4 MB/s total: slower individuals are not a regression.
+  const result = window(2_400_000);
+  assert.equal(result.activeConcurrency, 3);
+  assert.equal(result.concurrencyReason, 'gain');
+  assert.equal(result.bytesPerSecond, 2_400_000);
+  assert.equal(window(2_400_000).concurrencyReason, 'cooldown');
+  window(2_400_000);
+  assert.equal(window(2_400_000).activeConcurrency, 4, 'another probe is allowed after cooldown');
+});
+
+test('automatic concurrency reverts probes that cannot increase aggregate bandwidth', () => {
+  const { window } = adaptiveClock();
+  assert.equal(window(1000).activeConcurrency, 3);
+  const result = window(1000);
+  assert.equal(result.activeConcurrency, 2);
+  assert.equal(result.concurrencyReason, 'no-gain');
+  assert.equal(window(1000).activeConcurrency, 2, 'cooldown prevents repeated immediate probes');
+});
+
+test('small total gains above measurement noise are retained without a ten-percent threshold', () => {
+  const gain = adaptiveClock();
+  gain.window(1000);
+  assert.equal(gain.window(1050).concurrencyReason, 'gain');
+  assert.equal(gain.controller.metrics().activeConcurrency, 3);
+  const noise = adaptiveClock();
+  noise.window(1000);
+  assert.equal(noise.window(1020).concurrencyReason, 'no-gain');
+  assert.equal(noise.controller.metrics().activeConcurrency, 2);
+});
+
+test('sustained aggregate decline probes fewer connections and retains them if speed is preserved', () => {
+  const { window } = adaptiveClock({ initial: 3, max: 3 });
+  assert.equal(window(1000).concurrencyReason, 'steady');
+  assert.equal(window(600).activeConcurrency, 3, 'one slow window is insufficient');
+  assert.equal(window(600).activeConcurrency, 2);
+  const result = window(610);
+  assert.equal(result.activeConcurrency, 2);
+  assert.equal(result.concurrencyReason, 'decline');
+});
+
+test('HTTP errors and timeouts do not change concurrency or erase a useful total-speed probe', () => {
+  const automatic = adaptiveClock();
+  automatic.window(1000);
+  assert.equal(automatic.controller.recordFailure({ httpStatus: 429 }).activeConcurrency, 3);
+  assert.equal(automatic.controller.recordFailure({ httpStatus: 503 }).activeConcurrency, 3);
+  assert.equal(automatic.controller.recordFailure({ name: 'TimeoutError' }).activeConcurrency, 3);
+  assert.equal(automatic.controller.metrics().concurrencyReason, 'probing');
+  assert.equal(automatic.window(1050).concurrencyReason, 'gain');
+  const manual = adaptiveClock({ mode: 'manual', initial: 5 });
+  manual.window(1000);
+  assert.equal(manual.controller.recordFailure({ httpStatus: 429 }).activeConcurrency, 5);
+  assert.equal(manual.controller.metrics().concurrencyReason, 'manual');
+});
+
+test('retry wall time affects the total-speed trend naturally, without an independent error reduction', () => {
+  const fixture = adaptiveClock({ initial: 3, max: 3 });
+  fixture.window(1000);
+  assert.equal(fixture.controller.recordFailure({ httpStatus: 429 }).activeConcurrency, 3);
+  fixture.advance(4000); // A retry delay produces no successful network bytes.
+  assert.equal(fixture.controller.recordFailure({ name: 'TimeoutError' }).activeConcurrency, 3);
+  assert.equal(fixture.window(1000).activeConcurrency, 3, 'one slower total-speed window is insufficient');
+  assert.equal(fixture.window(700).activeConcurrency, 2, 'two slower total-speed windows trigger a lower-width probe');
+  assert.equal(fixture.window(700).activeConcurrency, 2, 'the lower width keeps the same total speed');
+});
+
+test('a lower-concurrency probe is rolled back when it reduces total speed', () => {
+  const { window } = adaptiveClock({ initial: 3, max: 3 });
+  window(1000); window(700);
+  assert.equal(window(700).activeConcurrency, 2);
+  const result = window(600);
+  assert.equal(result.activeConcurrency, 3);
+  assert.equal(result.concurrencyReason, 'no-gain');
+});
+
+test('minimum concurrency rebases sustained lower total speed and eventually probes upward again', () => {
+  const { window } = adaptiveClock({ initial: 2, max: 2 });
+  window(1000); window(600);
+  assert.equal(window(600).activeConcurrency, 1);
+  assert.equal(window(600).concurrencyReason, 'decline');
+  window(600); window(600);
+  assert.equal(window(500).concurrencyReason, 'steady');
+  assert.equal(window(500).concurrencyReason, 'cooldown', 'confirmed decline at the minimum rebases the historical rate');
+  assert.equal(window(500).activeConcurrency, 1);
+  assert.equal(window(500).activeConcurrency, 1);
+  const probe = window(500);
+  assert.equal(probe.activeConcurrency, 2);
+  assert.equal(probe.concurrencyReason, 'probing');
+  assert.equal(window(600).concurrencyReason, 'gain');
+});
+
+test('cache or tail contamination cancels a probe; short windows and stale rates do not train', () => {
+  const fixture = adaptiveClock();
+  fixture.advance(1000);
+  fixture.controller.recordSuccess(1000);
+  assert.equal(fixture.controller.metrics().activeConcurrency, 2);
+  fixture.advance(9000);
+  fixture.controller.recordSuccess(1000);
+  assert.equal(fixture.controller.metrics().activeConcurrency, 2, 'elapsed time alone is not enough samples');
+  fixture.controller.invalidate();
+  fixture.window(1000);
+  assert.equal(fixture.controller.metrics().activeConcurrency, 3);
+  assert.equal(fixture.controller.invalidate().activeConcurrency, 2);
+  assert.equal(fixture.window(1000, false).activeConcurrency, 2);
+  fixture.advance(4001);
+  assert.equal(fixture.controller.metrics().bytesPerSecond, 0);
+  assert.equal(fixture.controller.finish().bytesPerSecond, 0);
+});
+
+test('adaptive limits bound all total-speed probes to the permitted one to eight connections', () => {
+  const fixture = adaptiveClock({ initial: 20, max: 20, min: -5, cooldownMs: 4000 });
+  assert.equal(fixture.controller.metrics().activeConcurrency, 8);
+  assert.equal(fixture.window(1000).activeConcurrency, 8);
+  let rate = 1000;
+  for (let width = 8; width > 1; width--) {
+    rate /= 2;
+    fixture.window(rate);
+    assert.equal(fixture.window(rate).activeConcurrency, width - 1);
+    assert.equal(fixture.window(rate).activeConcurrency, width - 1);
+  }
+  fixture.window(rate / 2);
+  assert.equal(fixture.window(rate / 2).activeConcurrency, 1);
+});
+
+test('download scheduler probes aggregate speed, reverts no-gain, and preserves ordered bounded output', async () => {
+  let now = 0, active = 0, maxActive = 0, written = 0;
+  const gates = new Map(), metrics = [], progress = [];
+  const plan = parsePlaylist(playlist(Array.from({ length: 28 }, (_, index) => segment(`${index}.ts`)).join('\n')), BASE);
+  const output = [];
+  const task = client(async url => {
+    const index = Number(url.match(/(\d+)\.ts$/)[1]);
+    assert.ok(index < written + 8, 'pending reorder window cannot exceed eight');
+    const gate = deferred(); gates.set(index, gate);
+    maxActive = Math.max(maxActive, ++active);
+    await gate.promise; active--;
+    return response(Buffer.alloc(1000, index + 1));
+  }, { now: () => now, onMetrics: item => metrics.push(item) }).download(plan, {
+    async write(data) { output.push(new Uint8Array(data)[0]); written++; }
+  }, item => progress.push(item), 'auto');
+  await tick();
+  assert.equal(gates.size, 2);
+  for (let index = 0; index < 28; index++) {
+    assert.ok(gates.has(index), `segment ${index} is scheduled`);
+    now += 1000;
+    gates.get(index).resolve();
+    await tick();
+  }
+  await task;
+  assert.deepEqual(output, Array.from({ length: 28 }, (_, index) => index + 1));
+  assert.ok(metrics.some(item => item.activeConcurrency === 3 && item.concurrencyReason === 'probing'));
+  assert.ok(metrics.some(item => item.activeConcurrency === 2 && item.concurrencyReason === 'no-gain'));
+  assert.equal(maxActive, 3);
+  assert.ok(progress.every(item => item.concurrencyMode === 'auto' && Number.isFinite(item.bytesPerSecond)));
+  assert.equal(metrics.at(-1).bytesPerSecond, 0);
+});
+
+test('cached segments contribute output bytes but no network speed or concurrency learning', async () => {
+  let now = 0;
+  const metrics = [], progress = [];
+  const plan = parsePlaylist(playlist(Array.from({ length: 20 }, (_, index) => segment(`${index}.ts`)).join('\n')), BASE);
+  const result = await client(() => { throw new Error('cache must avoid network'); }, {
+    now: () => now, onMetrics: item => metrics.push(item)
+  }).download(plan, collectSink(), item => progress.push(item), 'auto', {
+    async getSegment() { now += 1000; return new ArrayBuffer(1000); }
+  });
+  assert.equal(result.bytes, 20000);
+  assert.ok(metrics.every(item => item.bytesPerSecond === 0 && item.activeConcurrency === 2));
+  assert.ok(progress.every(item => item.bytesPerSecond === 0));
+});
+
+test('short downloads do not probe and HTTP retries do not independently change scheduling width', async () => {
+  const plan = parsePlaylist(playlist(Array.from({ length: 3 }, (_, index) => segment(`${index}.ts`)).join('\n')), BASE);
+  for (const concurrency of ['auto', 5]) {
+    let now = 0, failed = false;
+    const metrics = [];
+    await client(async url => {
+      now += 2000;
+      if (!failed && url.endsWith('/0.ts')) { failed = true; return response('busy', null, { status: 429 }); }
+      return response(Buffer.alloc(1000));
+    }, { now: () => now, retries: 2, retryDelayMs: 0, onMetrics: item => metrics.push(item) })
+      .download(plan, collectSink(), undefined, concurrency);
+    if (concurrency === 'auto') {
+      assert.ok(metrics.every(item => item.activeConcurrency === 2));
+      assert.ok(metrics.every(item => item.concurrencyReason !== 'errors'));
+    } else assert.ok(metrics.every(item => item.activeConcurrency === 5 && item.concurrencyMode === 'manual'));
+    assert.equal(metrics.at(-1).bytesPerSecond, 0);
+  }
+});
+
+test('metrics decay to zero while requests are stalled, before download completion', async () => {
+  let now = 0;
+  const gates = [deferred(), deferred()], metrics = [];
+  const plan = parsePlaylist(playlist(segment('0.ts') + '\n' + segment('1.ts')), BASE);
+  const task = client(async url => {
+    await gates[Number(url.match(/(\d+)\.ts$/)[1])].promise;
+    return response(Buffer.alloc(1000));
+  }, { now: () => now, onMetrics: item => metrics.push(item) }).download(plan, collectSink(), undefined, 'auto');
+  now = 1000; gates[0].resolve();
+  await tick();
+  assert.ok(metrics.some(item => item.bytesPerSecond > 0));
+  now = 7000;
+  await new Promise(resolve => setTimeout(resolve, 1050));
+  assert.equal(metrics.at(-1).bytesPerSecond, 0);
+  gates[1].resolve();
+  await task;
+  const count = metrics.length;
+  await tick();
+  assert.equal(metrics.length, count, 'no telemetry emitted after the task settles');
+});
 
 test('short IV pads to 128 bits and sequence IV preserves integers beyond 2^53', () => {
   assert.equal(Buffer.from(parseIv('0x00000000000000000000000000000000')).toString('hex'), '00000000000000000000000000000000');

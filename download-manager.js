@@ -42,7 +42,9 @@
     if (subfolder && subfolder.split('/').some(part => !part || part === '.' || part === '..' || /[. ]$/.test(part) || /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(part))) throw new Error('子文件夹不能包含空目录、.. 或系统保留名称');
     const concurrency = value.concurrency === undefined ? 5 : value.concurrency;
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8) throw new Error('分片并发数必须是 1 到 8 之间的整数');
-    return { subfolder, askWhereToSave: value.askWhereToSave === true, concurrency };
+    const concurrencyMode = value.concurrencyMode === undefined ? 'auto' : value.concurrencyMode;
+    if (!['auto', 'manual'].includes(concurrencyMode)) throw new Error('请选择自动调整或手动并行模式');
+    return { subfolder, askWhereToSave: value.askWhereToSave === true, concurrency, concurrencyMode };
   }
   async function settings() {
     const data = await chrome.storage.local.get(SETTINGS_KEY);
@@ -125,6 +127,10 @@
     }
     if (typeof incoming.retryMessage === 'string') patch.retryMessage = incoming.retryMessage.slice(0, 500);
     if (typeof incoming.phase === 'string') patch.phase = incoming.phase.slice(0, 80);
+    if (Number.isFinite(incoming.bytesPerSecond) && incoming.bytesPerSecond >= 0 && incoming.bytesPerSecond <= 1e12) patch.bytesPerSecond = incoming.bytesPerSecond;
+    if (Number.isInteger(incoming.activeConcurrency) && incoming.activeConcurrency >= 0 && incoming.activeConcurrency <= 8) patch.activeConcurrency = incoming.activeConcurrency;
+    if (['auto', 'manual'].includes(incoming.concurrencyMode)) patch.concurrencyMode = incoming.concurrencyMode;
+    if (['initializing', 'probing', 'gain', 'no-gain', 'errors', 'decline', 'cooldown', 'steady', 'insufficient', 'manual'].includes(incoming.concurrencyReason)) patch.concurrencyReason = incoming.concurrencyReason;
     if (typeof incoming.filename === 'string') {
       const leaf = incoming.filename.split('/').pop();
       const expected = job.subfolder ? `${job.subfolder}/${safeName(leaf)}` : safeName(leaf);
@@ -146,7 +152,7 @@
     const isM3U8 = Boolean(message.isM3U8) || /\.m3u8(?:$|\?)/i.test(url.href);
     let basename = safeName(message.filename || message.title || '视频.mp4');
     if (isM3U8) basename = basename.replace(/\.(?:m3u8|mp4|ts)$/i, '') + '.ts';
-    const job = { id: crypto.randomUUID(), url: url.href, title: String(message.title || basename).slice(0, 300), filename: pref.subfolder ? `${pref.subfolder}/${basename}` : basename, subfolder: pref.subfolder, saveAs: pref.askWhereToSave, concurrency: pref.concurrency, isM3U8, tabId: Number.isInteger(message.tabId) ? message.tabId : null, state: 'queued', bytesReceived: 0, totalBytes: 0, completedSegments: 0, totalSegments: 0, error: '', createdAt: Date.now(), updatedAt: Date.now() };
+    const job = { id: crypto.randomUUID(), url: url.href, title: String(message.title || basename).slice(0, 300), filename: pref.subfolder ? `${pref.subfolder}/${basename}` : basename, subfolder: pref.subfolder, saveAs: pref.askWhereToSave, concurrency: pref.concurrency, concurrencyMode: pref.concurrencyMode, isM3U8, tabId: Number.isInteger(message.tabId) ? message.tabId : null, state: 'queued', bytesReceived: 0, totalBytes: 0, completedSegments: 0, totalSegments: 0, error: '', createdAt: Date.now(), updatedAt: Date.now() };
     jobs.set(job.id, job); dispatching.add(job.id);
     try {
       await persist(); notify();
@@ -185,7 +191,7 @@
         }
         update(job, { state: 'queued', error: '', cleanupError: '', cancelRequested: false,
           retryAttempt: 0, retryMessage: '', phase: 'queued', downloadId: null, savedPath: '',
-          concurrency: pref.concurrency });
+          concurrency: pref.concurrency, concurrencyMode: pref.concurrencyMode, bytesPerSecond: 0, activeConcurrency: 0, concurrencyReason: 'initializing' });
         prepared = true;
         await persist();
         await ensureOffscreen();

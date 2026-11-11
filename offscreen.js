@@ -86,6 +86,7 @@
           state: "queued", bytesReceived: 0, totalBytes: 0, completedSegments: 0, totalSegments: 0,
           cachedSegments: previous?.status.cachedSegments || job.cachedSegments || 0,
           resumable: false, retryAttempt: 0, retryMessage: '',
+          bytesPerSecond: 0, activeConcurrency: 0, concurrencyMode: job.concurrencyMode === 'manual' ? 'manual' : 'auto', concurrencyReason: 'initializing',
           createdAt: previous?.status.createdAt || stamp, updatedAt: stamp, error: null } };
       entries.set(job.id, entry);
       queue.push(job.id);
@@ -175,6 +176,9 @@
         }, onRecovered({ resourceUrl }) {
           retryingResources.delete(resourceUrl);
           update(entry, Array.from(retryingResources.values()).at(-1) || { retryAttempt: 0, retryMessage: '' });
+        }, onMetrics(metrics) {
+          update(entry, { bytesPerSecond: metrics.bytesPerSecond, activeConcurrency: metrics.activeConcurrency,
+            concurrencyMode: metrics.concurrencyMode, concurrencyReason: metrics.concurrencyReason });
         } });
         const plan = await client.loadPlan(entry.input.url);
         ensureActive(entry);
@@ -200,7 +204,7 @@
         await update(entry, { state: "downloading" }, true);
         await client.download(plan, sink, ({ bytes, completed, total }) => {
           update(entry, { bytesReceived: bytes, completedSegments: completed, totalSegments: total });
-        }, entry.input.concurrency || 5, cache || {});
+        }, entry.input.concurrencyMode === 'manual' ? entry.input.concurrency || 5 : 'auto', cache || {});
         ensureActive(entry);
         let file;
         if (writer) {
@@ -214,7 +218,7 @@
         }
         ensureActive(entry);
         objectUrl = urlApi.createObjectURL(file);
-        await update(entry, { state: "saving", totalBytes: file.size, retryAttempt: 0, retryMessage: '' }, true);
+        await update(entry, { state: "saving", totalBytes: file.size, retryAttempt: 0, retryMessage: '', bytesPerSecond: 0, activeConcurrency: 0 }, true);
         chromeReferencePossible = true;
         const result = await saveBlob(entry, { jobId: entry.status.id, url: objectUrl, filename, saveAs: entry.input.saveAs === true });
         if (!Number.isInteger(result.downloadId)) throw new Error("Chrome 未返回有效的下载任务编号");
@@ -262,7 +266,7 @@
         const resumable = finalState === 'interrupted' && retainedCount > 0 &&
           ((!chromeReferencePossible && entry.downloadId === null) || entry.chromeFinished);
         await update(entry, { state: finalState, error: errorText, cleanupError, resumable,
-          cachedSegments: retainedCount, retryAttempt: 0, retryMessage: '', cancelRequested: false, finishedAt: now() }, true);
+          cachedSegments: retainedCount, retryAttempt: 0, retryMessage: '', bytesPerSecond: 0, activeConcurrency: 0, cancelRequested: false, finishedAt: now() }, true);
       }
     }
     async function pump() {

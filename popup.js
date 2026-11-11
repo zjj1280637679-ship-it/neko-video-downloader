@@ -5,10 +5,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   const activeStates = new Set(["queued", "parsing", "downloading", "saving"]);
   const stateLabels = { queued: "等待下载", parsing: "解析清单", downloading: "下载中", saving: "正在保存", complete: "已保存", interrupted: "下载中断", cancelled: "已取消" };
   let currentTab = null, currentMedia = [], currentJobs = [], currentFrames = [], activeModalData, modalTrigger;
-  let settings = { subfolder: "", askWhereToSave: false, concurrency: 5 };
-  let customConcurrencyOption = null;
+  let settings = { subfolder: "", askWhereToSave: false, concurrency: 5, concurrencyMode: "auto" };
   let mediaLoading = false, jobsLoading = false, mediaPending = false, jobsPending = false;
   let refreshTimer, toastTimer, framesSignature = "", closing = false;
+  let capture = { phase: "checking", playback: {}, chunkCount: 0 }, checkingStartedAt = Date.now();
 
   function node(tag, className, text) {
     const element = document.createElement(tag);
@@ -60,13 +60,42 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
     });
   }
-  function emptyState(container, title, description, hint = "") {
-    const signature = JSON.stringify([title, description, hint]);
+  function emptyState(container, title, description, hint = "", phase = "") {
+    const signature = JSON.stringify([title, description, hint, phase]);
     if (container.querySelector(".empty-box")?.dataset.signature === signature) return;
-    const empty = node("div", "empty-box"); empty.dataset.signature = signature;
-    empty.append(node("p", "empty-cat", "(=^･ω･^=)"), node("p", "empty-title", title), node("p", "empty-desc", description));
+    const empty = node("div", "empty-box"); empty.dataset.signature = signature; empty.dataset.phase = phase;
+    const symbol = { checking: "○", unconfirmed: "○", waiting: "▶", sniffing: "⌕", "no-source": "…", unavailable: "—" }[phase] || "(=^･ω･^=)";
+    const icon = node("p", "empty-cat", symbol); icon.setAttribute("aria-hidden", "true");
+    empty.append(icon, node("p", "empty-title", title), node("p", "empty-desc", description));
     if (hint) empty.append(node("p", "empty-hint", hint));
     container.replaceChildren(empty);
+  }
+  function updateCapture(response) {
+    const playback = response.playback || {};
+    let phase = currentMedia.length ? "found" : response.capturePhase;
+    if (!["checking", "waiting", "sniffing", "found", "no-source", "no-video"].includes(phase) || phase === "found" && !currentMedia.length) phase = "checking";
+    // A source request can be a preload. Only player observations establish playback.
+    if (["sniffing", "no-source"].includes(phase) && !playback.observed && !playback.playing) phase = "checking";
+    if (phase === "checking" && capture.phase !== "checking") checkingStartedAt = Date.now();
+    capture = { phase, playback, chunkCount: response.chunkCount || 0 };
+  }
+  function captureFeedback() {
+    const { phase, playback } = capture;
+    if (phase === "found") {
+      const playbackLabel = playback.playing ? "正在播放" : playback.observed ? "已播放" : playback.hasVideo && !playback.uncertain ? "尚未播放" : "播放状态未确认";
+      return { state: "ready", status: `已发现 ${currentMedia.length} 个来源 · ${playbackLabel}` };
+    }
+    if (phase === "waiting") return { state: "waiting", status: "等待播放 · 请先在网页点击播放", title: "点击播放，开始识别", description: "已找到播放器，尚未观察到播放。请先在网页点击播放按钮。", hint: "出现视频来源后，即可在这里下载。" };
+    if (phase === "sniffing") return { state: "sniffing", status: "已播放 · 正在识别视频来源…", title: "正在识别视频来源", description: capture.chunkCount ? "已检测到分段请求，正在等待可下载的播放清单。" : "已确认视频开始播放，正在查看播放器发出的视频请求。", hint: "若暂未找到来源，会在约 10 秒后显示结果。" };
+    if (phase === "no-source") return { state: "no-source", status: "已播放 · 暂未识别到可下载来源", title: "这次还没有找到来源", description: "已观察到播放，但暂未找到可下载的视频地址。", hint: "可切换播放线路，或刷新网页后重新播放。" };
+    if (phase === "no-video") return { state: "no-video", status: "暂未检测到播放器", title: "当前网页还没有播放器", description: "请打开视频播放页面，或等待网页加载播放器。", hint: "下载任务仍可在右侧页签查看。" };
+    if (phase === "unavailable") return { state: "unavailable", status: "当前页面不支持视频识别", title: "切换到视频网页", description: "浏览器内部页面无法识别视频。打开一个视频网页后，再打开扩展。", hint: "已有下载会继续运行。" };
+    if (phase === "error") return { state: "error", status: "读取失败，点击右侧刷新重试", title: "暂时无法连接扩展", description: "请刷新视频网页，然后重新打开扩展。", hint: capture.error || "" };
+    if (Date.now() - checkingStartedAt >= 5000) return { state: "unconfirmed", status: "播放器状态尚未确认", title: "还未确认播放器状态", description: "可以先播放视频，或刷新网页后重新打开扩展。", hint: "嵌入式播放器可能无法立即确认播放状态。" };
+    return { state: "checking", status: "正在确认播放器状态…", title: "正在查看当前网页", description: "正在确认播放器和可用的视频来源。", hint: "" };
+  }
+  function renderCapture() {
+    const feedback = captureFeedback(); setStatus(feedback.status, feedback.state); renderMedia();
   }
 
   async function startDownload(item, button) {
@@ -116,7 +145,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     const live = new Set(currentMedia.map(item => item.url));
     for (const [url, entry] of cards) if (!live.has(url)) { entry.card.remove(); cards.delete(url); }
     if (!filtered.length) {
-      emptyState($("mediaList"), currentMedia.length ? "没有匹配的来源" : "先让视频播放一会儿", currentMedia.length ? "试试文件名、集数，或视频来源域名。" : "在网页点击播放。出现来源后，点下载即可保存。", currentMedia.length ? "" : "仍未发现？刷新视频网页，再重新播放。");
+      if (currentMedia.length) emptyState($("mediaList"), "没有匹配的来源", "试试文件名、集数，或视频来源域名。");
+      else {
+        const feedback = captureFeedback(); emptyState($("mediaList"), feedback.title, feedback.description, feedback.hint, feedback.state);
+      }
       return;
     }
     $("mediaList").querySelector(".empty-box")?.remove();
@@ -128,7 +160,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       const url = mediaUrl(item.url);
       entry.badge.className = `badge-tag ${item.isM3U8 ? "badge-m3u8" : "badge-mp4"}`;
       setText(entry.badge, item.isM3U8 ? "HLS · M3U8" : String(item.ext || "VIDEO").toUpperCase());
-      setText(entry.number, item.active ? "当前播放" : `来源 ${currentMedia.indexOf(item) + 1}`);
+      setText(entry.number, item.active ? capture.playback.playing ? "当前播放" : "当前线路" : `来源 ${currentMedia.indexOf(item) + 1}`);
       entry.card.dataset.active = String(Boolean(item.active));
       setText(entry.size, item.isM3U8 ? "自动合并" : item.size > 0 ? formatSize(item.size) : "大小待确认");
       setText(entry.title, item.suggestedFilename || "未命名视频"); entry.title.title = entry.title.textContent;
@@ -168,11 +200,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     const progress = node("div", "job-progress"), fill = node("div", "job-progress-fill");
     progress.setAttribute("role", "progressbar"); progress.setAttribute("aria-label", "视频下载进度"); progress.setAttribute("aria-valuemin", "0"); progress.setAttribute("aria-valuemax", "100"); progress.append(fill);
     const details = node("div", "job-details"), metrics = node("span", "job-metrics"), percent = node("span", "job-percent"); details.append(metrics, percent);
+    const telemetry = node("div", "job-telemetry"), speed = node("span", "job-speed"), concurrency = node("span", "job-concurrency");
+    speed.title = "当前所有网络分片的合计下载速度，缓存读取不计入"; telemetry.append(speed, concurrency);
     const retryStatus = node("p", "job-retry-status"), cacheStatus = node("p", "job-cache-status");
     retryStatus.setAttribute("role", "status"); retryStatus.setAttribute("aria-live", "polite");
     const error = node("p", "job-error"), actions = node("div", "job-actions"), cancel = node("button", "job-button", "取消"), retry = node("button", "job-button", "重新下载"), reveal = node("button", "job-button", "在文件夹中显示"), discard = node("button", "job-button job-discard", "清除缓存");
-    actions.append(cancel, retry, reveal, discard); card.append(header, progress, details, retryStatus, error, cacheStatus, actions);
-    const entry = { card, title, label, progress, fill, metrics, percent, retryStatus, cacheStatus, error, cancel, retry, reveal, discard, job, pendingAction: null };
+    actions.append(cancel, retry, reveal, discard); card.append(header, progress, details, telemetry, retryStatus, error, cacheStatus, actions);
+    const entry = { card, title, label, progress, fill, metrics, percent, telemetry, speed, concurrency, retryStatus, cacheStatus, error, cancel, retry, reveal, discard, job, pendingAction: null };
     cancel.addEventListener("click", () => jobAction("cancelJob", entry, cancel));
     reveal.addEventListener("click", () => jobAction("showJob", entry, reveal));
     retry.addEventListener("click", () => jobAction(entry.job.state === "interrupted" && entry.job.resumable ? "retryJob" : "freshStart", entry, retry));
@@ -233,6 +267,18 @@ document.addEventListener("DOMContentLoaded", async () => {
       const segments = job.totalSegments > 0 ? `${job.completedSegments || 0} / ${job.totalSegments} 片 · ` : "";
       setText(entry.metrics, `${segments}${formatSize(job.bytesReceived || 0)}${!job.totalSegments && job.totalBytes > 0 ? ` / ${formatSize(job.totalBytes)}` : ""}`);
       setText(entry.percent, hasTotal || job.state === "complete" ? `${value}%` : "");
+      const hasSpeed = Number.isFinite(job.bytesPerSecond) && job.bytesPerSecond >= 0;
+      const hasConcurrency = Number.isInteger(job.activeConcurrency) && job.activeConcurrency >= 1 && job.activeConcurrency <= 8;
+      entry.telemetry.hidden = job.state !== "downloading" || (!hasSpeed && !hasConcurrency);
+      setText(entry.speed, hasSpeed ? `合计 ${formatSize(job.bytesPerSecond)}/s` : "正在测量速度…");
+      entry.concurrency.hidden = !hasConcurrency;
+      setText(entry.concurrency, `${job.concurrencyMode === "manual" ? "手动" : "自动"} · ${hasConcurrency ? job.activeConcurrency : "—"} 路`);
+      const concurrencyReasons = {
+        initializing: "正在测量当前总下载速度", probing: "正在比较增加并行数后的总速度", gain: "增加并行数后总速度有提升",
+        "no-gain": "增加并行数没有提速，已回退", errors: "遇到来源错误，已降低并行数", decline: "总速度下降，已降低并行数",
+        cooldown: "暂时保持当前并行数，等待速度稳定", steady: "保持当前有效的并行数", insufficient: "网络数据不足，暂不调整并行数", manual: "按设置固定并行数"
+      };
+      entry.concurrency.title = concurrencyReasons[job.concurrencyReason] || (job.concurrencyMode === "manual" ? "按设置固定并行数" : "根据实际总下载速度调整并行数");
       const retrying = activeStates.has(job.state) && (job.retryAttempt > 0 || Boolean(job.retryMessage));
       entry.retryStatus.hidden = !retrying;
       setText(entry.retryStatus, retrying ? String(job.retryMessage || `正在进行第 ${job.retryAttempt} 次重试…`) : "");
@@ -279,11 +325,9 @@ document.addEventListener("DOMContentLoaded", async () => {
       currentMedia = (response.media || []).filter(item => mediaUrl(item.url));
       const title = response.pageTitle && response.pageTitle !== "当前网页" ? response.pageTitle : currentTab.title || currentTab.url || "当前网页";
       setText($("pageTitle"), title); $("pageTitle").title = title;
-      setStatus(currentMedia.length ? `已发现 ${currentMedia.length} 个视频来源` : response.chunkCount ? "检测到分段请求，等待播放清单" : "等待视频播放", currentMedia.length ? "ready" : "waiting");
-      renderMedia(); renderFrames(response.frames || []);
+      updateCapture(response); renderCapture(); renderFrames(response.frames || []);
     } catch (error) {
-      setStatus("读取失败，点击右侧刷新重试", "error");
-      if (!currentMedia.length) emptyState($("mediaList"), "暂时无法连接扩展", "刷新扩展后，请重新打开视频网页。", error.message);
+      capture = { phase: "error", playback: {}, error: error.message }; renderCapture();
     } finally {
       mediaLoading = false;
       if (mediaPending && !closing) { mediaPending = false; queueMicrotask(loadMediaData); }
@@ -292,7 +336,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   function applySettings(value) {
     const concurrency = Number(value?.concurrency);
-    settings = { subfolder: String(value?.subfolder || ""), askWhereToSave: Boolean(value?.askWhereToSave), concurrency: Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 8 ? concurrency : 5 };
+    settings = { subfolder: String(value?.subfolder || ""), askWhereToSave: Boolean(value?.askWhereToSave), concurrency: Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 8 ? concurrency : 5, concurrencyMode: value?.concurrencyMode === "manual" ? "manual" : "auto" };
     setText($("saveLocation"), settings.askWhereToSave ? "每次询问保存位置" : settings.subfolder ? `保存至默认目录 / ${settings.subfolder}` : "保存至 Chrome 默认下载文件夹");
     $("btnSaveLocation").title = $("saveLocation").textContent;
   }
@@ -302,37 +346,39 @@ document.addEventListener("DOMContentLoaded", async () => {
   function folderPreview() { setText($("folderPreview"), `默认下载文件夹${$("subfolder").value.trim() ? ` / ${$("subfolder").value.trim().replace(/\\/g, "/")}` : ""}`); }
   function fillSettingsForm() {
     $("subfolder").value = settings.subfolder; $("askWhereToSave").checked = settings.askWhereToSave;
-    customConcurrencyOption?.remove(); customConcurrencyOption = null;
-    // Preserve a valid value written by another extension version, even when
-    // it falls between the compact choices offered by this interface.
-    if (![1, 2, 3, 5, 8].includes(settings.concurrency)) {
-      customConcurrencyOption = node("option", "", `${settings.concurrency} 个（当前设置）`);
-      customConcurrencyOption.value = String(settings.concurrency); $("concurrency").append(customConcurrencyOption);
-    }
-    $("concurrency").value = String(settings.concurrency); folderPreview();
+    $("concurrencyMode").value = settings.concurrencyMode;
+    $("concurrency").value = String(settings.concurrency); folderPreview(); syncConcurrencyMode();
+  }
+  function syncConcurrencyMode() {
+    const manual = $("concurrencyMode").value === "manual";
+    $("concurrencyCountRow").hidden = !manual;
+    setText($("concurrencyModeHint"), manual ? "手动固定并行数，不会自动调整。" : "根据并行数变化后的总下载速度调整：持续提速时增加，提速不明显时停止增加，降速时尝试减少。");
   }
   function openModal(id, trigger, focusId) { modalTrigger = trigger; $(id).hidden = false; $("appContent").inert = true; $(focusId).focus(); }
   function closeModal(id) { $(id).hidden = true; $("appContent").inert = false; if (modalTrigger?.isConnected) modalTrigger.focus(); else $("sourceTab").focus(); }
   async function openSettings(trigger) {
-    $("settingsError").hidden = true; $("settingsSave").disabled = true; $("subfolder").disabled = true; $("askWhereToSave").disabled = true; $("concurrency").disabled = true;
+    $("settingsError").hidden = true; $("settingsSave").disabled = true; $("subfolder").disabled = true; $("askWhereToSave").disabled = true; $("concurrency").disabled = true; $("concurrencyMode").disabled = true;
     fillSettingsForm();
     openModal("settingsModal", trigger, "settingsClose");
     try {
       await loadSettings(); fillSettingsForm();
     } catch (error) { $("settingsError").hidden = false; setText($("settingsError"), error.message); }
-    finally { $("settingsSave").disabled = false; $("subfolder").disabled = false; $("askWhereToSave").disabled = false; $("concurrency").disabled = false; }
+    finally { $("settingsSave").disabled = false; $("subfolder").disabled = false; $("askWhereToSave").disabled = false; $("concurrency").disabled = false; $("concurrencyMode").disabled = false; }
   }
   for (const id of ["btnSettings", "btnSaveLocation"]) $(id).addEventListener("click", () => openSettings($(id)));
   for (const id of ["settingsClose", "settingsCancel"]) $(id).addEventListener("click", () => closeModal("settingsModal"));
   $("modalClose").addEventListener("click", () => closeModal("imageModal"));
   for (const id of ["imageModal", "settingsModal"]) $(id).addEventListener("click", event => { if (event.target === $(id)) closeModal(id); });
   $("subfolder").addEventListener("input", folderPreview);
+  $("concurrencyMode").addEventListener("change", syncConcurrencyMode);
   $("settingsForm").addEventListener("submit", async event => {
     event.preventDefault(); $("settingsSave").disabled = true; $("settingsError").hidden = true;
     try {
       const concurrency = Number($("concurrency").value);
+      const concurrencyMode = $("concurrencyMode").value;
+      if (!["auto", "manual"].includes(concurrencyMode)) throw new Error("请选择自动调节或手动固定");
       if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8) throw new Error("并行分片数必须是 1 到 8 之间的整数");
-      const response = await sendMessage({ action: "saveSettings", settings: { subfolder: $("subfolder").value.trim(), askWhereToSave: $("askWhereToSave").checked, concurrency } });
+      const response = await sendMessage({ action: "saveSettings", settings: { subfolder: $("subfolder").value.trim(), askWhereToSave: $("askWhereToSave").checked, concurrency, concurrencyMode } });
       applySettings(response.settings); closeModal("settingsModal"); showToast("下载设置已保存，将用于之后的下载和截图");
     } catch (error) { $("settingsError").hidden = false; setText($("settingsError"), error.message); }
     finally { $("settingsSave").disabled = false; }
@@ -346,7 +392,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (!modal) return;
     if (event.key === "Escape") { event.preventDefault(); closeModal(modal.id); }
     if (event.key === "Tab") {
-      const focusable = [...modal.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled])")].filter(element => !element.hidden);
+      const focusable = [...modal.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled])")].filter(element => !element.hidden && !(element.id === "concurrency" && $("concurrencyCountRow").hidden));
       const first = focusable[0], last = focusable[focusable.length - 1];
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
@@ -375,7 +421,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   });
   $("mediaSearch").addEventListener("input", renderMedia);
-  $("btnRefresh").addEventListener("click", () => { setStatus("正在重新读取…", "loading"); loadMediaData(); });
+  $("btnRefresh").addEventListener("click", () => {
+    if (!currentTab || !mediaUrl(currentTab.url)) return renderCapture();
+    setStatus("正在重新读取…", "checking"); loadMediaData();
+  });
   const onMessage = message => {
     if ((message.action === "mediaListUpdated" || message.action === "framesUpdated") && message.tabId === currentTab?.id) loadMediaData();
     if (message.action === "jobsUpdated") loadJobs();
@@ -388,11 +437,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true }); currentTab = tabs[0] || null;
     setText($("pageTitle"), currentTab?.title || currentTab?.url || "未选择视频网页");
     if (!currentTab || !mediaUrl(currentTab.url)) {
-      setStatus("请切换到视频网页", "waiting");
-      emptyState($("mediaList"), "这里还没有视频", "打开一个视频网页并播放。下载任务仍可在右侧页签查看。");
+      capture = { phase: "unavailable", playback: {} }; renderCapture();
       if (currentJobs.length) showPane("jobs");
     } else await loadMediaData();
-  } catch (error) { setStatus(error.message, "error"); emptyState($("mediaList"), "无法读取当前网页", "已有下载不受影响，请查看下载任务。", error.message); }
+  } catch (error) { capture = { phase: "error", playback: {}, error: error.message }; renderCapture(); }
   refreshTimer = setInterval(() => { if (!document.hidden) { loadMediaData(); loadJobs(); } }, 2000);
   window.addEventListener("unload", () => { closing = true; clearInterval(refreshTimer); clearTimeout(toastTimer); chrome.runtime.onMessage.removeListener(onMessage); });
 });

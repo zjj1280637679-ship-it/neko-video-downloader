@@ -2,7 +2,7 @@
 chcp 65001 >nul
 title 喵喵视频下载姬 - 打开测试页
 echo.
-echo 喵喵视频下载姬 v1.3.1
+echo 喵喵视频下载姬 v1.4.0
 echo 扩展目录：%~dp0
 echo.
 echo 初次安装：在 Chrome 地址栏输入 chrome://extensions/

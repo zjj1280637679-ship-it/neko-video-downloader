@@ -22,7 +22,7 @@
       <button id="jobsTab" class="view-tab" role="tab" aria-selected="false" aria-controls="jobsPanel" tabindex="-1">下载任务 <span id="jobsTabCount">0</span></button>
     </nav>
     <section class="view-panel" id="sourcePanel" role="tabpanel" aria-labelledby="sourceTab">
-      <div class="status-bar" id="statusBar" data-state="loading"><span class="status-radar" aria-hidden="true"></span><span id="statusText" role="status" aria-live="polite">正在读取视频来源…</span><button class="btn-icon" id="btnRefresh" title="重新读取视频列表" aria-label="重新读取视频列表">↻</button></div>
+      <div class="status-bar" id="statusBar" data-state="checking"><span class="status-radar" aria-hidden="true"></span><span id="statusText" role="status" aria-live="polite">正在确认播放器状态…</span><button class="btn-icon" id="btnRefresh" title="重新读取视频列表" aria-label="重新读取视频列表">↻</button></div>
       <div class="list-toolbar" id="listToolbar" hidden><label class="search-wrap"><span aria-hidden="true">⌕</span><input id="mediaSearch" type="search" placeholder="搜索文件名或来源" aria-label="搜索文件名或来源" autocomplete="off"></label><span id="sourceCount" class="source-count"></span></div>
       <main class="media-list" id="mediaList" aria-label="视频来源"></main>
       <details class="frames-section" id="framesSection" hidden>
@@ -47,8 +47,9 @@
       <input class="setting-input" id="subfolder" type="text" placeholder="例如：喵喵视频" autocomplete="off" maxlength="160" aria-describedby="folderHint folderPreview">
       <p class="field-hint" id="folderHint">留空直接保存到默认目录。可用“/”创建多级子文件夹。</p>
       <p class="folder-preview" id="folderPreview">默认下载文件夹</p>
-      <div class="concurrency-field"><label class="setting-field" for="concurrency">并行分片数</label><select class="setting-input concurrency-select" id="concurrency" aria-describedby="concurrencyHint"><option value="1">1 个</option><option value="2">2 个</option><option value="3">3 个</option><option value="5" selected>5 个（默认）</option><option value="8">8 个</option></select></div>
-      <p class="field-hint" id="concurrencyHint">并行数越高越可能触发来源限流。频繁失败时可调低后继续下载。</p>
+      <div class="concurrency-field"><label class="setting-field" for="concurrencyMode">分片并行策略</label><select class="setting-input concurrency-select mode-select" id="concurrencyMode" aria-describedby="concurrencyModeHint"><option value="auto" selected>自动调节（推荐）</option><option value="manual">手动固定</option></select></div>
+      <p class="field-hint" id="concurrencyModeHint">根据并行数变化后的总下载速度调整：持续提速时增加，提速不明显时停止增加，降速时尝试减少。</p>
+      <div id="concurrencyCountRow" hidden><div class="concurrency-field"><label class="setting-field" for="concurrency">并行分片数</label><select class="setting-input concurrency-select" id="concurrency" aria-describedby="concurrencyHint"><option value="1">1 个</option><option value="2">2 个</option><option value="3">3 个</option><option value="4">4 个</option><option value="5" selected>5 个</option><option value="6">6 个</option><option value="7">7 个</option><option value="8">8 个</option></select></div><p class="field-hint" id="concurrencyHint">固定使用所选并行数。过高可能触发来源限流，频繁失败时可调低。</p></div>
       <label class="checkbox-setting"><input id="askWhereToSave" type="checkbox"><span>每次询问保存位置<small>开启后，保存文件前会弹出位置选择框。</small></span></label>
       <p class="settings-error" id="settingsError" role="alert" hidden></p>
       <div class="settings-actions"><button type="button" class="btn btn-secondary" id="settingsCancel">取消</button><button type="submit" class="btn btn-primary" id="settingsSave">保存设置</button></div>
