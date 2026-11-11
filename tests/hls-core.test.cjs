@@ -5,6 +5,8 @@ const { parsePlaylist, parseIv, sequenceToIv, createClient, safeFilename, absolu
 const BASE = 'https://fixture.test/video/list.m3u8';
 const playlist = (body, end = true) => `#EXTM3U\n${body}\n${end ? '#EXT-X-ENDLIST' : ''}\n`;
 const segment = name => `#EXTINF:5.5,\n${name}`;
+const tick = () => new Promise(resolve => setImmediate(resolve));
+const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 function response(body, url, init) {
   const value = new Response(body, init);
   if (url) Object.defineProperty(value, 'url', { value: url });
@@ -187,4 +189,232 @@ test('saved manifest preserves relative key, map, media and master URIs as absol
   assert.match(master, /URI="https:\/\/cdn.test\/audio\/list.m3u8"/);
   assert.match(master, /\nhttps:\/\/cdn.test\/video\/list.m3u8$/);
   assert.throws(() => absolutizePlaylist('<html>no manifest</html>', BASE), /不是有效/);
+});
+
+test('sliding window schedules new segments before a slow later peer finishes', async () => {
+  const plan = parsePlaylist(playlist(Array.from({ length: 8 }, (_, i) => segment(`${i}.ts`)).join('\n')), BASE);
+  const gate = deferred(), requested = [];
+  let completed = 0, maxAhead = 0;
+  const sink = collectSink();
+  const pending = client(async url => {
+    const index = Number(/(\d+)\.ts/.exec(url)[1]);
+    requested.push(index);
+    maxAhead = Math.max(maxAhead, requested.length - completed);
+    if (index === 2) await gate.promise;
+    return response(String(index));
+  }).download(plan, sink, progress => { completed = progress.completed; }, 3);
+  await tick(); await tick();
+  assert.deepEqual(requested, [0, 1, 2, 3, 4]);
+  assert.equal(maxAhead, 3);
+  gate.resolve(); await pending;
+  assert.equal(Buffer.concat(sink.chunks).toString(), '01234567');
+});
+
+test('default six-attempt budget recovers transient HTTP and never retries permanent 4xx', async () => {
+  let attempts = 0;
+  const c = createClient({ fetch: async () => ++attempts < 6 ? response('busy', null, { status: 503 }) : response('OK'), retryDelayMs: 0 });
+  assert.equal(Buffer.from(await c.request(BASE)).toString(), 'OK');
+  assert.equal(attempts, 6);
+  attempts = 0;
+  await assert.rejects(createClient({ fetch: async () => { attempts++; return response('denied', null, { status: 403 }); }, retryDelayMs: 0 }).request(BASE), error => {
+    assert.equal(error.retryable, false);
+    assert.equal(error.httpStatus, 403);
+    assert.equal(error.resourceUrl, BASE);
+    return true;
+  });
+  assert.equal(attempts, 1);
+});
+
+test('Retry-After is honored and capped at 30 seconds without blocking cancellation', async () => {
+  const controller = new AbortController();
+  let retry;
+  const pending = createClient({
+    signal: controller.signal, fetch: async () => response('busy', null, { status: 429, headers: { 'Retry-After': '120' } }),
+    onRetry(info) { retry = info; controller.abort(); }
+  }).request(BASE);
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(retry.delayMs, 30000);
+  assert.equal(retry.error.httpStatus, 429);
+  assert.equal(retry.error.retryable, true);
+});
+
+test('request timeout retries as TimeoutError, while user abort does not retry', async () => {
+  let requests = 0;
+  const stages = [];
+  const c = createClient({ timeoutMs: 1, retryDelayMs: 0, fetch: async (_url, { signal }) => {
+    if (++requests === 1) return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new DOMException('fetch aborted', 'AbortError'))));
+    return response('OK');
+  }, onRetry(info) { stages.push(info.error.name); } });
+  assert.equal(Buffer.from(await c.request(BASE)).toString(), 'OK');
+  assert.deepEqual(stages, ['TimeoutError']);
+  const controller = new AbortController();
+  let retries = 0;
+  const pending = createClient({ signal: controller.signal, fetch: (_url, { signal }) => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason))), onRetry() { retries++; } }).request(BASE);
+  controller.abort();
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(retries, 0);
+});
+
+async function encryptedFixture() {
+  const keyBytes = new Uint8Array(16).fill(9);
+  const key = await webcrypto.subtle.importKey('raw', keyBytes, 'AES-CBC', false, ['encrypt']);
+  const iv = parseIv('0x0');
+  const plain = new Uint8Array(40).fill(65);
+  const encrypted = await webcrypto.subtle.encrypt({ name: 'AES-CBC', iv }, key, plain);
+  return { keyBytes, encrypted, plain, descriptor: { url: 'https://fixture.test/part.ts', key: { url: 'https://fixture.test/key' }, iv } };
+}
+
+test('corrupted AES segment is refetched without browser cache and key is refreshed', async () => {
+  const fixture = await encryptedFixture();
+  const requests = [], retries = [];
+  let segments = 0, keys = 0;
+  const c = createClient({ crypto: webcrypto, retryDelayMs: 0, fetch: async (url, init) => {
+    requests.push({ url, cache: init.cache });
+    if (url.endsWith('/key')) { keys++; return response(fixture.keyBytes); }
+    return response(++segments === 1 ? fixture.encrypted.slice(0, 16) : fixture.encrypted);
+  }, onRetry(info) { retries.push(info.stage); } });
+  assert.deepEqual(new Uint8Array(await c.readResource(fixture.descriptor)), fixture.plain);
+  assert.equal(segments, 2);
+  assert.equal(keys, 2);
+  assert.deepEqual(retries, ['decrypt']);
+  assert.equal(requests[2].cache, 'no-store');
+  assert.equal(requests[3].cache, 'no-store');
+});
+
+test('permanently corrupt AES stops after six total attempts, not nested retry budgets', async () => {
+  const fixture = await encryptedFixture();
+  let segments = 0, keys = 0;
+  const c = createClient({ crypto: webcrypto, retryDelayMs: 0, fetch: async url => {
+    if (url.endsWith('/key')) { keys++; return response(fixture.keyBytes); }
+    segments++; return response(fixture.encrypted.slice(0, 16));
+  } });
+  await assert.rejects(c.readResource(fixture.descriptor), error => {
+    assert.equal(error.retryable, true);
+    assert.equal(error.stage, 'decrypt');
+    assert.equal(error.attempts, 6);
+    assert.equal(error.httpStatus, 200);
+    return true;
+  });
+  assert.equal(segments, 6);
+  assert.equal(keys, 6);
+});
+
+test('same key URL refresh recovers a transient wrong encryption key', async () => {
+  const fixture = await encryptedFixture();
+  let keys = 0;
+  const c = createClient({ crypto: webcrypto, retryDelayMs: 0, fetch: async url => {
+    if (url.endsWith('/key')) return response(++keys === 1 ? new Uint8Array(16) : fixture.keyBytes);
+    return response(fixture.encrypted);
+  } });
+  assert.deepEqual(new Uint8Array(await c.readResource(fixture.descriptor)), fixture.plain);
+  assert.equal(keys, 2);
+});
+
+test('late failure using an old key cannot evict the refreshed concurrent key', async () => {
+  const fixture = await encryptedFixture(), late = deferred();
+  let decryptions = 0, keyRequests = 0;
+  const crypto = { subtle: {
+    importKey: (...args) => webcrypto.subtle.importKey(...args),
+    async decrypt(...args) {
+      const call = ++decryptions;
+      if (call === 1) throw new DOMException('first transient decode failure', 'OperationError');
+      if (call === 2) { await late.promise; throw new DOMException('late old-key failure', 'OperationError'); }
+      return webcrypto.subtle.decrypt(...args);
+    }
+  } };
+  const c = createClient({ crypto, retryDelayMs: 0, fetch: async url => {
+    if (url.endsWith('/key')) { keyRequests++; return response(fixture.keyBytes); }
+    return response(fixture.encrypted);
+  } });
+  const first = c.readResource(fixture.descriptor);
+  const second = c.readResource({ ...fixture.descriptor, url: 'https://fixture.test/second.ts' });
+  await first;
+  assert.equal(keyRequests, 2);
+  late.resolve();
+  assert.deepEqual(new Uint8Array(await second), fixture.plain);
+  assert.equal(keyRequests, 2);
+});
+
+test('successful peers persist after a failed segment, and retry fetches only missing segments', async () => {
+  const plan = parsePlaylist(playlist(Array.from({ length: 6 }, (_, i) => segment(`${i}.ts`)).join('\n')), BASE);
+  const cache = new Map();
+  const hooks = { async getSegment(index) { return cache.get(index) || null; }, async putSegment(index, _segment, data) { await tick(); cache.set(index, data); } };
+  const first = client(async url => response('' + /(\d+)\.ts/.exec(url)[1], null, url.endsWith('/1.ts') ? { status: 503 } : undefined), { retries: 2, retryDelayMs: 0 });
+  await assert.rejects(first.download(plan, collectSink(), () => {}, 3, hooks), error => {
+    assert.equal(error.segmentIndex, 1);
+    assert.equal(error.segmentNumber, 2);
+    assert.equal(error.retryable, true);
+    assert.equal(error.httpStatus, 503);
+    return true;
+  });
+  assert.ok(cache.has(0)); assert.ok(cache.has(2)); assert.equal(cache.has(1), false);
+  const retained = new Set(cache.keys()), requests = [], sink = collectSink();
+  await client(async url => { const index = Number(/(\d+)\.ts/.exec(url)[1]); requests.push(index); return response(String(index)); }).download(plan, sink, () => {}, 3, hooks);
+  assert.deepEqual(new Set(requests), new Set([0, 1, 2, 3, 4, 5].filter(index => !retained.has(index))));
+  assert.equal(Buffer.concat(sink.chunks).toString(), '012345');
+});
+
+test('failed request waits for successful peer cache writes before rejecting', async () => {
+  const plan = parsePlaylist(playlist(segment('0.ts') + '\n' + segment('1.ts')), BASE);
+  const gate = deferred(), cache = new Map();
+  let putStarted = false, settled = false;
+  const pending = client(async url => url.endsWith('/0.ts') ? response('bad', null, { status: 404 }) : response('good')).download(plan, collectSink(), () => {}, 2, {
+    async putSegment(index, _segment, data) { putStarted = true; await gate.promise; cache.set(index, data); }
+  }).catch(error => { settled = true; return error; });
+  await tick(); await tick();
+  assert.equal(putStarted, true); assert.equal(settled, false);
+  gate.resolve();
+  const error = await pending;
+  assert.equal(error.segmentIndex, 0);
+  assert.equal(cache.has(1), true);
+  const count = cache.size; await tick(); assert.equal(cache.size, count);
+});
+
+test('cache errors are terminal and are never retried as network failures', async () => {
+  const plan = parsePlaylist(playlist(segment('0.ts')), BASE);
+  let requests = 0, puts = 0;
+  await assert.rejects(createClient({ retryDelayMs: 0, fetch: async () => { requests++; return response('data'); } }).download(plan, collectSink(), () => {}, 2, {
+    async putSegment() { puts++; throw new DOMException('quota', 'QuotaExceededError'); }
+  }), error => { assert.equal(error.retryable, false); assert.equal(error.stage, 'cache-write'); assert.equal(error.name, 'QuotaExceededError'); return true; });
+  assert.equal(requests, 1); assert.equal(puts, 1);
+});
+
+test('user cancellation settles an in-flight cache write before allowing caller cleanup', async () => {
+  const plan = parsePlaylist(playlist(segment('0.ts')), BASE);
+  const controller = new AbortController(), gate = deferred();
+  let putStarted = false, settled = false, cacheWritten = false;
+  const pending = client(async () => response('data'), { signal: controller.signal }).download(plan, collectSink(), () => {}, 1, {
+    async putSegment() { putStarted = true; await gate.promise; cacheWritten = true; }
+  }).catch(error => { settled = true; return error; });
+  await tick(); assert.equal(putStarted, true);
+  controller.abort(); await tick(); assert.equal(settled, false);
+  gate.resolve();
+  assert.equal((await pending).name, 'AbortError');
+  assert.equal(cacheWritten, true);
+});
+
+test('recovered notification clears the matching request operation only after success', async () => {
+  let requests = 0;
+  const retries = [], recovered = [];
+  const c = createClient({ retryDelayMs: 0, fetch: async () => ++requests === 1 ? response('busy', null, { status: 503 }) : response('OK'),
+    onRetry(info) { retries.push(info); }, onRecovered(info) { recovered.push(info); } });
+  await c.request(BASE);
+  assert.equal(retries[0].operationUrl, BASE);
+  assert.deepEqual(recovered, [{ resourceUrl: BASE, attempt: 2 }]);
+  await c.request(BASE);
+  assert.equal(recovered.length, 1, 'first-attempt success must not emit a recovery');
+});
+
+test('key retry and recovery share the parent segment operation URL', async () => {
+  const fixture = await encryptedFixture();
+  let keys = 0;
+  const retries = [], recovered = [];
+  const c = createClient({ crypto: webcrypto, retryDelayMs: 0, fetch: async url => {
+    if (url.endsWith('/key')) return ++keys === 1 ? response('busy', null, { status: 503 }) : response(fixture.keyBytes);
+    return response(fixture.encrypted);
+  }, onRetry(info) { retries.push(info); }, onRecovered(info) { recovered.push(info); } });
+  await c.readResource(fixture.descriptor);
+  assert.equal(retries[0].resourceUrl, fixture.descriptor.key.url);
+  assert.equal(retries[0].operationUrl, fixture.descriptor.url);
+  assert.deepEqual(recovered, [{ resourceUrl: fixture.descriptor.url, attempt: 2 }]);
 });

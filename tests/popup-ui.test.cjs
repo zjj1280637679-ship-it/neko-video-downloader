@@ -10,10 +10,10 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 // opening a browser or downloading network content.
 async function setup(options = {}) {
   let ready;
-  const elements = new Map(), messages = [], downloadCalls = [], runtimeListeners = new Set();
+  const elements = new Map(), messages = [], downloadCalls = [], runtimeListeners = new Set(), pendingActions = new Map();
   const state = {
     media: options.media || [], frames: options.frames || [], jobs: options.jobs || [],
-    settings: options.settings || { subfolder: '', askWhereToSave: false },
+    settings: options.settings || { subfolder: '', askWhereToSave: false, concurrency: 5 },
     settingsError: null, nextJob: 1
   };
   const document = { hidden: false, activeElement: null, addEventListener(name, fn) { if (name === 'DOMContentLoaded') ready = fn; }, getElementById(id) { assert.ok(elements.has(id), `Missing HTML element ${id}`); return elements.get(id); } };
@@ -39,7 +39,7 @@ async function setup(options = {}) {
       const matches = [];
       for (const child of this.children) {
         if (selector.startsWith('.') && child.className.split(' ').includes(selector.slice(1))) matches.push(child);
-        if (selector.includes(':not([disabled])') && ['BUTTON', 'INPUT'].includes(child.tagName) && !child.disabled) matches.push(child);
+        if (selector.includes(':not([disabled])') && ['BUTTON', 'INPUT', 'SELECT'].includes(child.tagName) && !child.disabled) matches.push(child);
         matches.push(...child.querySelectorAll(selector));
       }
       return matches;
@@ -66,6 +66,18 @@ async function setup(options = {}) {
             state.jobs.unshift(job); return callback({ success: true, job });
           }
           case 'cancelJob': state.jobs.find(job => job.id === message.jobId).state = 'cancelled'; return callback({ success: true });
+          case 'retryJob': case 'discardJob': {
+            const finish = () => {
+              if (options.actionErrors?.[message.action]) return callback({ success: false, error: options.actionErrors[message.action] });
+              const job = state.jobs.find(job => job.id === message.jobId);
+              if (message.action === 'retryJob') Object.assign(job, { state: 'queued', error: '', retryAttempt: 0, retryMessage: '' });
+              else Object.assign(job, { resumable: false, cachedSegments: 0 });
+              callback({ success: true, job });
+            };
+            if (options.deferredActions?.includes(message.action)) pendingActions.set(message.action, finish);
+            else finish();
+            return;
+          }
           case 'showJob': case 'openDownloadSettings': return callback({ success: true });
           default: throw new Error(`Unexpected message ${message.action}`);
         }
@@ -78,6 +90,7 @@ async function setup(options = {}) {
   vm.runInContext(source, context); await ready(); await tick();
   return {
     elements, messages, downloadCalls, state, document,
+    async finishAction(action) { pendingActions.get(action)(); pendingActions.delete(action); await tick(); },
     async click(element) { await (typeof element === 'string' ? elements.get(element) : element).listeners.click?.({ target: element }); await tick(); },
     async submit() { await elements.get('settingsForm').listeners.submit({ preventDefault() {} }); await tick(); },
     async updateJobs() { for (const listener of runtimeListeners) listener({ action: 'jobsUpdated' }); await tick(); }
@@ -153,4 +166,96 @@ test('screenshots follow the current subfolder and askWhereToSave setting', asyn
     assert.match(ui.downloadCalls[0].filename, /^截图\/.*00_12\.jpg$/);
     assert.equal(ui.elements.get('imageModal').hidden, true);
   }
+});
+
+test('resumable interrupted task continues with the same job id and retained segments', async () => {
+  const ui = await setup({ jobs: [{ id: 'partially-saved', url: media().url, filename: 'film.ts', isM3U8: true, state: 'interrupted', completedSegments: 498, totalSegments: 576, cachedSegments: 498, resumable: true, error: '分片解密失败' }] });
+  const card = ui.elements.get('jobList').querySelector('.job-card');
+  const retry = card.querySelectorAll('.job-button')[1];
+  assert.equal(retry.textContent, '继续下载');
+  assert.match(card.querySelector('.job-cache-status').textContent, /已保留 498 个分片/);
+  assert.match(card.querySelector('.job-cache-status').textContent, /仅在本次浏览器会话内/);
+  retry.focus(); await ui.click(retry);
+  assert.deepEqual(ui.messages.find(message => message.action === 'retryJob'), { action: 'retryJob', jobId: 'partially-saved' });
+  assert.equal(ui.messages.some(message => message.action === 'startDownload'), false);
+  assert.equal(ui.state.jobs.length, 1);
+  assert.equal(ui.elements.get('jobList').querySelector('.job-card'), card);
+  assert.equal(card.querySelector('.job-state').textContent, '等待下载');
+  assert.equal(ui.document.activeElement, card.querySelectorAll('.job-button')[0]);
+});
+
+test('cancelled tasks use a fresh download even when an obsolete resumable flag exists', async () => {
+  const ui = await setup({ jobs: [{ id: 'cancelled-old', url: media().url, filename: 'film.ts', isM3U8: true, state: 'cancelled', cachedSegments: 3, resumable: true }] });
+  const card = ui.elements.get('jobList').querySelector('.job-card');
+  assert.equal(card.querySelector('.job-cache-status').hidden, true);
+  assert.equal(card.querySelector('.job-discard').hidden, true);
+  await ui.click(card.querySelectorAll('.job-button')[1]);
+  assert.equal(ui.messages.some(message => message.action === 'retryJob'), false);
+  assert.equal(ui.messages.filter(message => message.action === 'startDownload').length, 1);
+});
+
+test('clearing retained cache disables competing actions and polling preserves focus', async () => {
+  const ui = await setup({ deferredActions: ['discardJob'], jobs: [{ id: 'cache', url: media().url, filename: 'film.ts', isM3U8: true, state: 'interrupted', cachedSegments: 498, resumable: true }] });
+  const card = ui.elements.get('jobList').querySelector('.job-card');
+  const discard = card.querySelector('.job-discard'); discard.focus();
+  const pending = ui.click(discard); await tick();
+  assert.equal(discard.disabled, true);
+  const retry = card.querySelectorAll('.job-button')[1]; assert.equal(retry.disabled, true);
+  await ui.updateJobs();
+  assert.equal(ui.elements.get('jobList').querySelector('.job-card'), card);
+  assert.equal(ui.document.activeElement, discard);
+  assert.equal(discard.disabled, true, 'Polling must not re-enable a pending action');
+  await ui.click(retry);
+  assert.equal(ui.messages.some(message => message.action === 'retryJob'), false, 'A second handler cannot race the pending discard');
+  await ui.finishAction('discardJob'); await pending;
+  assert.equal(ui.messages.filter(message => message.action === 'discardJob').length, 1);
+  assert.equal(discard.hidden, true);
+  assert.equal(retry.textContent, '重新下载');
+  assert.equal(retry.disabled, false);
+  assert.equal(ui.document.activeElement, retry);
+  assert.equal(card.querySelector('.job-cache-status').hidden, true);
+});
+
+test('failed resume keeps its cache action available and reports the broker error', async () => {
+  const ui = await setup({ actionErrors: { retryJob: '缓存暂时无法读取' }, jobs: [{ id: 'failed-resume', url: media().url, filename: 'film.ts', isM3U8: true, state: 'interrupted', cachedSegments: 498, resumable: true }] });
+  const card = ui.elements.get('jobList').querySelector('.job-card');
+  await ui.click(card.querySelectorAll('.job-button')[1]);
+  assert.equal(card.querySelectorAll('.job-button')[1].disabled, false);
+  assert.equal(card.querySelector('.job-discard').hidden, false);
+  assert.equal(ui.elements.get('toast').textContent, '缓存暂时无法读取');
+  assert.equal(ui.messages.some(message => message.action === 'startDownload'), false);
+});
+
+test('engine retry/backoff text is visible while running and disappears after recovery', async () => {
+  const message = '第 499 片解密失败，2 秒后重试（2/4）';
+  const ui = await setup({ jobs: [{ id: 'retrying', url: media().url, filename: 'film.ts', state: 'downloading', retryAttempt: 2, retryMessage: message }] });
+  const status = ui.elements.get('jobList').querySelector('.job-retry-status');
+  assert.equal(status.hidden, false); assert.equal(status.textContent, message);
+  Object.assign(ui.state.jobs[0], { retryAttempt: 0, retryMessage: '' }); await ui.updateJobs();
+  assert.equal(status.hidden, true);
+  Object.assign(ui.state.jobs[0], { state: 'complete', retryAttempt: 2, retryMessage: message }); await ui.updateJobs();
+  assert.equal(status.hidden, true, 'A successful job must not display stale retry information');
+});
+
+test('parallel settings default to five and save numeric supported choices', async () => {
+  const ui = await setup({ settings: { subfolder: '', askWhereToSave: false } });
+  await ui.click('btnSettings'); assert.equal(ui.elements.get('concurrency').value, '5');
+  for (const concurrency of [1, 2, 3, 5, 8]) {
+    await ui.click('btnSettings'); ui.elements.get('concurrency').value = String(concurrency); await ui.submit();
+    assert.equal(ui.state.settings.concurrency, concurrency);
+    assert.equal(ui.elements.get('settingsModal').hidden, true);
+  }
+});
+
+test('invalid concurrency does not reach settings storage, and valid existing values are retained', async () => {
+  const ui = await setup({ settings: { subfolder: '', askWhereToSave: false, concurrency: 4 } });
+  await ui.click('btnSettings'); assert.equal(ui.elements.get('concurrency').value, '4');
+  await ui.submit(); assert.equal(ui.state.settings.concurrency, 4);
+  const before = ui.messages.filter(message => message.action === 'saveSettings').length;
+  for (const invalid of ['', '0', '9', '1.5', 'not-a-number']) {
+    await ui.click('btnSettings'); ui.elements.get('concurrency').value = invalid; await ui.submit();
+    assert.equal(ui.elements.get('settingsModal').hidden, false);
+    assert.match(ui.elements.get('settingsError').textContent, /1 到 8 之间的整数/);
+  }
+  assert.equal(ui.messages.filter(message => message.action === 'saveSettings').length, before);
 });

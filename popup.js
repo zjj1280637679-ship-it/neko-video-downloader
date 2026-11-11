@@ -5,7 +5,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   const activeStates = new Set(["queued", "parsing", "downloading", "saving"]);
   const stateLabels = { queued: "等待下载", parsing: "解析清单", downloading: "下载中", saving: "正在保存", complete: "已保存", interrupted: "下载中断", cancelled: "已取消" };
   let currentTab = null, currentMedia = [], currentJobs = [], currentFrames = [], activeModalData, modalTrigger;
-  let settings = { subfolder: "", askWhereToSave: false };
+  let settings = { subfolder: "", askWhereToSave: false, concurrency: 5 };
+  let customConcurrencyOption = null;
   let mediaLoading = false, jobsLoading = false, mediaPending = false, jobsPending = false;
   let refreshTimer, toastTimer, framesSignature = "", closing = false;
 
@@ -167,19 +168,43 @@ document.addEventListener("DOMContentLoaded", async () => {
     const progress = node("div", "job-progress"), fill = node("div", "job-progress-fill");
     progress.setAttribute("role", "progressbar"); progress.setAttribute("aria-label", "视频下载进度"); progress.setAttribute("aria-valuemin", "0"); progress.setAttribute("aria-valuemax", "100"); progress.append(fill);
     const details = node("div", "job-details"), metrics = node("span", "job-metrics"), percent = node("span", "job-percent"); details.append(metrics, percent);
-    const error = node("p", "job-error"), actions = node("div", "job-actions"), cancel = node("button", "job-button", "取消"), retry = node("button", "job-button", "重新下载"), reveal = node("button", "job-button", "在文件夹中显示");
-    actions.append(cancel, retry, reveal); card.append(header, progress, details, error, actions);
-    const entry = { card, title, label, progress, fill, metrics, percent, error, cancel, retry, reveal, job };
+    const retryStatus = node("p", "job-retry-status"), cacheStatus = node("p", "job-cache-status");
+    retryStatus.setAttribute("role", "status"); retryStatus.setAttribute("aria-live", "polite");
+    const error = node("p", "job-error"), actions = node("div", "job-actions"), cancel = node("button", "job-button", "取消"), retry = node("button", "job-button", "重新下载"), reveal = node("button", "job-button", "在文件夹中显示"), discard = node("button", "job-button job-discard", "清除缓存");
+    actions.append(cancel, retry, reveal, discard); card.append(header, progress, details, retryStatus, error, cacheStatus, actions);
+    const entry = { card, title, label, progress, fill, metrics, percent, retryStatus, cacheStatus, error, cancel, retry, reveal, discard, job, pendingAction: null };
     cancel.addEventListener("click", () => jobAction("cancelJob", entry, cancel));
     reveal.addEventListener("click", () => jobAction("showJob", entry, reveal));
-    retry.addEventListener("click", () => startDownload(entry.job, retry));
+    retry.addEventListener("click", () => jobAction(entry.job.state === "interrupted" && entry.job.resumable ? "retryJob" : "freshStart", entry, retry));
+    discard.addEventListener("click", () => jobAction("discardJob", entry, discard));
     return entry;
   }
+  function setJobControls(entry) {
+    for (const button of [entry.cancel, entry.retry, entry.reveal, entry.discard]) button.disabled = Boolean(entry.pendingAction);
+  }
   async function jobAction(action, entry, button) {
-    button.disabled = true;
-    try { await sendMessage({ action, jobId: entry.job.id }); if (action !== "showJob") await loadJobs(); }
+    if (entry.pendingAction) return;
+    entry.pendingAction = action; setJobControls(entry);
+    try {
+      if (action === "freshStart") await startDownload(entry.job, button);
+      else {
+        const response = await sendMessage({ action, jobId: entry.job.id });
+        if (response.job) currentJobs = currentJobs.map(job => job.id === response.job.id ? response.job : job);
+        if (action === "retryJob") showToast("已继续下载，将复用本次浏览器会话中保留的分片");
+        if (action === "discardJob") showToast("缓存已清除，下次下载将重新获取分片");
+        if (action !== "showJob") await loadJobs();
+      }
+    }
     catch (error) { showToast(error.message); }
-    finally { button.disabled = false; }
+    finally {
+      entry.pendingAction = null; setJobControls(entry);
+      // Polling never replaces controls. If an action removes its own control,
+      // keep keyboard navigation on a meaningful action for this task.
+      if (document.activeElement === button && (button.hidden || !button.isConnected)) {
+        const next = [entry.cancel, entry.retry, entry.reveal, entry.discard].find(control => !control.hidden && control.isConnected);
+        (next || $("jobsTab")).focus();
+      }
+    }
   }
   function renderJobs() {
     const jobs = currentJobs.slice(0, 20), active = currentJobs.filter(job => activeStates.has(job.state)).length;
@@ -208,11 +233,21 @@ document.addEventListener("DOMContentLoaded", async () => {
       const segments = job.totalSegments > 0 ? `${job.completedSegments || 0} / ${job.totalSegments} 片 · ` : "";
       setText(entry.metrics, `${segments}${formatSize(job.bytesReceived || 0)}${!job.totalSegments && job.totalBytes > 0 ? ` / ${formatSize(job.totalBytes)}` : ""}`);
       setText(entry.percent, hasTotal || job.state === "complete" ? `${value}%` : "");
+      const retrying = activeStates.has(job.state) && (job.retryAttempt > 0 || Boolean(job.retryMessage));
+      entry.retryStatus.hidden = !retrying;
+      setText(entry.retryStatus, retrying ? String(job.retryMessage || `正在进行第 ${job.retryAttempt} 次重试…`) : "");
       const issue = [job.error, job.cleanupError].filter(Boolean).join(" · ");
       entry.error.hidden = !issue; setText(entry.error, issue);
+      const canResume = job.state === "interrupted" && job.resumable === true;
+      const cached = Number.isFinite(job.cachedSegments) ? Math.max(0, Math.floor(job.cachedSegments)) : 0;
+      entry.cacheStatus.hidden = !canResume;
+      setText(entry.cacheStatus, canResume ? `已保留 ${cached} 个分片，可继续下载。缓存仅在本次浏览器会话内可用。` : "");
       entry.cancel.hidden = !activeStates.has(job.state);
       entry.retry.hidden = !["interrupted", "cancelled"].includes(job.state);
+      setText(entry.retry, canResume ? "继续下载" : "重新下载");
       entry.reveal.hidden = job.state !== "complete";
+      entry.discard.hidden = !canResume;
+      setJobControls(entry);
       const previous = index ? jobCards.get(jobs[index - 1].id).card : null;
       if (!entry.card.isConnected || entry.card.previousElementSibling !== previous) {
         if (previous) previous.after(entry.card); else $("jobList").prepend(entry.card);
@@ -256,7 +291,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   function applySettings(value) {
-    settings = { subfolder: String(value?.subfolder || ""), askWhereToSave: Boolean(value?.askWhereToSave) };
+    const concurrency = Number(value?.concurrency);
+    settings = { subfolder: String(value?.subfolder || ""), askWhereToSave: Boolean(value?.askWhereToSave), concurrency: Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 8 ? concurrency : 5 };
     setText($("saveLocation"), settings.askWhereToSave ? "每次询问保存位置" : settings.subfolder ? `保存至默认目录 / ${settings.subfolder}` : "保存至 Chrome 默认下载文件夹");
     $("btnSaveLocation").title = $("saveLocation").textContent;
   }
@@ -264,16 +300,27 @@ document.addEventListener("DOMContentLoaded", async () => {
     const response = await sendMessage({ action: "getSettings" }); applySettings(response.settings); return settings;
   }
   function folderPreview() { setText($("folderPreview"), `默认下载文件夹${$("subfolder").value.trim() ? ` / ${$("subfolder").value.trim().replace(/\\/g, "/")}` : ""}`); }
+  function fillSettingsForm() {
+    $("subfolder").value = settings.subfolder; $("askWhereToSave").checked = settings.askWhereToSave;
+    customConcurrencyOption?.remove(); customConcurrencyOption = null;
+    // Preserve a valid value written by another extension version, even when
+    // it falls between the compact choices offered by this interface.
+    if (![1, 2, 3, 5, 8].includes(settings.concurrency)) {
+      customConcurrencyOption = node("option", "", `${settings.concurrency} 个（当前设置）`);
+      customConcurrencyOption.value = String(settings.concurrency); $("concurrency").append(customConcurrencyOption);
+    }
+    $("concurrency").value = String(settings.concurrency); folderPreview();
+  }
   function openModal(id, trigger, focusId) { modalTrigger = trigger; $(id).hidden = false; $("appContent").inert = true; $(focusId).focus(); }
   function closeModal(id) { $(id).hidden = true; $("appContent").inert = false; if (modalTrigger?.isConnected) modalTrigger.focus(); else $("sourceTab").focus(); }
   async function openSettings(trigger) {
-    $("settingsError").hidden = true; $("settingsSave").disabled = true; $("subfolder").disabled = true; $("askWhereToSave").disabled = true;
-    $("subfolder").value = settings.subfolder; $("askWhereToSave").checked = settings.askWhereToSave; folderPreview();
+    $("settingsError").hidden = true; $("settingsSave").disabled = true; $("subfolder").disabled = true; $("askWhereToSave").disabled = true; $("concurrency").disabled = true;
+    fillSettingsForm();
     openModal("settingsModal", trigger, "settingsClose");
     try {
-      await loadSettings(); $("subfolder").value = settings.subfolder; $("askWhereToSave").checked = settings.askWhereToSave; folderPreview();
+      await loadSettings(); fillSettingsForm();
     } catch (error) { $("settingsError").hidden = false; setText($("settingsError"), error.message); }
-    finally { $("settingsSave").disabled = false; $("subfolder").disabled = false; $("askWhereToSave").disabled = false; }
+    finally { $("settingsSave").disabled = false; $("subfolder").disabled = false; $("askWhereToSave").disabled = false; $("concurrency").disabled = false; }
   }
   for (const id of ["btnSettings", "btnSaveLocation"]) $(id).addEventListener("click", () => openSettings($(id)));
   for (const id of ["settingsClose", "settingsCancel"]) $(id).addEventListener("click", () => closeModal("settingsModal"));
@@ -283,7 +330,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("settingsForm").addEventListener("submit", async event => {
     event.preventDefault(); $("settingsSave").disabled = true; $("settingsError").hidden = true;
     try {
-      const response = await sendMessage({ action: "saveSettings", settings: { subfolder: $("subfolder").value.trim(), askWhereToSave: $("askWhereToSave").checked } });
+      const concurrency = Number($("concurrency").value);
+      if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8) throw new Error("并行分片数必须是 1 到 8 之间的整数");
+      const response = await sendMessage({ action: "saveSettings", settings: { subfolder: $("subfolder").value.trim(), askWhereToSave: $("askWhereToSave").checked, concurrency } });
       applySettings(response.settings); closeModal("settingsModal"); showToast("下载设置已保存，将用于之后的下载和截图");
     } catch (error) { $("settingsError").hidden = false; setText($("settingsError"), error.message); }
     finally { $("settingsSave").disabled = false; }
@@ -297,7 +346,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (!modal) return;
     if (event.key === "Escape") { event.preventDefault(); closeModal(modal.id); }
     if (event.key === "Tab") {
-      const focusable = [...modal.querySelectorAll("button:not([disabled]), input:not([disabled])")].filter(element => !element.hidden);
+      const focusable = [...modal.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled])")].filter(element => !element.hidden);
       const first = focusable[0], last = focusable[focusable.length - 1];
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }

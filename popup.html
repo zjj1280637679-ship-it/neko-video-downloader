@@ -47,6 +47,8 @@
       <input class="setting-input" id="subfolder" type="text" placeholder="例如：喵喵视频" autocomplete="off" maxlength="160" aria-describedby="folderHint folderPreview">
       <p class="field-hint" id="folderHint">留空直接保存到默认目录。可用“/”创建多级子文件夹。</p>
       <p class="folder-preview" id="folderPreview">默认下载文件夹</p>
+      <div class="concurrency-field"><label class="setting-field" for="concurrency">并行分片数</label><select class="setting-input concurrency-select" id="concurrency" aria-describedby="concurrencyHint"><option value="1">1 个</option><option value="2">2 个</option><option value="3">3 个</option><option value="5" selected>5 个（默认）</option><option value="8">8 个</option></select></div>
+      <p class="field-hint" id="concurrencyHint">并行数越高越可能触发来源限流。频繁失败时可调低后继续下载。</p>
       <label class="checkbox-setting"><input id="askWhereToSave" type="checkbox"><span>每次询问保存位置<small>开启后，保存文件前会弹出位置选择框。</small></span></label>
       <p class="settings-error" id="settingsError" role="alert" hidden></p>
       <div class="settings-actions"><button type="button" class="btn btn-secondary" id="settingsCancel">取消</button><button type="submit" class="btn btn-primary" id="settingsSave">保存设置</button></div>

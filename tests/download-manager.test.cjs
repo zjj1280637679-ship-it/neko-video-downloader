@@ -70,7 +70,7 @@ const restoredJob = changes => ({ id: 'restored', url: 'https://cdn.test/list.m3
 test('content scripts and other extension pages cannot start jobs, save blobs or change settings', async () => {
   const h = setup();
   const contentSender = { id: extensionId, url: 'https://page.test/watch', tab: { id: 8 } };
-  for (const action of ['startDownload', 'saveSettings', 'openDownloadSettings', 'cancelJob']) {
+  for (const action of ['startDownload', 'retryJob', 'discardJob', 'saveSettings', 'openDownloadSettings', 'cancelJob']) {
     assert.equal((await h.message({ ...hlsRequest, action }, contentSender)).success, false);
   }
   assert.equal((await h.message({ target: 'neko-background', action: 'saveBlob' }, contentSender)).success, false);
@@ -82,7 +82,7 @@ test('content scripts and other extension pages cannot start jobs, save blobs or
 
 test('settings reject absolute and traversal paths while default uses Chrome directory', async () => {
   const h = setup();
-  assert.deepEqual(JSON.parse(JSON.stringify((await h.message({ action: 'getSettings' })).settings)), { subfolder: '', askWhereToSave: false });
+  assert.deepEqual(JSON.parse(JSON.stringify((await h.message({ action: 'getSettings' })).settings)), { subfolder: '', askWhereToSave: false, concurrency: 5 });
   for (const subfolder of ['C:/Desktop', '../escape', 'Video/../escape', '/root', 'Video//nested', 'CON', 'Video/NUL', 'Video/trailing.']) {
     assert.equal((await h.message({ action: 'saveSettings', settings: { subfolder } })).success, false, subfolder);
   }
@@ -245,4 +245,153 @@ test('offscreen can recover a native ID when a saveBlob response was lost', asyn
   assert.equal(recovered.success, true);
   assert.equal(recovered.downloadId, saved.downloadId);
   assert.equal(recovered.item.state, 'in_progress');
+});
+
+test('concurrency defaults for old preferences, rejects invalid values, and preserves unrelated settings', async () => {
+  const h = setup({ settings: { subfolder: 'Existing/Videos', askWhereToSave: true } });
+  const previous = await h.message({ action: 'getSettings' });
+  assert.equal(previous.settings.concurrency, 5);
+  assert.equal(previous.settings.subfolder, 'Existing/Videos');
+  for (const concurrency of [0, 9, 2.5, '3', null, NaN, Infinity]) {
+    assert.equal((await h.message({ action: 'saveSettings', settings: { concurrency } })).success, false, String(concurrency));
+  }
+  const saved = await h.message({ action: 'saveSettings', settings: { concurrency: 3 } });
+  assert.equal(saved.settings.concurrency, 3);
+  assert.equal(saved.settings.subfolder, 'Existing/Videos');
+  assert.equal(saved.settings.askWhereToSave, true);
+  const { job } = await h.message({ ...hlsRequest, concurrency: 8 });
+  assert.equal(job.concurrency, 3, 'Jobs snapshot validated settings, not caller-supplied concurrency');
+  await h.message({ action: 'saveSettings', settings: { concurrency: 7 } });
+  assert.equal(h.calls.offscreen.find(call => call.action === 'runJob').job.concurrency, 3);
+});
+
+test('retry reuses ID and destination, applies current concurrency, clears old Chrome ID, and waits for one acknowledgement', async () => {
+  const acknowledgement = deferred();
+  const job = restoredJob({ state: 'interrupted', resumable: true, cachedSegments: 2,
+    filename: 'Original/movie.mp4', subfolder: 'Original', saveAs: true, concurrency: 2,
+    downloadId: 81, savedPath: 'old-path', error: 'network failed', cleanupError: 'old cleanup', cancelRequested: true });
+  const h = setup({ jobs: [job], settings: { subfolder: 'New', askWhereToSave: false, concurrency: 1 },
+    items: [{ id: 81, state: 'interrupted', error: 'NETWORK_FAILED' }],
+    offscreen: async message => message.action === 'runJob' ? acknowledgement.promise : { success: true } });
+  let firstSettled = false, secondSettled = false;
+  const first = h.message({ action: 'retryJob', jobId: job.id }).then(value => { firstSettled = true; return value; });
+  await tick();
+  const second = h.message({ action: 'retryJob', jobId: job.id }).then(value => { secondSettled = true; return value; });
+  await tick();
+  const dispatched = h.calls.offscreen.filter(call => call.action === 'runJob');
+  assert.equal(dispatched.length, 1);
+  assert.equal(firstSettled, false); assert.equal(secondSettled, false);
+  assert.equal(dispatched[0].job.id, 'restored');
+  assert.equal(dispatched[0].job.resume, true);
+  assert.equal(dispatched[0].job.filename, 'Original/movie.mp4');
+  assert.equal(dispatched[0].job.subfolder, 'Original');
+  assert.equal(dispatched[0].job.saveAs, true);
+  assert.equal(dispatched[0].job.concurrency, 1, 'Retry applies a lowered concurrency setting without changing its destination');
+  assert.equal(dispatched[0].job.url, 'https://cdn.test/list.m3u8');
+  assert.equal(dispatched[0].job.downloadId, null);
+  assert.equal(dispatched[0].job.savedPath, '');
+  assert.equal(dispatched[0].job.error, '');
+  assert.equal(dispatched[0].job.cleanupError, '');
+  assert.equal(dispatched[0].job.cancelRequested, false);
+  acknowledgement.resolve({ success: true });
+  assert.equal((await first).job.id, 'restored');
+  assert.equal((await second).job.id, 'restored');
+  const saved = await h.engine({ action: 'saveBlob', jobId: job.id, filename: 'Original/movie.mp4', url: `blob:${extensionUrl('')}new-attempt` });
+  assert.equal(saved.success, true);
+  assert.notEqual(saved.downloadId, 81, 'Retry cannot reuse the failed native save ID');
+  assert.equal(h.calls.nativeDownloads.length, 1);
+});
+
+test('retry guards terminal state, resumability, active Chrome saves, and maximum active queue', async () => {
+  for (const changes of [{ state: 'complete', resumable: true }, { state: 'cancelled', resumable: true },
+    { state: 'downloading', resumable: true }, { state: 'interrupted', resumable: false },
+    { state: 'interrupted', resumable: true, isM3U8: false }]) {
+    const h = setup({ jobs: [restoredJob(changes)] });
+    assert.equal((await h.message({ action: 'retryJob', jobId: 'restored' })).success, false);
+    assert.equal(h.calls.offscreen.filter(call => call.action === 'runJob').length, 0);
+  }
+  const activeSave = setup({ jobs: [restoredJob({ state: 'interrupted', resumable: true, downloadId: 8 })], items: [{ id: 8, state: 'in_progress' }] });
+  assert.equal((await activeSave.message({ action: 'retryJob', jobId: 'restored' })).success, false);
+  assert.equal(activeSave.session.neko_jobs_v1[0].downloadId, 8);
+  const full = setup({ jobs: [restoredJob({ state: 'interrupted', resumable: true }),
+    ...Array.from({ length: 10 }, (_, index) => restoredJob({ id: `active-${index}`, state: 'downloading' }))] });
+  assert.equal((await full.message({ action: 'retryJob', jobId: 'restored' })).success, false);
+  assert.equal(full.calls.create.length, 0);
+});
+
+test('progress exposes bounded retry and cache metadata without accepting malformed counters', async () => {
+  const h = setup();
+  const { job } = await h.message(hlsRequest);
+  await h.engine({ action: 'jobProgress', job: { id: job.id, state: 'downloading', resumable: true,
+    cachedSegments: 4, retryAttempt: 2, retryMessage: 'Retrying segment 5', phase: 'fetching' } });
+  await tick();
+  let stored = h.session.neko_jobs_v1.find(item => item.id === job.id);
+  assert.equal(stored.resumable, true); assert.equal(stored.cachedSegments, 4);
+  assert.equal(stored.retryAttempt, 2); assert.equal(stored.retryMessage, 'Retrying segment 5');
+  assert.equal(stored.phase, 'fetching');
+  await h.engine({ action: 'jobProgress', job: { id: job.id, state: 'interrupted', resumable: 'yes',
+    cachedSegments: -1, retryAttempt: 1.5, retryMessage: 'x'.repeat(1000), phase: 'y'.repeat(200) } });
+  await tick();
+  stored = h.session.neko_jobs_v1.find(item => item.id === job.id);
+  assert.equal(stored.resumable, true); assert.equal(stored.cachedSegments, 4); assert.equal(stored.retryAttempt, 2);
+  assert.equal(stored.retryMessage.length, 500); assert.equal(stored.phase.length, 80);
+});
+
+test('discard only clears confirmed interrupted HLS cache and preserves the failure record', async () => {
+  const cleanup = deferred();
+  const h = setup({ jobs: [restoredJob({ state: 'interrupted', resumable: true, cachedSegments: 3, error: 'Network failed' })],
+    offscreen: async message => message.action === 'discardJob' ? cleanup.promise : { success: true } });
+  const first = h.message({ action: 'discardJob', jobId: 'restored' });
+  await tick();
+  const second = h.message({ action: 'discardJob', jobId: 'restored' });
+  await tick();
+  assert.equal(h.calls.create.length, 1);
+  assert.equal(h.calls.offscreen.filter(call => call.action === 'discardJob').length, 1);
+  assert.equal(h.session.neko_jobs_v1[0].resumable, true);
+  assert.equal((await h.message({ action: 'retryJob', jobId: 'restored' })).success, false);
+  cleanup.resolve({ success: true });
+  const result = await first; await second;
+  assert.equal(result.job.state, 'interrupted'); assert.equal(result.job.error, 'Network failed');
+  assert.equal(result.job.resumable, false); assert.equal(result.job.cachedSegments, 0);
+  assert.equal(h.calls.nativeDownloads.length, 0);
+  assert.equal((await h.message({ action: 'discardJob', jobId: 'restored' })).success, false);
+});
+
+test('discard rejects active/completed/non-HLS jobs and does not erase metadata after engine failure', async () => {
+  for (const changes of [{ state: 'complete' }, { state: 'cancelled' }, { state: 'downloading' },
+    { state: 'interrupted', isM3U8: false }, { state: 'interrupted', resumable: false, cachedSegments: 0 }]) {
+    const h = setup({ jobs: [restoredJob({ resumable: true, cachedSegments: 2, ...changes })] });
+    assert.equal((await h.message({ action: 'discardJob', jobId: 'restored' })).success, false);
+    assert.equal(h.calls.offscreen.filter(call => call.action === 'discardJob').length, 0);
+  }
+  const failed = setup({ jobs: [restoredJob({ state: 'interrupted', resumable: true, cachedSegments: 2 })],
+    offscreen: async message => ({ success: message.action !== 'discardJob', error: 'disk unavailable' }) });
+  assert.equal((await failed.message({ action: 'discardJob', jobId: 'restored' })).success, false);
+  assert.equal(failed.session.neko_jobs_v1[0].resumable, true);
+  assert.equal(failed.session.neko_jobs_v1[0].cachedSegments, 2);
+});
+
+test('cancel during retry preparation confirms cache cleanup instead of orphaning it', async () => {
+  const opening = deferred();
+  const h = setup({ jobs: [restoredJob({ state: 'interrupted', resumable: true, cachedSegments: 2 })], getContexts: () => opening.promise });
+  const pending = h.message({ action: 'retryJob', jobId: 'restored' });
+  await tick();
+  assert.equal((await h.message({ action: 'cancelJob', jobId: 'restored' })).success, true);
+  opening.resolve([]);
+  const result = await pending;
+  assert.equal(result.job.state, 'cancelled');
+  assert.equal(result.job.resumable, false); assert.equal(result.job.cachedSegments, 0);
+  assert.equal(h.calls.offscreen.filter(call => call.action === 'runJob').length, 0);
+  assert.equal(h.calls.offscreen.filter(call => call.action === 'discardJob').length, 1);
+});
+
+test('history trimming retains every resumable task and new-worker pruning protects all known IDs', async () => {
+  const knownJobs = Array.from({ length: 23 }, (_, index) => restoredJob({ id: `cached-${index}`, state: 'interrupted', resumable: true, cachedSegments: 1 }));
+  const h = setup({ jobs: knownJobs });
+  const started = await h.message(hlsRequest);
+  const pruning = h.calls.offscreen.find(call => call.action === 'pruneCaches');
+  assert.deepEqual(new Set(pruning.jobIds), new Set([...knownJobs.map(job => job.id), started.job.id]));
+  assert.equal(h.session.neko_jobs_v1.filter(job => job.resumable).length, 23);
+  await h.message({ ...hlsRequest, url: 'https://cdn.test/second.m3u8' });
+  assert.equal(h.calls.offscreen.filter(call => call.action === 'pruneCaches').length, 1);
 });

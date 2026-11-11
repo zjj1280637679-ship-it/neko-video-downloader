@@ -1,11 +1,11 @@
 /* Hidden HLS worker. Only chrome.runtime is used here; downloads are brokered
  * by the service worker. No popup or visible document owns a running task. */
 (function (root, factory) {
-  const api = factory();
+  const api = factory(typeof module === "object" && module.exports ? require('./segment-cache.js') : root.NekoSegmentCache);
   if (typeof module === "object" && module.exports) module.exports = api;
   else api.createOffscreenRunner({ runtime: root.chrome.runtime, hls: root.NekoHls,
     storage: root.navigator.storage, urlApi: root.URL, cryptoApi: root.crypto }).attach();
-})(typeof globalThis !== "undefined" ? globalThis : this, function () {
+})(typeof globalThis !== "undefined" ? globalThis : this, function (segmentCache) {
   "use strict";
   const TERMINAL = new Set(["complete", "interrupted", "cancelled"]);
   const MEMORY_LIMIT = 256 * 1024 * 1024;
@@ -69,13 +69,14 @@
       return [...parts, hls.safeFilename(basename, extension)].join("/");
     }
     function trimHistory() {
-      const finished = Array.from(entries.values()).filter(entry => TERMINAL.has(entry.status.state));
+      const finished = Array.from(entries.values()).filter(entry => TERMINAL.has(entry.status.state) && !entry.status.resumable);
       for (const entry of finished.slice(0, Math.max(0, finished.length - 30))) entries.delete(entry.status.id);
     }
     function addJob(job) {
       if (!job || typeof job.id !== "string" || !job.id || job.id.length > 128 || job.isM3U8 !== true) throw new Error("无效的 HLS 下载任务");
       if (!/^https?:$/.test(new URL(job.url).protocol)) throw new Error("仅支持 HTTP / HTTPS 视频资源");
-      if (entries.has(job.id)) return { success: true, job: snapshot(entries.get(job.id)) };
+      const previous = entries.get(job.id);
+      if (previous && !(job.resume === true && previous.status.state === 'interrupted' && previous.status.resumable)) return { success: true, job: snapshot(previous) };
       if (Array.from(entries.values()).filter(entry => !TERMINAL.has(entry.status.state)).length >= 20) throw new Error("下载队列已满，请等待当前任务完成");
       trimHistory();
       const stamp = now();
@@ -83,7 +84,9 @@
         lastSent: -Infinity, notifications: Promise.resolve(), downloadId: null, chromeFinished: false,
         status: { id: job.id, title: job.title || "视频", tabId: job.tabId, filename: job.filename || "视频",
           state: "queued", bytesReceived: 0, totalBytes: 0, completedSegments: 0, totalSegments: 0,
-          createdAt: stamp, updatedAt: stamp, error: null } };
+          cachedSegments: previous?.status.cachedSegments || job.cachedSegments || 0,
+          resumable: false, retryAttempt: 0, retryMessage: '',
+          createdAt: previous?.status.createdAt || stamp, updatedAt: stamp, error: null } };
       entries.set(job.id, entry);
       queue.push(job.id);
       update(entry, {}, true);
@@ -95,7 +98,19 @@
       if (!entry) return { success: false, error: "找不到下载任务" };
       if (TERMINAL.has(entry.status.state)) return { success: true, job: snapshot(entry) };
       entry.controller.abort(abortError());
-      if (activeId !== jobId) update(entry, { state: "cancelled", error: null, finishedAt: now() }, true);
+      if (activeId !== jobId && entry.status.cachedSegments > 0) {
+        const at = queue.indexOf(jobId);
+        if (at >= 0) queue.splice(at, 1);
+        update(entry, { cancelRequested: true }, true);
+        (async () => {
+          try {
+            await segmentCache.removeJob(await storage.getDirectory(), jobId, cryptoApi);
+            await update(entry, { state: 'cancelled', resumable: false, cachedSegments: 0, cancelRequested: false, error: null, finishedAt: now() }, true);
+          } catch (error) {
+            await update(entry, { state: 'interrupted', resumable: true, cancelRequested: false, cleanupError: `分片缓存未能清理：${error.message}`, finishedAt: now() }, true);
+          }
+        })();
+      } else if (activeId !== jobId) update(entry, { state: "cancelled", error: null, finishedAt: now() }, true);
       else update(entry, { cancelRequested: true }, true);
       return { success: true };
     }
@@ -145,13 +160,21 @@
     }
     async function execute(entry) {
       let writer = null, directory = null, temporaryName = null, temporaryFile = null, objectUrl = null;
+      let cache = null;
       const memoryParts = [];
       let memoryBytes = 0, finalState = "interrupted", errorText = null, cleanupError = null, chromeReferencePossible = false;
       try {
         ensureActive(entry);
         await update(entry, { state: "parsing" }, true);
-        const client = hls.createClient({ signal: entry.controller.signal, onRetry({ attempt }) {
-          update(entry, { retryAttempt: attempt });
+        const retryingResources = new Map();
+        const client = hls.createClient({ signal: entry.controller.signal, onRetry({ attempt, maxAttempts, delayMs, stage, operationUrl }) {
+          const reason = stage === 'decrypt' ? '分片解密失败' : stage === 'payload' ? '分片内容异常' : '资源请求失败';
+          const retry = { retryAttempt: attempt, retryMessage: `${reason}，${Math.ceil((delayMs || 0) / 1000)} 秒后进行第 ${attempt + 1}/${maxAttempts || 6} 次尝试` };
+          retryingResources.set(operationUrl, retry);
+          update(entry, retry);
+        }, onRecovered({ resourceUrl }) {
+          retryingResources.delete(resourceUrl);
+          update(entry, Array.from(retryingResources.values()).at(-1) || { retryAttempt: 0, retryMessage: '' });
         } });
         const plan = await client.loadPlan(entry.input.url);
         ensureActive(entry);
@@ -162,6 +185,7 @@
           try { directory = await storage.getDirectory(); }
           catch (error) { if (error.name !== "NotSupportedError") throw error; }
           if (directory) {
+            cache = await segmentCache.open(directory, entry.status.id, plan, cryptoApi, count => update(entry, { cachedSegments: count }));
             temporaryName = `neko-download-${cryptoApi.randomUUID()}.part`;
             temporaryFile = await directory.getFileHandle(temporaryName, { create: true });
             writer = await temporaryFile.createWritable();
@@ -175,8 +199,8 @@
         } };
         await update(entry, { state: "downloading" }, true);
         await client.download(plan, sink, ({ bytes, completed, total }) => {
-          update(entry, { bytesReceived: bytes, completedSegments: completed, totalSegments: total, retryAttempt: 0 });
-        });
+          update(entry, { bytesReceived: bytes, completedSegments: completed, totalSegments: total });
+        }, entry.input.concurrency || 5, cache || {});
         ensureActive(entry);
         let file;
         if (writer) {
@@ -190,7 +214,7 @@
         }
         ensureActive(entry);
         objectUrl = urlApi.createObjectURL(file);
-        await update(entry, { state: "saving", totalBytes: file.size }, true);
+        await update(entry, { state: "saving", totalBytes: file.size, retryAttempt: 0, retryMessage: '' }, true);
         chromeReferencePossible = true;
         const result = await saveBlob(entry, { jobId: entry.status.id, url: objectUrl, filename, saveAs: entry.input.saveAs === true });
         if (!Number.isInteger(result.downloadId)) throw new Error("Chrome 未返回有效的下载任务编号");
@@ -200,7 +224,7 @@
         finalState = "complete";
       } catch (error) {
         if (error.noChromeReference) chromeReferencePossible = false;
-        const cancelled = entry.controller.signal.aborted || error.name === "AbortError";
+        const cancelled = entry.controller.signal.aborted;
         finalState = cancelled ? "cancelled" : "interrupted";
         errorText = cancelled ? null : error.name === "QuotaExceededError" ? "临时存储空间不足，请释放磁盘空间后重试" : error.message;
         if (entry.downloadId !== null && !entry.chromeFinished) {
@@ -223,7 +247,22 @@
             catch (error) { if (error.name !== "NotFoundError") cleanupError = `临时下载文件未能清理：${error.message}`; }
           }
         }
-        await update(entry, { state: finalState, error: errorText, cleanupError, cancelRequested: false, finishedAt: now() }, true);
+        if (cache && finalState !== 'interrupted') {
+          try { await cache.clear(); }
+          catch (error) { cleanupError = `分片缓存未能清理：${error.message}`; }
+        } else if (!cache && finalState === 'cancelled' && entry.status.cachedSegments > 0) {
+          try {
+            await segmentCache.removeJob(await storage.getDirectory(), entry.status.id, cryptoApi);
+            entry.status.cachedSegments = 0;
+          } catch (error) { cleanupError = `分片缓存未能清理：${error.message}`; }
+        }
+        // A failure retains committed, verified pieces; explicit cancellation
+        // discards them. Never offer restart while Chrome may still be saving.
+        const retainedCount = cache ? cache.count() : entry.status.cachedSegments;
+        const resumable = finalState === 'interrupted' && retainedCount > 0 &&
+          ((!chromeReferencePossible && entry.downloadId === null) || entry.chromeFinished);
+        await update(entry, { state: finalState, error: errorText, cleanupError, resumable,
+          cachedSegments: retainedCount, retryAttempt: 0, retryMessage: '', cancelRequested: false, finishedAt: now() }, true);
       }
     }
     async function pump() {
@@ -243,6 +282,25 @@
     function handleMessage(message, sender, sendResponse) {
       if (message?.target !== "neko-offscreen") return false;
       if (sender?.id !== runtime.id || sender.tab || (sender.url && sender.url !== runtime.getURL("background.js"))) return false;
+      if (message.action === 'discardJob' || message.action === 'pruneCaches') {
+        (async () => {
+          if (typeof storage?.getDirectory !== 'function') return { success: true };
+          const directory = await storage.getDirectory();
+          if (message.action === 'pruneCaches') {
+            if (!Array.isArray(message.jobIds) || message.jobIds.some(id => typeof id !== 'string' || !id || id.length > 128)) throw new Error('缓存任务列表无效');
+            const active = Array.from(entries.values()).filter(entry => !TERMINAL.has(entry.status.state)).map(entry => entry.status.id);
+            await segmentCache.prune(directory, [...message.jobIds, ...active], cryptoApi);
+          } else {
+            if (typeof message.jobId !== 'string' || !message.jobId || message.jobId.length > 128) throw new Error('缓存任务无效');
+            const entry = entries.get(message.jobId);
+            if (entry && !TERMINAL.has(entry.status.state)) throw new Error('下载进行中，不能清理缓存');
+            await segmentCache.removeJob(directory, message.jobId, cryptoApi);
+            if (entry) await update(entry, { resumable: false, cachedSegments: 0 }, true);
+          }
+          return { success: true };
+        })().then(sendResponse, error => sendResponse({ success: false, error: error.message }));
+        return true;
+      }
       try {
         if (message.action === "runJob") sendResponse(addJob(message.job));
         else if (message.action === "cancelJob") sendResponse(cancelJob(message.jobId));

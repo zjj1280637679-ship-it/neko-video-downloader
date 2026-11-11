@@ -141,48 +141,88 @@
     const fetcher = options.fetch || globalThis.fetch.bind(globalThis);
     const cryptoApi = options.crypto || globalThis.crypto;
     const signal = options.signal;
-    const retries = options.retries ?? 3;
+    const retries = Number.isFinite(options.retries) ? Math.max(1, Math.min(10, Math.floor(options.retries))) : 6;
     const keyCache = new Map(), mapCache = new Map();
-    async function request(url, byteRange, asText = false) {
+    function annotate(error, details) {
+      const result = error instanceof Error || error instanceof DOMException ? error : new Error(String(error));
+      for (const [key, value] of Object.entries(details)) if (result[key] === undefined) result[key] = value;
+      return result;
+    }
+    function retryAfter(value) {
+      if (!value) return 0;
+      const seconds = Number(value);
+      const wait = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - (options.now || Date.now)();
+      return Number.isFinite(wait) ? Math.min(30000, Math.max(0, wait)) : 0;
+    }
+    async function withRetries(operation, operationSignal, resourceUrl) {
       for (let attempt = 1; attempt <= retries; attempt++) {
-        ensureActive(signal);
-        const controller = new AbortController();
-        const abort = () => controller.abort(signal.reason || abortError());
-        signal?.addEventListener("abort", abort, { once: true });
-        const timer = setTimeout(() => controller.abort(new Error("请求超时")), options.timeoutMs ?? 30000);
+        ensureActive(operationSignal);
+        let result;
         try {
-          const headers = byteRange ? { Range: `bytes=${byteRange.offset}-${byteRange.offset + byteRange.length - 1}` } : {};
-          const response = await fetcher(url, { headers, signal: controller.signal, credentials: "include" });
-          if (!response.ok) {
-            const error = new Error(`资源请求失败（HTTP ${response.status}）`);
-            error.noRetry = response.status >= 400 && response.status < 500 && ![408, 429].includes(response.status);
-            throw error;
-          }
-          if (asText) return { text: await response.text(), url: response.url || url };
-          let data = await response.arrayBuffer();
-          if (byteRange) {
-            if (response.status === 200) {
-              if (data.byteLength < byteRange.offset + byteRange.length) throw new Error("服务器返回的完整资源不足以覆盖字节范围");
-              data = data.slice(byteRange.offset, byteRange.offset + byteRange.length);
-            } else if (response.status === 206) {
-              const contentRange = response.headers.get("content-range");
-              const expected = new RegExp(`^bytes ${byteRange.offset}-${byteRange.offset + byteRange.length - 1}/(?:\\d+|\\*)$`, "i");
-              if (!contentRange || !expected.test(contentRange)) throw new Error("服务器返回了错误的字节范围");
-            } else throw new Error("服务器没有正确响应分片范围请求");
-            if (data.byteLength !== byteRange.length) throw new Error("分片字节数不完整");
-          }
-          if (!data.byteLength) throw new Error("服务器返回了空分片");
-          return data;
-        } catch (error) {
-          ensureActive(signal);
-          if (attempt >= retries || error.noRetry) throw error;
-          options.onRetry?.({ attempt, error });
-        } finally {
-          clearTimeout(timer);
-          signal?.removeEventListener("abort", abort);
+          result = await operation(attempt);
+        } catch (cause) {
+          ensureActive(operationSignal);
+          const error = annotate(cause, { retryable: true, resourceUrl, stage: "request" });
+          error.attempts = attempt;
+          if (!error.retryable || attempt >= retries) throw error;
+          const base = Math.max(0, options.retryDelayMs ?? 500);
+          const cap = Math.max(0, Math.min(30000, options.maxRetryDelayMs ?? 10000));
+          const random = Math.max(0, Math.min(1, (options.random || Math.random)()));
+          const backoff = Math.min(cap, base * 2 ** (attempt - 1) * (0.8 + random * 0.4));
+          const delayMs = Math.min(30000, Math.max(Math.round(backoff), error.retryAfterMs || 0));
+          options.onRetry?.({ attempt, maxAttempts: retries, delayMs, stage: error.stage, resourceUrl: error.resourceUrl, operationUrl: resourceUrl, error });
+          await delay(delayMs, operationSignal);
+          continue;
         }
-        await delay((options.retryDelayMs ?? 500) * attempt, signal);
+        if (attempt > 1) options.onRecovered?.({ resourceUrl, attempt });
+        return result;
       }
+    }
+    async function requestOnce(url, byteRange, asText, operationSignal, cache) {
+      ensureActive(operationSignal);
+      const controller = new AbortController();
+      const abort = () => controller.abort(operationSignal.reason || abortError());
+      operationSignal?.addEventListener("abort", abort, { once: true });
+      let timedOut = false, httpStatus;
+      const timer = setTimeout(() => { timedOut = true; controller.abort(new DOMException("资源请求超时", "TimeoutError")); }, options.timeoutMs ?? 30000);
+      try {
+        const headers = byteRange ? { Range: `bytes=${byteRange.offset}-${byteRange.offset + byteRange.length - 1}` } : {};
+        const response = await fetcher(url, { headers, signal: controller.signal, credentials: "include", ...(cache ? { cache } : {}) });
+        httpStatus = response.status;
+        if (!response.ok) {
+          try { await response.body?.cancel(); } catch { /* Error-body cleanup must not replace the HTTP failure. */ }
+          throw annotate(new Error(`资源请求失败（HTTP ${response.status}）`), {
+            retryable: response.status === 408 || response.status === 429 || response.status >= 500,
+            retryAfterMs: [429, 503].includes(response.status) ? retryAfter(response.headers.get("retry-after")) : 0
+          });
+        }
+        if (asText) return { text: await response.text(), url: response.url || url, httpStatus };
+        let data = await response.arrayBuffer();
+        if (byteRange) {
+          if (response.status === 200) {
+            if (data.byteLength < byteRange.offset + byteRange.length) throw new Error("服务器返回的完整资源不足以覆盖字节范围");
+            data = data.slice(byteRange.offset, byteRange.offset + byteRange.length);
+          } else if (response.status === 206) {
+            const contentRange = response.headers.get("content-range");
+            const expected = new RegExp(`^bytes ${byteRange.offset}-${byteRange.offset + byteRange.length - 1}/(?:\\d+|\\*)$`, "i");
+            if (!contentRange || !expected.test(contentRange)) throw annotate(new Error("服务器返回了错误的字节范围"), { retryable: false });
+          } else throw annotate(new Error("服务器没有正确响应分片范围请求"), { retryable: false });
+          if (data.byteLength !== byteRange.length) throw new Error("分片字节数不完整");
+        }
+        if (!data.byteLength) throw new Error("服务器返回了空分片");
+        return { data, httpStatus };
+      } catch (cause) {
+        ensureActive(operationSignal);
+        const error = timedOut ? new DOMException("资源请求超时", "TimeoutError") : cause;
+        throw annotate(error, { retryable: true, resourceUrl: url, httpStatus, stage: "request" });
+      } finally {
+        clearTimeout(timer);
+        operationSignal?.removeEventListener("abort", abort);
+      }
+    }
+    async function request(url, byteRange, asText = false) {
+      const result = await withRetries(attempt => requestOnce(url, byteRange, asText, signal, attempt > 1 ? "no-store" : undefined), signal, url);
+      return asText ? { text: result.text, url: result.url } : result.data;
     }
     async function loadPlan(url) {
       const visited = new Set();
@@ -199,60 +239,157 @@
       }
       throw new Error("播放清单嵌套过深");
     }
-    async function getKey(url) {
-      if (!keyCache.has(url)) keyCache.set(url, (async () => {
-        const bytes = await request(url);
-        if (bytes.byteLength !== 16) throw new Error("AES-128 密钥长度无效（应为 16 字节）");
-        return cryptoApi.subtle.importKey("raw", bytes, "AES-CBC", false, ["decrypt"]);
-      })());
-      try { return await keyCache.get(url); }
-      catch (error) { keyCache.delete(url); throw error; }
+    async function getKey(url, operationSignal, cache) {
+      if (!keyCache.has(url)) {
+        const token = {};
+        token.promise = (async () => {
+          try {
+            const { data: bytes, httpStatus } = await requestOnce(url, null, false, operationSignal, cache);
+            if (bytes.byteLength !== 16) throw annotate(new Error("AES-128 密钥长度无效（应为 16 字节）"), { httpStatus });
+            return await cryptoApi.subtle.importKey("raw", bytes, "AES-CBC", false, ["decrypt"]);
+          } catch (error) { error.stage = "key"; throw annotate(error, { retryable: true, resourceUrl: url }); }
+        })();
+        keyCache.set(url, token);
+      }
+      const token = keyCache.get(url);
+      try { return { key: await token.promise, token }; }
+      catch (error) {
+        if (keyCache.get(url) === token) keyCache.delete(url);
+        throw error;
+      }
     }
-    async function readResource(resource) {
-      const raw = await request(resource.url, resource.byteRange);
-      if (!resource.key) return validatePayload(raw);
-      const key = await getKey(resource.key.url);
-      ensureActive(signal);
-      let decoded;
-      try { decoded = await cryptoApi.subtle.decrypt({ name: "AES-CBC", iv: resource.iv }, key, raw); }
-      catch { throw new Error("AES-128 解密失败，请重新播放网页后获取最新线路"); }
-      return validatePayload(decoded);
+    async function readResource(resource, operationSignal = signal) {
+      return withRetries(async attempt => {
+        const cache = attempt > 1 ? "no-store" : undefined;
+        const { data: raw, httpStatus } = await requestOnce(resource.url, resource.byteRange, false, operationSignal, cache);
+        let keyEntry, stage = "payload";
+        try {
+          validatePayload(raw);
+          if (!resource.key) return raw;
+          stage = "decrypt";
+          if (raw.byteLength % 16 !== 0) throw new Error("AES-128 分片长度不完整");
+          keyEntry = await getKey(resource.key.url, operationSignal, cache);
+          ensureActive(operationSignal);
+          let decoded;
+          try { decoded = await cryptoApi.subtle.decrypt({ name: "AES-CBC", iv: resource.iv }, keyEntry.key, raw); }
+          catch { throw new Error("AES-128 解密失败，请重新播放网页后获取最新线路"); }
+          stage = "payload";
+          return validatePayload(decoded);
+        } catch (error) {
+          ensureActive(operationSignal);
+          if (keyEntry && keyCache.get(resource.key.url) === keyEntry.token) keyCache.delete(resource.key.url);
+          throw annotate(error, { retryable: true, resourceUrl: resource.url, httpStatus, stage });
+        }
+      }, operationSignal, resource.url);
     }
-    async function readMap(plan, id) {
-      if (!mapCache.has(id)) mapCache.set(id, readResource(plan.maps.get(id)));
-      try { return await mapCache.get(id); }
-      catch (error) { mapCache.delete(id); throw error; }
+    async function readMap(plan, id, operationSignal) {
+      if (!mapCache.has(id)) mapCache.set(id, readResource(plan.maps.get(id), operationSignal));
+      const pending = mapCache.get(id);
+      try { return await pending; }
+      catch (error) { if (mapCache.get(id) === pending) mapCache.delete(id); throw error; }
     }
-    // Consume each window before scheduling the next: bounded reorder memory.
-    async function download(plan, sink, onProgress = () => {}, concurrency = 5) {
+    // Slide a bounded read/cache window behind an ordered writer. Successful
+    // peers are cached immediately, including when another segment later fails.
+    async function download(plan, sink, onProgress = () => {}, concurrency = 5, hooks = {}) {
       if (plan.isFmp4 && (plan.maps.size > 1 || plan.discontinuities)) throw new Error("此 fMP4 线路存在初始化段或时间轴切换，需要重新封装；请更换线路或使用外部下载工具");
       let bytes = 0, completed = 0, lastMap = null;
       const width = Number.isFinite(concurrency) ? Math.max(1, Math.min(8, Math.floor(concurrency))) : 5;
-      for (let start = 0; start < plan.segments.length; start += width) {
-        ensureActive(signal);
-        const window = plan.segments.slice(start, start + width);
-        const results = await Promise.allSettled(window.map(segment => readResource(segment)));
-        ensureActive(signal);
-        const failed = results.findIndex(result => result.status === "rejected");
-        if (failed >= 0) throw new Error(`第 ${start + failed + 1} 个分片下载失败：${results[failed].reason.message}`);
-        for (let i = 0; i < window.length; i++) {
-          ensureActive(signal);
-          const segment = window[i];
+      const operation = new AbortController();
+      const abort = () => operation.abort(signal.reason || abortError());
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+      const pending = new Map();
+      let nextToSchedule = 0, firstFailure = null;
+      function segmentError(cause, index, segment, stage) {
+        if (cause.name === "AbortError") return cause;
+        const error = new Error(`第 ${index + 1} 个分片处理失败：${cause.message}`, { cause });
+        error.name = cause.name || "Error";
+        Object.assign(error, { retryable: cause.retryable ?? false, resourceUrl: cause.resourceUrl || segment.url,
+          httpStatus: cause.httpStatus, stage: cause.stage || stage, segmentIndex: index, segmentNumber: index + 1,
+          segmentUrl: segment.url, attempts: cause.attempts });
+        return error;
+      }
+      async function readSegment(index) {
+        const segment = plan.segments[index];
+        let stage = "cache-read";
+        try {
+          ensureActive(operation.signal);
+          if (hooks.getSegment) {
+            const cached = await hooks.getSegment(index, segment);
+            ensureActive(operation.signal);
+            if (cached != null) {
+              if (Object.prototype.toString.call(cached) !== "[object ArrayBuffer]" || !cached.byteLength) throw new Error("已缓存的分片内容无效");
+              return { data: cached };
+            }
+          }
+          stage = "request";
+          const data = await readResource(segment, operation.signal);
+          ensureActive(operation.signal);
+          if (hooks.putSegment) {
+            stage = "cache-write";
+            await hooks.putSegment(index, segment, data);
+          }
+          ensureActive(operation.signal);
+          return { data };
+        } catch (cause) {
+          const error = segmentError(cause, index, segment, stage);
+          if (stage === "cache-read" || stage === "cache-write") { error.retryable = false; error.stage = stage; }
+          if (!firstFailure && error.name !== "AbortError") firstFailure = error;
+          return { error };
+        }
+      }
+      function fillWindow(written) {
+        while (!firstFailure && !operation.signal.aborted && nextToSchedule < plan.segments.length && nextToSchedule < written + width) {
+          const index = nextToSchedule++;
+          pending.set(index, readSegment(index));
+        }
+      }
+      try {
+        fillWindow(0);
+        for (let index = 0; index < plan.segments.length; index++) {
+          ensureActive(operation.signal);
+          const result = await pending.get(index);
+          ensureActive(operation.signal);
+          if (firstFailure) throw firstFailure;
+          if (result?.error) throw result.error;
+          const segment = plan.segments[index];
           if (segment.mapId && (segment.mapId !== lastMap || segment.discontinuity)) {
-            const init = await readMap(plan, segment.mapId);
-            await sink.write(init);
+            let init;
+            try { init = await readMap(plan, segment.mapId, operation.signal); }
+            catch (error) { throw segmentError(error, index, segment, "request"); }
+            ensureActive(operation.signal);
+            try { await sink.write(init); }
+            catch (error) {
+              const failure = segmentError(error, index, segment, "sink-write");
+              failure.retryable = false; failure.stage = "sink-write"; throw failure;
+            }
+            ensureActive(operation.signal);
             bytes += init.byteLength;
             lastMap = segment.mapId;
           }
-          const data = results[i].value;
-          await sink.write(data);
-          bytes += data.byteLength;
+          ensureActive(operation.signal);
+          try { await sink.write(result.data); }
+          catch (error) {
+            const failure = segmentError(error, index, segment, "sink-write");
+            failure.retryable = false; failure.stage = "sink-write"; throw failure;
+          }
+          ensureActive(operation.signal);
+          bytes += result.data.byteLength;
           completed++;
-          results[i] = null;
+          pending.delete(index);
           onProgress({ bytes, completed, total: plan.segments.length });
+          fillWindow(completed);
         }
+        return { bytes, completed, total: plan.segments.length };
+      } catch (error) {
+        // Keep successful peers running long enough to persist their cache on a
+        // network failure. Storage failure can stop outstanding network work.
+        if (["sink-write", "cache-read", "cache-write"].includes(error.stage)) operation.abort(abortError());
+        throw error;
+      } finally {
+        await Promise.allSettled(pending.values());
+        signal?.removeEventListener("abort", abort);
       }
-      return { bytes, completed, total: plan.segments.length };
     }
     return { loadPlan, download, readResource, request };
   }
