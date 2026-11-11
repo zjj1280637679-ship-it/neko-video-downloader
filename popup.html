@@ -7,66 +7,55 @@
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <div class="app-container">
-    <!-- 头部可爱猫耳导航栏 -->
+  <div class="app-container" id="appContent">
     <header class="header">
-      <div class="cat-ears">
-        <span class="ear left-ear"></span>
-        <span class="ear right-ear"></span>
-      </div>
-      <div class="title-row">
-        <span class="sparkle">✨</span>
-        <h1 class="title">喵喵视频下载姬</h1>
-        <span class="sparkle">✨</span>
-      </div>
-      <p class="subtitle">(◕ᴗ◕✿) 为你捕捉每一帧心动~</p>
+      <div class="brand-mark" aria-hidden="true"><img src="icons/icon48.png" alt=""></div>
+      <div><p class="eyebrow">NEKO · VIDEO COMPANION</p><h1>喵喵视频下载姬</h1><p class="subtitle">把喜欢的画面，好好收藏。</p></div>
+      <button class="btn-icon btn-settings" id="btnSettings" title="下载设置" aria-label="下载设置">⚙</button>
     </header>
-
-    <!-- 当前网页信息条 -->
-    <div class="page-bar">
-      <span class="page-icon">🌐</span>
-      <span class="page-title" id="pageTitle">正在连接网页...</span>
-    </div>
-
-    <!-- 极速捕捉状态条 -->
-    <div class="status-bar" id="statusBar">
-      <div class="status-left">
-        <span class="status-radar"></span>
-        <span id="statusText">正在捕捉视频信号中喵... (✧ω✧)</span>
-      </div>
-      <button class="btn-icon" id="btnRefresh" title="强制刷新">🔄</button>
-    </div>
-
-    <!-- 视频列表容器 -->
-    <main class="media-list" id="mediaList">
-      <!-- 动态渲染 -->
-    </main>
-
-    <!-- 底部可爱版权/提示 -->
-    <footer class="footer">
-      <span>(=^･ω･^=) 极速高频嗅探中 · 仅供学习交流使用哦</span>
-    </footer>
+    <section class="page-bar" aria-label="当前网页">
+      <span class="page-icon" aria-hidden="true">↗</span>
+      <div class="page-copy"><span class="section-label">当前网页</span><p class="page-title" id="pageTitle">正在连接网页…</p></div>
+    </section>
+    <nav class="view-tabs" role="tablist" aria-label="视频与下载">
+      <button id="sourceTab" class="view-tab" role="tab" aria-selected="true" aria-controls="sourcePanel">视频来源 <span id="sourceTabCount">0</span></button>
+      <button id="jobsTab" class="view-tab" role="tab" aria-selected="false" aria-controls="jobsPanel" tabindex="-1">下载任务 <span id="jobsTabCount">0</span></button>
+    </nav>
+    <section class="view-panel" id="sourcePanel" role="tabpanel" aria-labelledby="sourceTab">
+      <div class="status-bar" id="statusBar" data-state="checking"><span class="status-radar" aria-hidden="true"></span><span id="statusText" role="status" aria-live="polite">正在确认播放器状态…</span><button class="btn-icon" id="btnRefresh" title="重新读取视频列表" aria-label="重新读取视频列表">↻</button></div>
+      <div class="list-toolbar" id="listToolbar" hidden><label class="search-wrap"><span aria-hidden="true">⌕</span><input id="mediaSearch" type="search" placeholder="搜索文件名或来源" aria-label="搜索文件名或来源" autocomplete="off"></label><span id="sourceCount" class="source-count"></span></div>
+      <main class="media-list" id="mediaList" aria-label="视频来源"></main>
+      <details class="frames-section" id="framesSection" hidden>
+        <summary>当前网页画面 <small id="framesCount"></small></summary>
+        <div class="frames-header"><span>留住喜欢的一帧</span><button class="btn-snap" id="btnSnap">抓拍一帧</button></div>
+        <div class="frames-scroll" id="framesList"></div><p class="frames-empty-hint" id="framesHint">播放后可抓拍；部分跨域视频不允许截图。</p>
+      </details>
+    </section>
+    <section class="view-panel" id="jobsPanel" role="tabpanel" aria-labelledby="jobsTab" hidden>
+      <p class="jobs-hint"><span aria-hidden="true">✿</span> 关掉弹窗也会继续下载，下次打开可查看进度。</p>
+      <p id="jobsStatus" class="jobs-status" role="status" aria-live="polite" hidden></p>
+      <div class="job-list" id="jobList" aria-label="最近下载任务"></div>
+    </section>
+    <footer class="footer"><span class="footer-cat" aria-hidden="true">(=^･ω･^=)</span><button id="btnSaveLocation" class="location-link" title="查看下载设置"><span id="saveLocation">保存至 Chrome 默认下载文件夹</span><span aria-hidden="true"> ›</span></button></footer>
   </div>
-
-  <!-- 截图大图预览弹窗 -->
-  <div class="modal" id="imageModal">
-    <div class="modal-content">
-      <div class="modal-header">
-        <span class="modal-title" id="modalTimeTag">⏱️ 截屏时间: 00:00</span>
-        <button class="modal-close" id="modalClose">✕</button>
-      </div>
-      <img id="modalImg" class="modal-img" src="" alt="截屏预览">
-      <div class="modal-actions">
-        <button class="btn btn-primary" id="btnSaveFrame">
-          <span>💾</span> 保存该帧截图 (JPG)
-        </button>
-      </div>
-    </div>
+  <div class="modal" id="imageModal" role="dialog" aria-modal="true" aria-labelledby="modalTimeTag" hidden><div class="modal-content"><div class="modal-header"><span id="modalTimeTag">画面预览</span><button class="btn-icon" id="modalClose" aria-label="关闭画面预览">×</button></div><img id="modalImg" class="modal-img" alt="视频画面预览"><button class="btn btn-primary" id="btnSaveFrame">保存截图 · JPG</button></div></div>
+  <div class="modal" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
+    <form class="modal-content settings-content" id="settingsForm">
+      <div class="modal-header"><div><p class="eyebrow">MAKE IT YOURS</p><h2 id="settingsTitle">下载设置</h2></div><button class="btn-icon" type="button" id="settingsClose" aria-label="关闭下载设置">×</button></div>
+      <div class="destination-box"><span class="section-label">保存位置</span><strong>Chrome 默认下载文件夹</strong><button type="button" class="text-button" id="btnChromeSettings">更改 Chrome 下载位置 ↗</button></div>
+      <label class="setting-field" for="subfolder">子文件夹 <span>选填</span></label>
+      <input class="setting-input" id="subfolder" type="text" placeholder="例如：喵喵视频" autocomplete="off" maxlength="160" aria-describedby="folderHint folderPreview">
+      <p class="field-hint" id="folderHint">留空直接保存到默认目录。可用“/”创建多级子文件夹。</p>
+      <p class="folder-preview" id="folderPreview">默认下载文件夹</p>
+      <div class="concurrency-field"><label class="setting-field" for="concurrencyMode">分片并行策略</label><select class="setting-input concurrency-select mode-select" id="concurrencyMode" aria-describedby="concurrencyModeHint"><option value="auto" selected>自动调节（推荐）</option><option value="manual">手动固定</option></select></div>
+      <p class="field-hint" id="concurrencyModeHint">根据并行数变化后的总下载速度调整：持续提速时增加，提速不明显时停止增加，降速时尝试减少。</p>
+      <div id="concurrencyCountRow" hidden><div class="concurrency-field"><label class="setting-field" for="concurrency">并行分片数</label><select class="setting-input concurrency-select" id="concurrency" aria-describedby="concurrencyHint"><option value="1">1 个</option><option value="2">2 个</option><option value="3">3 个</option><option value="4">4 个</option><option value="5" selected>5 个</option><option value="6">6 个</option><option value="7">7 个</option><option value="8">8 个</option></select></div><p class="field-hint" id="concurrencyHint">固定使用所选并行数。过高可能触发来源限流，频繁失败时可调低。</p></div>
+      <label class="checkbox-setting"><input id="askWhereToSave" type="checkbox"><span>每次询问保存位置<small>开启后，保存文件前会弹出位置选择框。</small></span></label>
+      <p class="settings-error" id="settingsError" role="alert" hidden></p>
+      <div class="settings-actions"><button type="button" class="btn btn-secondary" id="settingsCancel">取消</button><button type="submit" class="btn btn-primary" id="settingsSave">保存设置</button></div>
+    </form>
   </div>
-
-  <!-- 萌系悬浮 Toast 提示 -->
-  <div class="toast" id="toast"></div>
-
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="popup.js"></script>
 </body>
 </html>

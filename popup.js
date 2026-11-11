@@ -1,325 +1,477 @@
-// 🌸 喵喵视频下载姬 - Popup 界面交互逻辑 (过滤碎片 · 专属完整全片版)
-
+// The popup is only a view: the background owns all video download jobs.
 document.addEventListener("DOMContentLoaded", async () => {
-  const pageTitleEl = document.getElementById("pageTitle");
-  const statusTextEl = document.getElementById("statusText");
-  const mediaListEl = document.getElementById("mediaList");
-  const btnRefresh = document.getElementById("btnRefresh");
-  const toastEl = document.getElementById("toast");
+  const $ = id => document.getElementById(id);
+  const cards = new Map(), jobCards = new Map();
+  const activeStates = new Set(["queued", "parsing", "downloading", "saving"]);
+  const stateLabels = { queued: "等待下载", parsing: "解析清单", downloading: "下载中", saving: "正在保存", complete: "已保存", interrupted: "下载中断", cancelled: "已取消" };
+  let currentTab = null, currentMedia = [], currentJobs = [], currentFrames = [], activeModalData, modalTrigger;
+  let settings = { subfolder: "", askWhereToSave: false, concurrency: 5, concurrencyMode: "auto" };
+  let mediaLoading = false, jobsLoading = false, mediaPending = false, jobsPending = false;
+  let refreshTimer, toastTimer, framesSignature = "", closing = false;
+  let capture = { phase: "checking", playback: {}, chunkCount: 0 }, checkingStartedAt = Date.now();
 
-  // 大图弹窗
-  const imageModal = document.getElementById("imageModal");
-  const modalImg = document.getElementById("modalImg");
-  const modalTimeTag = document.getElementById("modalTimeTag");
-  const modalClose = document.getElementById("modalClose");
-  const btnSaveFrame = document.getElementById("btnSaveFrame");
-
-  let currentTab = null;
-  let activeModalData = null;
-  let refreshTimer = null;
-  let lastRenderHash = "";
-
-  function showToast(message, duration = 2200) {
-    toastEl.textContent = message;
-    toastEl.classList.add("show");
-    setTimeout(() => {
-      toastEl.classList.remove("show");
-    }, duration);
+  function node(tag, className, text) {
+    const element = document.createElement(tag);
+    if (className) element.className = className;
+    if (text !== undefined) element.textContent = text;
+    return element;
   }
-
+  function setText(element, text) { if (element.textContent !== String(text)) element.textContent = text; }
+  function showToast(message) {
+    clearTimeout(toastTimer); setText($("toast"), message); $("toast").classList.add("show");
+    toastTimer = setTimeout(() => $("toast").classList.remove("show"), 3500);
+  }
+  function setStatus(message, state = "ready") { setText($("statusText"), message); $("statusBar").dataset.state = state; }
   function formatSize(bytes) {
-    if (!bytes || bytes <= 0) return "流媒体 / 动态全片";
-    const mb = bytes / (1024 * 1024);
-    if (mb >= 1024) return (mb / 1024).toFixed(2) + " GB";
-    return mb.toFixed(2) + " MB";
+    if (!(bytes > 0)) return "0 B";
+    if (bytes < 1024) return `${Math.round(bytes)} B`;
+    if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+    return bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(2)} GB` : `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   }
-
-  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tabs && tabs.length > 0) {
-    currentTab = tabs[0];
-    pageTitleEl.textContent = currentTab.title || currentTab.url || "正在连接网页...";
-  } else {
-    pageTitleEl.textContent = "无法获取当前网页";
-    statusTextEl.textContent = "未找到活动标签页 (T_T)";
-    return;
+  function safeFilename(name) {
+    return String(name || "视频").replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").replace(/^[. ]+|[. ]+$/g, "").slice(0, 120) || "视频";
   }
-
-  // 加载数据
-  function loadMediaData(silent = false) {
-    if (!currentTab) return;
-
-    if (!silent) {
-      statusTextEl.textContent = "正在捕捉完整视频信号中喵... (✧ω✧)";
+  function mediaUrl(value) {
+    try { const url = new URL(value); return /^https?:$/.test(url.protocol) ? url : null; } catch { return null; }
+  }
+  function sendMessage(message) {
+    return new Promise((resolve, reject) => chrome.runtime.sendMessage(message, response => {
+      const error = chrome.runtime.lastError;
+      if (error) reject(new Error(error.message));
+      else if (!response) reject(new Error("扩展后台未响应"));
+      else if (response.success === false) reject(new Error(response.error || "操作未完成，请重试"));
+      else resolve(response);
+    }));
+  }
+  function showPane(name, focus = false) {
+    for (const pane of ["source", "jobs"]) {
+      const selected = pane === name;
+      $(`${pane}Panel`).hidden = !selected;
+      $(`${pane}Tab`).setAttribute("aria-selected", String(selected));
+      $(`${pane}Tab`).tabIndex = selected ? 0 : -1;
     }
-
-    chrome.runtime.sendMessage(
-      { action: "getMedia", tabId: currentTab.id },
-      (response) => {
-        if (chrome.runtime.lastError || !response) return;
-
-        const media = response.media || [];
-        const frames = response.frames || [];
-        const chunkCount = response.chunkCount || 0;
-        const pageTitle = response.pageTitle || currentTab.title;
-
-        if (pageTitle && pageTitleEl.textContent !== pageTitle) {
-          pageTitleEl.textContent = pageTitle;
-        }
-
-        const currentHash = JSON.stringify({
-          count: media.length,
-          urls: media.map(m => m.url),
-          framesCount: frames.length,
-          chunkCount: chunkCount,
-          lastFrameTime: frames.length > 0 ? frames[frames.length - 1].timeStr : ""
-        });
-
-        if (currentHash === lastRenderHash) return;
-        lastRenderHash = currentHash;
-
-        if (media.length === 0) {
-          renderEmptyState(chunkCount);
-        } else {
-          renderMediaList(media, frames);
-        }
-      }
-    );
+    syncArtMotion();
+    if (focus) $(`${name}Tab`).focus();
   }
-
-  // 渲染正在捕捉中
-  function renderEmptyState(chunkCount) {
-    statusTextEl.textContent = "正在捕捉完整视频中喵... (✧ω✧)";
-    
-    let chunkHint = "";
-    if (chunkCount > 0) {
-      chunkHint = `<div style="margin-top: 6px; color: #FF6B8B; font-weight: 600;">已自动帮您过滤了 ${chunkCount} 个碎片切片，正在锁定完整总流！</div>`;
-    }
-
-    mediaListEl.innerHTML = `
-      <div class="empty-box">
-        <div class="empty-radar-wrap">
-          <div class="empty-kaomoji">(✧ω✧)</div>
-          <div class="empty-ripple"></div>
-        </div>
-        <div class="empty-title">🌸 正在全力锁定完整视频总流...</div>
-        <div class="empty-desc">
-          喵喵已开启<b>【智能碎片过滤系统】</b>，会自动屏蔽几MB的短切片碎片，只为您捕获整部完整视频喵！(o^▽^o)<br>
-          ${chunkHint}
-          <div style="margin-top: 6px;">💡 <b>提示：</b>请在网页中点击<b>播放视频</b>，视频一旦缓冲即可抓取完整流！</div>
-        </div>
-      </div>
-    `;
+  function syncArtMotion() {
+    $("appContent").dataset.artPaused = String(document.hidden || $("sourcePanel").hidden || !$("settingsModal").hidden || !$("imageModal").hidden);
   }
-
-  // 渲染完整视频列表
-  function renderMediaList(mediaList, globalFrames) {
-    statusTextEl.textContent = `✨ 成功锁定 ${mediaList.length} 个完整视频总流！(o^▽^o)`;
-    mediaListEl.innerHTML = "";
-
-    mediaList.forEach((item, index) => {
-      const card = document.createElement("div");
-      card.className = "media-card";
-
-      const isM3U8 = item.isM3U8;
-      const tagClass = isM3U8 ? "badge-m3u8" : "badge-mp4";
-      const tagText = isM3U8 ? "🌸 完整全片流媒体 (m3u8)" : `🎀 完整视频文件 (.${item.ext.toUpperCase()})`;
-
-      const frames = (item.frames && item.frames.length > 0) ? item.frames : globalFrames;
-
-      // 切片状态提示
-      let streamHint = "";
-      if (isM3U8) {
-        streamHint = `
-          <div class="full-stream-banner">
-            <span>✨ <b>整部完整视频</b> · 已自动过滤短小碎片</span>
-            ${item.chunkCount ? `<span class="chunk-badge">📶 持续缓冲中 (${item.chunkCount} 切片)</span>` : ""}
-          </div>
-        `;
-      }
-
-      // 多帧截屏
-      let framesHtml = "";
-      if (frames && frames.length > 0) {
-        const frameItems = frames.map((f, fIdx) => `
-          <div class="frame-card" data-idx="${fIdx}" title="点击放大/保存第 ${f.timeStr} 帧截屏">
-            <img class="frame-img" src="${f.dataUrl}" alt="帧 ${f.timeStr}">
-            <span class="frame-time-tag">⏱️ ${f.timeStr}</span>
-          </div>
-        `).join("");
-
-        framesHtml = `
-          <div class="frames-section">
-            <div class="frames-header">
-              <span>🎬 精彩多帧截屏预览 (${frames.length} 帧)</span>
-              <button class="btn-snap" id="btnSnap_${index}">📸 抓拍当前帧</button>
-            </div>
-            <div class="frames-scroll">${frameItems}</div>
-          </div>
-        `;
-      } else {
-        framesHtml = `
-          <div class="frames-section">
-            <div class="frames-header">
-              <span>🎬 精彩多帧截屏预览</span>
-              <button class="btn-snap" id="btnSnap_${index}">📸 抓拍当前画面</button>
-            </div>
-            <div class="frames-empty-hint">📸 正在抓拍带时间参数的截屏中 (播放时会自动采样喵~)</div>
-          </div>
-        `;
-      }
-
-      card.innerHTML = `
-        <div class="card-header">
-          <span class="badge-tag ${tagClass}">${tagText}</span>
-          <span class="media-size">${isM3U8 ? "完整片源" : formatSize(item.size)}</span>
-        </div>
-        ${streamHint}
-        <div class="card-body">
-          <div class="file-name" title="${item.suggestedFilename}">${item.suggestedFilename}</div>
-          <div class="url-preview" title="${item.url}">${item.url}</div>
-        </div>
-        ${framesHtml}
-        <div class="card-actions">
-          <button class="btn btn-primary btn-download" data-index="${index}">
-            <span>🌸</span> ${isM3U8 ? "一键合并下载整部视频" : "一键下载完整视频"}
-          </button>
-          <button class="btn btn-secondary btn-copy" data-index="${index}">
-            <span>📋</span> 复制整片直链
-          </button>
-        </div>
-      `;
-
-      // 绑定多帧点击预览
-      const frameCards = card.querySelectorAll(".frame-card");
-      frameCards.forEach((fc) => {
-        fc.addEventListener("click", () => {
-          const fIdx = parseInt(fc.getAttribute("data-idx"), 10);
-          const fData = frames[fIdx];
-          if (fData) openImageModal(fData, item.suggestedFilename);
-        });
-      });
-
-      // 绑定即时抓拍
-      const btnSnap = card.querySelector(`#btnSnap_${index}`);
-      if (btnSnap) {
-        btnSnap.addEventListener("click", () => triggerInstantSnap(btnSnap));
-      }
-
-      // 绑定下载
-      const btnDownload = card.querySelector(".btn-download");
-      btnDownload.addEventListener("click", () => handleDownload(item));
-
-      // 绑定复制链接
-      const btnCopy = card.querySelector(".btn-copy");
-      btnCopy.addEventListener("click", () => handleCopy(item.url));
-
-      mediaListEl.appendChild(card);
-    });
-  }
-
-  // 抓拍当前帧
-  function triggerInstantSnap(btn) {
-    if (!currentTab) return;
-    btn.textContent = "📸 抓拍中...";
-    chrome.tabs.sendMessage(currentTab.id, { action: "captureCurrentFrameNow" }, (res) => {
-      btn.textContent = "📸 抓拍当前帧";
-      if (res && res.success) {
-        showToast(`✨ 成功截取 [${res.frame.timeStr}] 画面喵！`);
-        loadMediaData(true);
-      } else {
-        showToast("未能截到画面，请确保网页视频正在播放哦喵~");
+  document.addEventListener("visibilitychange", syncArtMotion);
+  syncArtMotion();
+  for (const name of ["source", "jobs"]) {
+    $(`${name}Tab`).addEventListener("click", () => showPane(name));
+    $(`${name}Tab`).addEventListener("keydown", event => {
+      if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+        event.preventDefault(); showPane(event.key === "Home" ? "source" : event.key === "End" ? "jobs" : name === "jobs" ? "source" : "jobs", true);
       }
     });
   }
-
-  // 大图预览
-  function openImageModal(frameData, videoTitle) {
-    activeModalData = { ...frameData, videoTitle };
-    modalImg.src = frameData.dataUrl;
-    modalTimeTag.textContent = `⏱️ 视频时间参数: ${frameData.timeStr}`;
-    imageModal.classList.add("show");
-  }
-
-  modalClose.addEventListener("click", () => imageModal.classList.remove("show"));
-  imageModal.addEventListener("click", (e) => {
-    if (e.target === imageModal) imageModal.classList.remove("show");
-  });
-
-  btnSaveFrame.addEventListener("click", () => {
-    if (!activeModalData) return;
-    const cleanTitle = (activeModalData.videoTitle || "视频截屏").replace(/\.[^/.]+$/, "");
-    const filename = `${cleanTitle}_帧_${activeModalData.timeStr.replace(/:/g, "-")}.jpg`;
-    
-    chrome.downloads.download({
-      url: activeModalData.dataUrl,
-      filename: filename,
-      saveAs: true
-    }, () => {
-      showToast("💾 截屏图片已保存喵！");
-      imageModal.classList.remove("show");
-    });
-  });
-
-  // 处理下载
-  function handleDownload(item) {
-    if (item.isM3U8) {
-      // 打开整片切片合并下载姬
-      const downloaderUrl = chrome.runtime.getURL("downloader.html") + 
-        `?url=${encodeURIComponent(item.url)}&title=${encodeURIComponent(item.suggestedFilename.replace(/\.m3u8$/i, ""))}`;
-      chrome.tabs.create({ url: downloaderUrl });
-      showToast("🌸 已打开整片切片合并下载姬！(｡♥‿♥｡)");
+  function createCaptureArt(phase) {
+    const art = node("div", `neko-art neko-art-${phase}`); art.setAttribute("aria-hidden", "true");
+    art.append(node("span", "neko-halo"), node("span", "neko-spark neko-spark-one"), node("span", "neko-spark neko-spark-two"), node("span", "neko-shadow"));
+    if (phase === "sniffing") art.append(node("span", "neko-orbit-ring"));
+    const cat = node("div", "neko-cat"), face = node("div", "neko-face"), eyes = node("div", "neko-gaze");
+    eyes.append(node("span", "neko-eye"), node("span", "neko-eye"));
+    face.append(node("span", "neko-blush neko-blush-left"), node("span", "neko-blush neko-blush-right"), eyes, node("span", "neko-nose"), node("span", "neko-mouth"));
+    cat.append(node("span", "neko-ear neko-ear-left"), node("span", "neko-ear neko-ear-right"), face);
+    art.append(cat, node("span", "neko-ledge"), node("span", "neko-paw neko-paw-left"), node("span", "neko-paw neko-paw-right"));
+    if (phase === "waiting") {
+      const bubble = node("span", "neko-play-bubble"); bubble.append(node("span", "neko-play-icon")); art.append(bubble);
     } else {
-      chrome.runtime.sendMessage(
-        { action: "download", url: item.url, filename: item.suggestedFilename },
-        (res) => {
-          if (res && res.success) {
-            showToast("✨ 开始下载完整视频啦！可在浏览器下载中查看~");
-          } else {
-            showToast("下载出错：" + (res?.error || "未知错误"));
-          }
-        }
-      );
+      art.append(node("span", "neko-orbit-dot neko-orbit-trail-two"), node("span", "neko-orbit-dot neko-orbit-trail-one"), node("span", "neko-orbit-dot neko-orbit-light"));
+    }
+    return art;
+  }
+  function emptyState(container, title, description, hint = "", phase = "") {
+    const signature = JSON.stringify([title, description, hint, phase]);
+    const existing = container.querySelector(".empty-box");
+    if (existing?.dataset.signature === signature) return;
+    // Keep the illustration's timeline when only a discovery hint changes.
+    if (existing && existing.dataset.phase === phase) {
+      existing.dataset.signature = signature; setText(existing.querySelector(".empty-title"), title); setText(existing.querySelector(".empty-desc"), description);
+      const hintNode = existing.querySelector(".empty-hint");
+      if (hint) { if (hintNode) setText(hintNode, hint); else existing.append(node("p", "empty-hint", hint)); }
+      else hintNode?.remove();
+      return;
+    }
+    const empty = node("div", "empty-box"); empty.dataset.signature = signature; empty.dataset.phase = phase;
+    const symbol = { checking: "○", unconfirmed: "○", waiting: "▶", sniffing: "⌕", "no-source": "…", unavailable: "—" }[phase] || "(=^･ω･^=)";
+    const icon = node("p", "empty-cat", symbol); icon.setAttribute("aria-hidden", "true");
+    empty.append(["waiting", "sniffing"].includes(phase) ? createCaptureArt(phase) : icon, node("p", "empty-title", title), node("p", "empty-desc", description));
+    if (hint) empty.append(node("p", "empty-hint", hint));
+    container.replaceChildren(empty);
+  }
+  function updateCapture(response) {
+    const playback = response.playback || {};
+    let phase = currentMedia.length ? "found" : response.capturePhase;
+    if (!["checking", "waiting", "sniffing", "found", "no-source", "no-video"].includes(phase) || phase === "found" && !currentMedia.length) phase = "checking";
+    // A source request can be a preload. Only player observations establish playback.
+    if (["sniffing", "no-source"].includes(phase) && !playback.observed && !playback.playing) phase = "checking";
+    if (phase === "checking" && capture.phase !== "checking") checkingStartedAt = Date.now();
+    capture = { phase, playback, chunkCount: response.chunkCount || 0 };
+  }
+  function captureFeedback() {
+    const { phase, playback } = capture;
+    if (phase === "found") {
+      const playbackLabel = playback.playing ? "正在播放" : playback.observed ? "已播放" : playback.hasVideo && !playback.uncertain ? "尚未播放" : "播放状态未确认";
+      return { state: "ready", status: `已发现 ${currentMedia.length} 个来源 · ${playbackLabel}` };
+    }
+    if (phase === "waiting") return { state: "waiting", status: "等待播放 · 请先在网页点击播放", title: "点击播放，开始识别", description: "已找到播放器，尚未观察到播放。请先在网页点击播放按钮。", hint: "出现视频来源后，即可在这里下载。" };
+    if (phase === "sniffing") return { state: "sniffing", status: "已播放 · 正在识别视频来源…", title: "正在识别视频来源", description: capture.chunkCount ? "已检测到分段请求，正在等待可下载的播放清单。" : "已确认视频开始播放，正在查看播放器发出的视频请求。", hint: "若暂未找到来源，会在约 10 秒后显示结果。" };
+    if (phase === "no-source") return { state: "no-source", status: "已播放 · 暂未识别到可下载来源", title: "这次还没有找到来源", description: "已观察到播放，但暂未找到可下载的视频地址。", hint: "可切换播放线路，或刷新网页后重新播放。" };
+    if (phase === "no-video") return { state: "no-video", status: "暂未检测到播放器", title: "当前网页还没有播放器", description: "请打开视频播放页面，或等待网页加载播放器。", hint: "下载任务仍可在右侧页签查看。" };
+    if (phase === "unavailable") return { state: "unavailable", status: "当前页面不支持视频识别", title: "切换到视频网页", description: "浏览器内部页面无法识别视频。打开一个视频网页后，再打开扩展。", hint: "已有下载会继续运行。" };
+    if (phase === "error") return { state: "error", status: "读取失败，点击右侧刷新重试", title: "暂时无法连接扩展", description: "请刷新视频网页，然后重新打开扩展。", hint: capture.error || "" };
+    if (Date.now() - checkingStartedAt >= 5000) return { state: "unconfirmed", status: "播放器状态尚未确认", title: "还未确认播放器状态", description: "可以先播放视频，或刷新网页后重新打开扩展。", hint: "嵌入式播放器可能无法立即确认播放状态。" };
+    return { state: "checking", status: "正在确认播放器状态…", title: "正在查看当前网页", description: "正在确认播放器和可用的视频来源。", hint: "" };
+  }
+  function renderCapture() {
+    const feedback = captureFeedback(); setStatus(feedback.status, feedback.state); renderMedia();
+  }
+
+  async function startDownload(item, button) {
+    if (!mediaUrl(item.url)) return showToast("该来源不是可下载的 HTTP 视频地址");
+    button.disabled = true;
+    try {
+      const filename = String(item.suggestedFilename || item.filename || "视频").split(/[\\/]/).pop();
+      const title = item.title || filename.replace(/\.(m3u8|mp4|ts|webm|mov|mkv|m4a|mp3)$/i, "");
+      const response = await sendMessage({ action: "startDownload", url: item.url, title, filename: safeFilename(filename), isM3U8: Boolean(item.isM3U8 || /\.m3u8(?:[?#]|$)/i.test(item.url) || item.totalSegments > 0), tabId: item.tabId ?? currentTab?.id });
+      if (response.job) currentJobs = [response.job, ...currentJobs.filter(job => job.id !== response.job.id)];
+      renderJobs(); showPane("jobs");
+      showToast("任务已开始，关闭弹窗也会继续下载");
+      await loadJobs();
+    } catch (error) { showToast(`下载未开始：${error.message}`); }
+    finally { button.disabled = false; syncSourceJobs(); }
+  }
+  async function copyUrl(url) {
+    try { await navigator.clipboard.writeText(url); showToast("视频来源链接已复制"); }
+    catch { showToast("复制失败，请重新点击复制链接"); }
+  }
+  function createCard(item) {
+    const card = node("article", "media-card"), header = node("div", "card-header"), identity = node("div");
+    const badge = node("span", "badge-tag"), number = node("span", "source-number"), size = node("span", "media-size");
+    identity.append(badge, number); header.append(identity, size);
+    const title = node("h2", "file-name"), host = node("div", "source-host"), path = node("div", "url-preview");
+    const actions = node("div", "card-actions"), download = node("button", "btn btn-primary"), copy = node("button", "btn btn-secondary", "复制链接"), state = node("div", "card-state");
+    actions.append(download, copy); card.append(header, title, host, path, actions, state);
+    const entry = { card, badge, number, size, title, host, path, download, state, item };
+    download.addEventListener("click", () => startDownload(entry.item, download));
+    copy.addEventListener("click", () => copyUrl(entry.item.url));
+    return entry;
+  }
+  function syncSourceJobs() {
+    for (const entry of cards.values()) {
+      const job = currentJobs.find(job => job.url === entry.item.url && activeStates.has(job.state));
+      entry.download.disabled = Boolean(job);
+      setText(entry.download, job ? stateLabels[job.state] : "↓ 下载视频");
+      setText(entry.state, job ? "任务已在后台运行，可切换到下载任务查看。" : "");
     }
   }
-
-  // 复制直链
-  function handleCopy(url) {
-    navigator.clipboard.writeText(url).then(() => {
-      showToast("📋 完整全片直链已复制！粘贴到 PotPlayer 即可完整观看喵~");
-    }).catch(() => {
-      const input = document.createElement("input");
-      input.value = url;
-      document.body.appendChild(input);
-      input.select();
-      document.execCommand("copy");
-      document.body.removeChild(input);
-      showToast("📋 复制成功喵！可以直接丢进 PotPlayer 播放~");
+  function renderMedia() {
+    const query = $("mediaSearch").value.trim().toLocaleLowerCase();
+    const filtered = currentMedia.filter(item => `${item.suggestedFilename || ""} ${item.name || ""} ${item.url}`.toLocaleLowerCase().includes(query));
+    $("listToolbar").hidden = !currentMedia.length;
+    setText($("sourceTabCount"), currentMedia.length);
+    setText($("sourceCount"), query ? `${filtered.length} / ${currentMedia.length}` : `${currentMedia.length} 个来源`);
+    const live = new Set(currentMedia.map(item => item.url));
+    for (const [url, entry] of cards) if (!live.has(url)) { entry.card.remove(); cards.delete(url); }
+    if (!filtered.length) {
+      if (currentMedia.length) emptyState($("mediaList"), "没有匹配的来源", "试试文件名、集数，或视频来源域名。");
+      else {
+        const feedback = captureFeedback(); emptyState($("mediaList"), feedback.title, feedback.description, feedback.hint, feedback.state);
+      }
+      return;
+    }
+    $("mediaList").querySelector(".empty-box")?.remove();
+    const visible = new Set(filtered.map(item => item.url));
+    for (const [url, entry] of cards) entry.card.hidden = !visible.has(url);
+    filtered.forEach((item, index) => {
+      const entry = cards.get(item.url) || createCard(item);
+      cards.set(item.url, entry); entry.item = item; entry.card.hidden = false;
+      const url = mediaUrl(item.url);
+      entry.badge.className = `badge-tag ${item.isM3U8 ? "badge-m3u8" : "badge-mp4"}`;
+      setText(entry.badge, item.isM3U8 ? "HLS · M3U8" : String(item.ext || "VIDEO").toUpperCase());
+      setText(entry.number, item.active ? capture.playback.playing ? "当前播放" : "当前线路" : `来源 ${currentMedia.indexOf(item) + 1}`);
+      entry.card.dataset.active = String(Boolean(item.active));
+      setText(entry.size, item.isM3U8 ? "自动合并" : item.size > 0 ? formatSize(item.size) : "大小待确认");
+      setText(entry.title, item.suggestedFilename || "未命名视频"); entry.title.title = entry.title.textContent;
+      setText(entry.host, `${url?.hostname || "未知来源"}${item.name ? ` · ${item.name}` : ""}`);
+      setText(entry.path, url ? `${url.pathname}${url.search}` : item.url); entry.path.title = item.url;
+      const previous = index ? cards.get(filtered[index - 1].url).card : null;
+      if (!entry.card.isConnected || entry.card.previousElementSibling !== previous) {
+        if (previous) previous.after(entry.card); else $("mediaList").prepend(entry.card);
+      }
     });
+    syncSourceJobs();
+  }
+  function renderFrames(frames) {
+    currentFrames = frames.filter(frame => /^data:image\/(jpeg|png|webp);base64,/i.test(frame.dataUrl || "")).slice(-10);
+    $("framesSection").hidden = !currentMedia.length;
+    const signature = JSON.stringify(currentFrames.map(frame => [frame.timeStr, frame.timestamp, frame.dataUrl]));
+    if (signature === framesSignature) return;
+    framesSignature = signature;
+    setText($("framesCount"), currentFrames.length ? `${currentFrames.length} 帧` : "");
+    $("framesHint").hidden = !!currentFrames.length;
+    $("framesList").replaceChildren(...currentFrames.map(frame => {
+      const button = node("button", "frame-card"); button.title = `预览 ${frame.timeStr || "当前"} 的画面`;
+      const img = node("img", "frame-img"); img.src = frame.dataUrl; img.alt = `视频画面 ${frame.timeStr || ""}`;
+      button.append(img, node("span", "frame-time-tag", frame.timeStr || "当前"));
+      button.addEventListener("click", () => {
+        activeModalData = frame; $("modalImg").src = frame.dataUrl;
+        setText($("modalTimeTag"), `画面预览 · ${frame.timeStr || "当前"}`);
+        openModal("imageModal", button, "modalClose");
+      });
+      return button;
+    }));
   }
 
-  // 刷新
-  btnRefresh.addEventListener("click", () => {
-    btnRefresh.style.transform = "rotate(360deg)";
-    setTimeout(() => { btnRefresh.style.transform = ""; }, 400);
-    lastRenderHash = "";
-    loadMediaData();
-    showToast("🔄 已极速重新扫描信号喵~");
-  });
-
-  // 广播监听
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.action === "mediaListUpdated" || msg.action === "framesUpdated") {
-      if (currentTab && msg.tabId === currentTab.id) {
-        loadMediaData(true);
+  function createJobCard(job) {
+    const card = node("article", "job-card"), header = node("div", "job-header"), title = node("h2", "job-title"), label = node("span", "job-state");
+    header.append(title, label);
+    const progress = node("div", "job-progress"), fill = node("div", "job-progress-fill");
+    progress.setAttribute("role", "progressbar"); progress.setAttribute("aria-label", "视频下载进度"); progress.setAttribute("aria-valuemin", "0"); progress.setAttribute("aria-valuemax", "100"); progress.append(fill);
+    const details = node("div", "job-details"), metrics = node("span", "job-metrics"), percent = node("span", "job-percent"); details.append(metrics, percent);
+    const telemetry = node("div", "job-telemetry"), speed = node("span", "job-speed"), concurrency = node("span", "job-concurrency");
+    speed.title = "当前所有网络分片的合计下载速度，缓存读取不计入"; telemetry.append(speed, concurrency);
+    const retryStatus = node("p", "job-retry-status"), cacheStatus = node("p", "job-cache-status");
+    retryStatus.setAttribute("role", "status"); retryStatus.setAttribute("aria-live", "polite");
+    const error = node("p", "job-error"), actions = node("div", "job-actions"), cancel = node("button", "job-button", "取消"), retry = node("button", "job-button", "重新下载"), reveal = node("button", "job-button", "在文件夹中显示"), discard = node("button", "job-button job-discard", "清除缓存");
+    actions.append(cancel, retry, reveal, discard); card.append(header, progress, details, telemetry, retryStatus, error, cacheStatus, actions);
+    const entry = { card, title, label, progress, fill, metrics, percent, telemetry, speed, concurrency, retryStatus, cacheStatus, error, cancel, retry, reveal, discard, job, pendingAction: null };
+    cancel.addEventListener("click", () => jobAction("cancelJob", entry, cancel));
+    reveal.addEventListener("click", () => jobAction("showJob", entry, reveal));
+    retry.addEventListener("click", () => jobAction(entry.job.state === "interrupted" && entry.job.resumable ? "retryJob" : "freshStart", entry, retry));
+    discard.addEventListener("click", () => jobAction("discardJob", entry, discard));
+    return entry;
+  }
+  function setJobControls(entry) {
+    for (const button of [entry.cancel, entry.retry, entry.reveal, entry.discard]) button.disabled = Boolean(entry.pendingAction);
+  }
+  async function jobAction(action, entry, button) {
+    if (entry.pendingAction) return;
+    entry.pendingAction = action; setJobControls(entry);
+    try {
+      if (action === "freshStart") await startDownload(entry.job, button);
+      else {
+        const response = await sendMessage({ action, jobId: entry.job.id });
+        if (response.job) currentJobs = currentJobs.map(job => job.id === response.job.id ? response.job : job);
+        if (action === "retryJob") showToast("已继续下载，将复用本次浏览器会话中保留的分片");
+        if (action === "discardJob") showToast("缓存已清除，下次下载将重新获取分片");
+        if (action !== "showJob") await loadJobs();
       }
     }
-  });
+    catch (error) { showToast(error.message); }
+    finally {
+      entry.pendingAction = null; setJobControls(entry);
+      // Polling never replaces controls. If an action removes its own control,
+      // keep keyboard navigation on a meaningful action for this task.
+      if (document.activeElement === button && (button.hidden || !button.isConnected)) {
+        const next = [entry.cancel, entry.retry, entry.reveal, entry.discard].find(control => !control.hidden && control.isConnected);
+        (next || $("jobsTab")).focus();
+      }
+    }
+  }
+  function renderJobs() {
+    const jobs = currentJobs.slice(0, 20), active = currentJobs.filter(job => activeStates.has(job.state)).length;
+    setText($("jobsTabCount"), active || currentJobs.length);
+    $("jobsTabCount").dataset.active = String(active > 0);
+    const live = new Set(jobs.map(job => job.id));
+    for (const [id, entry] of jobCards) if (!live.has(id)) { entry.card.remove(); jobCards.delete(id); }
+    if (!jobs.length) {
+      emptyState($("jobList"), "喜欢的视频，正在等你", "在“视频来源”里点击下载。这里会保留近期任务，随时查看进度。");
+      syncSourceJobs(); return;
+    }
+    $("jobList").querySelector(".empty-box")?.remove();
+    jobs.forEach((job, index) => {
+      const entry = jobCards.get(job.id) || createJobCard(job); jobCards.set(job.id, entry); entry.job = job;
+      entry.card.dataset.state = job.state;
+      setText(entry.title, String(job.filename || job.title || "视频").split(/[\\/]/).pop()); entry.title.title = job.filename || job.title || "视频";
+      setText(entry.label, stateLabels[job.state] || "处理中");
+      const hasTotal = job.totalSegments > 0 || job.totalBytes > 0;
+      const ratio = job.totalSegments > 0 ? (job.completedSegments || 0) / job.totalSegments : job.totalBytes > 0 ? (job.bytesReceived || 0) / job.totalBytes : 0;
+      // Downloaded bytes/segments reaching 100% still means "saving", never "saved".
+      const value = job.state === "complete" ? 100 : Math.max(0, Math.min(100, Math.floor(ratio * 100)));
+      entry.fill.style.width = `${value}%`;
+      entry.progress.dataset.indeterminate = String(!hasTotal && activeStates.has(job.state));
+      if (hasTotal || job.state === "complete") entry.progress.setAttribute("aria-valuenow", value); else entry.progress.removeAttribute("aria-valuenow");
+      entry.progress.setAttribute("aria-valuetext", `${stateLabels[job.state] || "处理中"}${hasTotal ? ` ${value}%` : ""}`);
+      const segments = job.totalSegments > 0 ? `${job.completedSegments || 0} / ${job.totalSegments} 片 · ` : "";
+      setText(entry.metrics, `${segments}${formatSize(job.bytesReceived || 0)}${!job.totalSegments && job.totalBytes > 0 ? ` / ${formatSize(job.totalBytes)}` : ""}`);
+      setText(entry.percent, hasTotal || job.state === "complete" ? `${value}%` : "");
+      const hasSpeed = Number.isFinite(job.bytesPerSecond) && job.bytesPerSecond >= 0;
+      const hasConcurrency = Number.isInteger(job.activeConcurrency) && job.activeConcurrency >= 1 && job.activeConcurrency <= 8;
+      entry.telemetry.hidden = job.state !== "downloading" || (!hasSpeed && !hasConcurrency);
+      setText(entry.speed, hasSpeed ? `合计 ${formatSize(job.bytesPerSecond)}/s` : "正在测量速度…");
+      entry.concurrency.hidden = !hasConcurrency;
+      setText(entry.concurrency, `${job.concurrencyMode === "manual" ? "手动" : "自动"} · ${hasConcurrency ? job.activeConcurrency : "—"} 路`);
+      const concurrencyReasons = {
+        initializing: "正在测量当前总下载速度", probing: "正在比较增加并行数后的总速度", gain: "增加并行数后总速度有提升",
+        "no-gain": "增加并行数没有提速，已回退", errors: "遇到来源错误，已降低并行数", decline: "总速度下降，已降低并行数",
+        cooldown: "暂时保持当前并行数，等待速度稳定", steady: "保持当前有效的并行数", insufficient: "网络数据不足，暂不调整并行数", manual: "按设置固定并行数"
+      };
+      entry.concurrency.title = concurrencyReasons[job.concurrencyReason] || (job.concurrencyMode === "manual" ? "按设置固定并行数" : "根据实际总下载速度调整并行数");
+      const retrying = activeStates.has(job.state) && (job.retryAttempt > 0 || Boolean(job.retryMessage));
+      entry.retryStatus.hidden = !retrying;
+      setText(entry.retryStatus, retrying ? String(job.retryMessage || `正在进行第 ${job.retryAttempt} 次重试…`) : "");
+      const issue = [job.error, job.cleanupError].filter(Boolean).join(" · ");
+      entry.error.hidden = !issue; setText(entry.error, issue);
+      const canResume = job.state === "interrupted" && job.resumable === true;
+      const cached = Number.isFinite(job.cachedSegments) ? Math.max(0, Math.floor(job.cachedSegments)) : 0;
+      entry.cacheStatus.hidden = !canResume;
+      setText(entry.cacheStatus, canResume ? `已保留 ${cached} 个分片，可继续下载。缓存仅在本次浏览器会话内可用。` : "");
+      entry.cancel.hidden = !activeStates.has(job.state);
+      entry.retry.hidden = !["interrupted", "cancelled"].includes(job.state);
+      setText(entry.retry, canResume ? "继续下载" : "重新下载");
+      entry.reveal.hidden = job.state !== "complete";
+      entry.discard.hidden = !canResume;
+      setJobControls(entry);
+      const previous = index ? jobCards.get(jobs[index - 1].id).card : null;
+      if (!entry.card.isConnected || entry.card.previousElementSibling !== previous) {
+        if (previous) previous.after(entry.card); else $("jobList").prepend(entry.card);
+      }
+    });
+    syncSourceJobs();
+  }
+  async function loadJobs() {
+    if (closing) return;
+    if (jobsLoading) { jobsPending = true; return; }
+    jobsLoading = true;
+    try {
+      const response = await sendMessage({ action: "getJobs" });
+      currentJobs = Array.isArray(response.jobs) ? response.jobs : [];
+      $("jobsStatus").hidden = true; renderJobs();
+    } catch (error) {
+      $("jobsStatus").hidden = false; setText($("jobsStatus"), `暂时无法读取任务：${error.message}`);
+    } finally {
+      jobsLoading = false;
+      if (jobsPending && !closing) { jobsPending = false; queueMicrotask(loadJobs); }
+    }
+  }
+  async function loadMediaData() {
+    if (!currentTab || !mediaUrl(currentTab.url) || closing) return;
+    if (mediaLoading) { mediaPending = true; return; }
+    mediaLoading = true;
+    try {
+      const response = await sendMessage({ action: "getMedia", tabId: currentTab.id });
+      currentMedia = (response.media || []).filter(item => mediaUrl(item.url));
+      const title = response.pageTitle && response.pageTitle !== "当前网页" ? response.pageTitle : currentTab.title || currentTab.url || "当前网页";
+      setText($("pageTitle"), title); $("pageTitle").title = title;
+      updateCapture(response); renderCapture(); renderFrames(response.frames || []);
+    } catch (error) {
+      capture = { phase: "error", playback: {}, error: error.message }; renderCapture();
+    } finally {
+      mediaLoading = false;
+      if (mediaPending && !closing) { mediaPending = false; queueMicrotask(loadMediaData); }
+    }
+  }
 
-  // 轮询
-  loadMediaData();
-  refreshTimer = setInterval(() => { loadMediaData(true); }, 650);
-
-  window.addEventListener("unload", () => {
-    if (refreshTimer) clearInterval(refreshTimer);
+  function applySettings(value) {
+    const concurrency = Number(value?.concurrency);
+    settings = { subfolder: String(value?.subfolder || ""), askWhereToSave: Boolean(value?.askWhereToSave), concurrency: Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 8 ? concurrency : 5, concurrencyMode: value?.concurrencyMode === "manual" ? "manual" : "auto" };
+    setText($("saveLocation"), settings.askWhereToSave ? "每次询问保存位置" : settings.subfolder ? `保存至默认目录 / ${settings.subfolder}` : "保存至 Chrome 默认下载文件夹");
+    $("btnSaveLocation").title = $("saveLocation").textContent;
+  }
+  async function loadSettings() {
+    const response = await sendMessage({ action: "getSettings" }); applySettings(response.settings); return settings;
+  }
+  function folderPreview() { setText($("folderPreview"), `默认下载文件夹${$("subfolder").value.trim() ? ` / ${$("subfolder").value.trim().replace(/\\/g, "/")}` : ""}`); }
+  function fillSettingsForm() {
+    $("subfolder").value = settings.subfolder; $("askWhereToSave").checked = settings.askWhereToSave;
+    $("concurrencyMode").value = settings.concurrencyMode;
+    $("concurrency").value = String(settings.concurrency); folderPreview(); syncConcurrencyMode();
+  }
+  function syncConcurrencyMode() {
+    const manual = $("concurrencyMode").value === "manual";
+    $("concurrencyCountRow").hidden = !manual;
+    setText($("concurrencyModeHint"), manual ? "手动固定并行数，不会自动调整。" : "根据并行数变化后的总下载速度调整：持续提速时增加，提速不明显时停止增加，降速时尝试减少。");
+  }
+  function openModal(id, trigger, focusId) { modalTrigger = trigger; $(id).hidden = false; $("appContent").inert = true; syncArtMotion(); $(focusId).focus(); }
+  function closeModal(id) { $(id).hidden = true; $("appContent").inert = false; syncArtMotion(); if (modalTrigger?.isConnected) modalTrigger.focus(); else $("sourceTab").focus(); }
+  async function openSettings(trigger) {
+    $("settingsError").hidden = true; $("settingsSave").disabled = true; $("subfolder").disabled = true; $("askWhereToSave").disabled = true; $("concurrency").disabled = true; $("concurrencyMode").disabled = true;
+    fillSettingsForm();
+    openModal("settingsModal", trigger, "settingsClose");
+    try {
+      await loadSettings(); fillSettingsForm();
+    } catch (error) { $("settingsError").hidden = false; setText($("settingsError"), error.message); }
+    finally { $("settingsSave").disabled = false; $("subfolder").disabled = false; $("askWhereToSave").disabled = false; $("concurrency").disabled = false; $("concurrencyMode").disabled = false; }
+  }
+  for (const id of ["btnSettings", "btnSaveLocation"]) $(id).addEventListener("click", () => openSettings($(id)));
+  for (const id of ["settingsClose", "settingsCancel"]) $(id).addEventListener("click", () => closeModal("settingsModal"));
+  $("modalClose").addEventListener("click", () => closeModal("imageModal"));
+  for (const id of ["imageModal", "settingsModal"]) $(id).addEventListener("click", event => { if (event.target === $(id)) closeModal(id); });
+  $("subfolder").addEventListener("input", folderPreview);
+  $("concurrencyMode").addEventListener("change", syncConcurrencyMode);
+  $("settingsForm").addEventListener("submit", async event => {
+    event.preventDefault(); $("settingsSave").disabled = true; $("settingsError").hidden = true;
+    try {
+      const concurrency = Number($("concurrency").value);
+      const concurrencyMode = $("concurrencyMode").value;
+      if (!["auto", "manual"].includes(concurrencyMode)) throw new Error("请选择自动调节或手动固定");
+      if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8) throw new Error("并行分片数必须是 1 到 8 之间的整数");
+      const response = await sendMessage({ action: "saveSettings", settings: { subfolder: $("subfolder").value.trim(), askWhereToSave: $("askWhereToSave").checked, concurrency, concurrencyMode } });
+      applySettings(response.settings); closeModal("settingsModal"); showToast("下载设置已保存，将用于之后的下载和截图");
+    } catch (error) { $("settingsError").hidden = false; setText($("settingsError"), error.message); }
+    finally { $("settingsSave").disabled = false; }
   });
+  $("btnChromeSettings").addEventListener("click", async () => {
+    try { await sendMessage({ action: "openDownloadSettings" }); }
+    catch (error) { showToast(error.message); }
+  });
+  document.addEventListener("keydown", event => {
+    const modal = !$("settingsModal").hidden ? $("settingsModal") : !$("imageModal").hidden ? $("imageModal") : null;
+    if (!modal) return;
+    if (event.key === "Escape") { event.preventDefault(); closeModal(modal.id); }
+    if (event.key === "Tab") {
+      const focusable = [...modal.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled])")].filter(element => !element.hidden && !(element.id === "concurrency" && $("concurrencyCountRow").hidden));
+      const first = focusable[0], last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    }
+  });
+  $("btnSaveFrame").addEventListener("click", async () => {
+    if (!activeModalData) return;
+    $("btnSaveFrame").disabled = true;
+    try {
+      const currentSettings = await loadSettings();
+      const basename = `${safeFilename(currentTab?.title)}_${safeFilename(activeModalData.timeStr)}.jpg`;
+      const filename = `${currentSettings.subfolder ? `${currentSettings.subfolder}/` : ""}${basename}`;
+      await chrome.downloads.download({ url: activeModalData.dataUrl, filename, saveAs: currentSettings.askWhereToSave });
+      showToast("截图已交给 Chrome 保存，请查看下载记录"); closeModal("imageModal");
+    } catch (error) { showToast(`截图未保存：${error.message}`); }
+    finally { $("btnSaveFrame").disabled = false; }
+  });
+  $("btnSnap").addEventListener("click", () => {
+    if (!currentTab) return;
+    const button = $("btnSnap"); button.disabled = true; setText(button, "抓拍中…");
+    chrome.tabs.sendMessage(currentTab.id, { action: "captureCurrentFrameNow" }, response => {
+      const error = chrome.runtime.lastError;
+      button.disabled = false; setText(button, "抓拍一帧");
+      if (!error && response?.success) { showToast(`已抓拍 ${response.frame?.timeStr || "当前画面"}`); loadMediaData(); }
+      else showToast("暂时无法抓拍：请播放视频；跨域画面可能不允许截图");
+    });
+  });
+  $("mediaSearch").addEventListener("input", renderMedia);
+  $("btnRefresh").addEventListener("click", () => {
+    if (!currentTab || !mediaUrl(currentTab.url)) return renderCapture();
+    setStatus("正在重新读取…", "checking"); loadMediaData();
+  });
+  const onMessage = message => {
+    if ((message.action === "mediaListUpdated" || message.action === "framesUpdated") && message.tabId === currentTab?.id) loadMediaData();
+    if (message.action === "jobsUpdated") loadJobs();
+  };
+  chrome.runtime.onMessage.addListener(onMessage);
+  // Global jobs/settings stay available even when the selected tab is Chrome's own UI.
+  await Promise.allSettled([loadJobs(), loadSettings()]);
+  if (currentJobs.some(job => activeStates.has(job.state))) showPane("jobs");
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true }); currentTab = tabs[0] || null;
+    setText($("pageTitle"), currentTab?.title || currentTab?.url || "未选择视频网页");
+    if (!currentTab || !mediaUrl(currentTab.url)) {
+      capture = { phase: "unavailable", playback: {} }; renderCapture();
+      if (currentJobs.length) showPane("jobs");
+    } else await loadMediaData();
+  } catch (error) { capture = { phase: "error", playback: {}, error: error.message }; renderCapture(); }
+  refreshTimer = setInterval(() => { if (!document.hidden) { loadMediaData(); loadJobs(); } }, 2000);
+  window.addEventListener("unload", () => { closing = true; clearInterval(refreshTimer); clearTimeout(toastTimer); chrome.runtime.onMessage.removeListener(onMessage); });
 });
