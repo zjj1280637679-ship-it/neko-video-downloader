@@ -71,7 +71,7 @@ async function bootShippedDownloader() {
       location: { search: `?url=${encodeURIComponent(playlistUrl)}&title=Streaming` },
       showSaveFilePicker: async () => ({ createWritable: async () => writer })
     },
-    URL, URLSearchParams, Uint8Array, ArrayBuffer, Blob, AbortController, Map, Set,
+    URL, URLSearchParams, TextDecoder, Uint8Array, ArrayBuffer, Blob, AbortController, Map, Set,
     crypto: require("node:crypto").webcrypto,
     navigator: { clipboard: { async writeText() {} } },
     chrome: { downloads: { download() {} } },
