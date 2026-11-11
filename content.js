@@ -1,171 +1,197 @@
-// 🌸 喵喵视频下载姬 - Content Script
-// 负责 DOM 视频检测、完整主视频流嗅探(如 ikanbot lineData)、实时多帧截屏与时间戳
-
+// 页面视频发现与截图。原图留在播放器所在页面，后台只保存缩略图与来源。
 (function () {
-  const capturedFrames = [];
+  const MAX_FRAMES = 10;
+  const videoStates = new WeakMap();
+  let videoCounter = 0;
 
-  // 时间格式化：秒 -> mm:ss 或 hh:mm:ss
   function formatTime(seconds) {
-    if (isNaN(seconds) || seconds < 0) return "00:00";
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = Math.floor(seconds % 60);
-    if (h > 0) {
-      return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
-    }
-    return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+    const n = Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds)) : 0;
+    const parts = [Math.floor(n / 3600), Math.floor(n / 60) % 60, n % 60];
+    if (!parts[0]) parts.shift();
+    return parts.map((v) => String(v).padStart(2, "0")).join(":");
   }
 
-  // 截取单帧画面
-  function captureVideoFrame(video) {
-    if (!video || video.videoWidth === 0 || video.videoHeight === 0) return null;
-    try {
-      const canvas = document.createElement("canvas");
-      const width = 180;
-      const height = Math.round((video.videoHeight / video.videoWidth) * width) || 101;
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(video, 0, 0, width, height);
-      const dataUrl = canvas.toDataURL("image/jpeg", 0.75);
-
-      const currentTime = video.currentTime || 0;
-      return {
-        timeStr: formatTime(currentTime),
-        seconds: Math.round(currentTime),
-        dataUrl: dataUrl,
-        timestamp: Date.now()
-      };
-    } catch (e) {
-      return null;
-    }
+  function sourceOf(video) {
+    if (video.srcObject) return ""; // srcObject 优先于遗留 src 属性，不能把摄像头画面归给旧文件。
+    return video.currentSrc || video.src || video.querySelector("source[src]")?.src || "";
   }
 
-  function reportFrames() {
-    if (capturedFrames.length === 0) return;
+  function reportFrames(video, state) {
     chrome.runtime.sendMessage({
-      action: "reportVideoFrames",
-      frames: capturedFrames
+      action: "reportVideoFrames", videoId: state.id, sourceUrl: state.source,
+      isPlaying: !video.paused && !video.ended,
+      area: video.videoWidth * video.videoHeight, width: video.videoWidth, height: video.videoHeight,
+      title: document.title || "", pageUrl: location.href, frames: state.frames
     }).catch(() => {});
   }
 
-  function tryCapture(video) {
-    const currentSec = Math.round(video.currentTime || 0);
-    const isDistinct = capturedFrames.every(f => Math.abs(f.seconds - currentSec) >= 2);
-    if (isDistinct && capturedFrames.length < 10) {
-      const frame = captureVideoFrame(video);
-      if (frame) {
-        capturedFrames.push(frame);
-        capturedFrames.sort((a, b) => a.seconds - b.seconds);
-        reportFrames();
-      }
+  function resetSource(video, state, force = false) {
+    const source = sourceOf(video);
+    const sourceObject = video.srcObject || null;
+    if (!force && state.source === source && state.sourceObject === sourceObject) return;
+    state.source = source;
+    state.sourceObject = sourceObject;
+    state.frames = [];
+    state.originals.clear();
+    reportFrames(video, state);
+  }
+
+  function captureVideoFrame(video, state) {
+    if (!video.videoWidth || !video.videoHeight) throw new Error("视频画面尚未就绪，请先播放几秒后重试");
+    const original = document.createElement("canvas");
+    original.width = video.videoWidth;
+    original.height = video.videoHeight;
+    original.getContext("2d").drawImage(video, 0, 0);
+    let fullDataUrl;
+    try {
+      fullDataUrl = original.toDataURL("image/jpeg", 0.92);
+    } catch (err) {
+      if (err.name === "SecurityError") throw new Error("此播放器的跨域视频不允许读取画面，当前无法导出视频帧");
+      throw err;
     }
+    const thumbnail = document.createElement("canvas");
+    thumbnail.width = Math.min(180, original.width);
+    thumbnail.height = Math.max(1, Math.round(original.height * thumbnail.width / original.width));
+    thumbnail.getContext("2d").drawImage(original, 0, 0, thumbnail.width, thumbnail.height);
+    const seconds = Math.max(0, video.currentTime || 0);
+    const frame = {
+      id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      videoId: state.id, sourceUrl: state.source,
+      timeStr: formatTime(seconds), seconds: Math.round(seconds),
+      dataUrl: thumbnail.toDataURL("image/jpeg", 0.75),
+      width: original.width, height: original.height, timestamp: Date.now()
+    };
+    state.originals.set(frame.id, fullDataUrl);
+    return frame;
+  }
+
+  function tryCapture(video, manual = false) {
+    const state = videoStates.get(video);
+    resetSource(video, state);
+    const seconds = Math.round(video.currentTime || 0);
+    if (!manual && (state.frames.length >= MAX_FRAMES || state.frames.some((f) => Math.abs(f.seconds - seconds) < 2))) return null;
+    const frame = captureVideoFrame(video, state);
+    // 同秒抓拍替换旧图；换源清空，防止第二集显示第一集截图。
+    const previous = state.frames.findIndex((f) => f.seconds === frame.seconds);
+    if (previous >= 0) state.originals.delete(state.frames.splice(previous, 1)[0].id);
+    if (state.frames.length >= MAX_FRAMES) state.originals.delete(state.frames.shift().id);
+    state.frames.push(frame);
+    state.frames.sort((a, b) => a.seconds - b.seconds);
+    reportFrames(video, state);
+    return frame;
   }
 
   function attachFrameCapture(video) {
-    if (video.__cute_capture_hooked) return;
-    video.__cute_capture_hooked = true;
-
-    video.addEventListener("timeupdate", () => tryCapture(video));
-    video.addEventListener("playing", () => tryCapture(video));
-    video.addEventListener("seeked", () => tryCapture(video));
-    video.addEventListener("canplay", () => tryCapture(video));
-    tryCapture(video);
+    if (videoStates.has(video)) return;
+    const state = { id: `video-${++videoCounter}`, source: sourceOf(video), sourceObject: video.srcObject || null,
+      frames: [], originals: new Map() };
+    videoStates.set(video, state);
+    const capture = () => {
+      try { tryCapture(video); } catch (_) { /* 手动抓拍会返回可读错误；自动采样不打断播放。 */ }
+    };
+    for (const name of ["timeupdate", "seeked", "loadeddata"]) video.addEventListener(name, capture);
+    for (const name of ["playing", "pause", "ended", "resize"]) video.addEventListener(name, () => {
+      resetSource(video, state);
+      reportFrames(video, state); // 播放状态不能依赖截图缓存尚有空位或像素可读。
+      if (name === "playing") capture();
+    });
+    video.addEventListener("emptied", () => resetSource(video, state, true));
+    video.addEventListener("loadedmetadata", () => {
+      resetSource(video, state); reportFrames(video, state); reportVideoSource(video);
+    });
+    reportFrames(video, state); // 没有成功截图时也登记 iframe，供手动抓拍精确定位。
+    capture();
   }
 
-  // 核心突破：扫描页面 DOM 里的完整播放流地址 (例如爱看机器人 ikanbot 的 lineData udata)
+  const reportedStreams = new Set();
+  function reportStream(url, title, name = "", knownStream = false, directVideo = false, mime = "") {
+    if (!/^https?:\/\//i.test(url)) return;
+    const key = `${url}\n${title}\n${name}\n${directVideo}\n${mime}\n${knownStream}`;
+    if (reportedStreams.has(key)) return;
+    reportedStreams.add(key);
+    const isM3U8 = /\.m3u8(?:$|[?#])/i.test(url) || (knownStream && !/\.(mp4|webm|flv)(?:$|[?#])/i.test(url));
+    chrome.runtime.sendMessage({
+      action: isM3U8 ? "reportMasterStream" : "reportDOMVideo", url, title, name,
+      directVideo, mime, streamHint: knownStream
+    }).catch(() => { reportedStreams.delete(key); });
+  }
+
+  function reportVideoSource(video) {
+    const url = sourceOf(video);
+    const source = [...(video.querySelectorAll?.("source[src]") || [])].find((el) => el.src === url);
+    const mime = source?.type || video.getAttribute?.("type") || "";
+    // <video> 实际使用的地址是完整媒体证据；不能因为 .ts 或目录名而预先丢掉。
+    reportStream(url, document.title || "", "", false, true, mime);
+  }
+
   function scanMasterStreams() {
     const title = document.title || "";
-
-    // 针对 ikanbot 等流媒体站点的线路属性
-    const lineElements = document.querySelectorAll("div[name='lineData'], [udata], [data-url]");
-    lineElements.forEach((el) => {
-      const streamUrl = el.getAttribute("udata") || el.getAttribute("data-url");
-      if (streamUrl && (streamUrl.includes(".m3u8") || streamUrl.startsWith("http"))) {
-        const lineName = el.textContent.trim() || "";
-        chrome.runtime.sendMessage({
-          action: "reportMasterStream",
-          url: streamUrl,
-          name: lineName,
-          title: title
-        }).catch(() => {});
-      }
+    document.querySelectorAll("div[name='lineData'], [udata], [data-url]").forEach((el) => {
+      const raw = el.getAttribute("udata") || el.getAttribute("data-url");
+      if (!raw) return;
+      try {
+        const url = new URL(raw, location.href).href;
+        // data-url 也常是文章/图片链接，只有已知线路或媒体后缀才上报。
+        if (el.hasAttribute("udata") || el.getAttribute("name") === "lineData" || /\.(m3u8|mp4|webm)(?:$|[?#])/i.test(url)) {
+          reportStream(url, title, el.textContent.trim(), el.hasAttribute("udata") || el.getAttribute("name") === "lineData");
+        }
+      } catch (_) {}
     });
-
-    // 检查页面 video 标签是否有 m3u8
-    const videos = document.querySelectorAll("video");
-    videos.forEach((video) => {
+    document.querySelectorAll("video").forEach((video) => {
       attachFrameCapture(video);
-
-      if (video.src && video.src.includes(".m3u8")) {
-        chrome.runtime.sendMessage({
-          action: "reportMasterStream",
-          url: video.src,
-          title: title
-        }).catch(() => {});
-      }
-
-      // 普通非 blob 直链
-      if (video.src && !video.src.startsWith("blob:") && video.src.startsWith("http")) {
-        // 如果是 ts 切片则不作为独立视频上报
-        if (!video.src.includes(".ts")) {
-          chrome.runtime.sendMessage({
-            action: "reportDOMVideo",
-            url: video.src,
-            title: title
-          }).catch(() => {});
-        }
-      }
+      resetSource(video, videoStates.get(video));
+      reportVideoSource(video);
     });
   }
 
-  // 上报页面标题
+  function selectVideo(message) {
+    const videos = [...document.querySelectorAll("video")];
+    videos.forEach(attachFrameCapture);
+    if (message.videoId) return videos.find((v) => videoStates.get(v).id === message.videoId);
+    return videos.sort((a, b) => {
+      const score = (v) => (message.sourceUrl && sourceOf(v) === message.sourceUrl ? 1e12 : 0) +
+        (!v.paused && !v.ended ? 1e10 : 0) + v.videoWidth * v.videoHeight;
+      return score(b) - score(a);
+    })[0];
+  }
+
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (!["captureCurrentFrameNow", "getCapturedFrame"].includes(message.action)) return false;
+    try {
+      const video = selectVideo(message);
+      if (!video) throw new Error("此播放器已关闭，请刷新列表或重新播放视频");
+      const state = videoStates.get(video);
+      resetSource(video, state);
+      if (message.action === "captureCurrentFrameNow" && message.expectedSourceUrl !== undefined &&
+          state.source !== message.expectedSourceUrl) {
+        throw new Error("播放器已切换到其他片源，请刷新列表后重新选择");
+      }
+      if (message.action === "captureCurrentFrameNow" && /^https?:\/\//i.test(message.sourceUrl || "") &&
+          /^https?:\/\//i.test(state.source) && state.source !== message.sourceUrl) {
+        throw new Error("播放器已切换到其他片源，请刷新列表后重新选择");
+      }
+      const frame = message.action === "captureCurrentFrameNow" ? tryCapture(video, true) : state.frames.find((f) => f.id === message.captureId);
+      if (!frame || !state.originals.has(frame.id)) throw new Error("这张原图已随页面换源或刷新失效，请重新抓拍");
+      sendResponse({ success: true, frame: { ...frame, originalDataUrl: state.originals.get(frame.id) } });
+    } catch (err) {
+      sendResponse({ success: false, error: err.message });
+    }
+    return false;
+  });
+
   function reportTitle() {
-    if (window.top === window && document.title) {
-      chrome.runtime.sendMessage({
-        action: "reportPageTitle",
-        title: document.title
-      }).catch(() => {});
-    }
+    if (window.top === window && document.title) chrome.runtime.sendMessage({ action: "reportPageTitle", title: document.title }).catch(() => {});
   }
-
-  // 响应即时截图
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (msg.action === "captureCurrentFrameNow") {
-      const video = document.querySelector("video");
-      if (video) {
-        const frame = captureVideoFrame(video);
-        if (frame) {
-          const exists = capturedFrames.some(f => f.timeStr === frame.timeStr);
-          if (!exists) {
-            capturedFrames.push(frame);
-            capturedFrames.sort((a, b) => a.seconds - b.seconds);
-          }
-          reportFrames();
-          sendResponse({ success: true, frame });
-          return true;
-        }
-      }
-      sendResponse({ success: false, error: "未找到正在播放的视频画面" });
-      return true;
-    }
-  });
-
-  reportTitle();
-  scanMasterStreams();
-
-  // 深度监听 DOM 动态变化（很多站点点播、切集是异步塞入 lineData 的）
+  let scanScheduled = false;
   const observer = new MutationObserver(() => {
-    scanMasterStreams();
+    if (scanScheduled) return;
+    scanScheduled = true;
+    setTimeout(() => { scanScheduled = false; reportTitle(); scanMasterStreams(); }, 100);
   });
-
-  if (document.body) {
-    observer.observe(document.body, { childList: true, subtree: true });
-  } else {
-    document.addEventListener("DOMContentLoaded", () => {
-      reportTitle();
-      scanMasterStreams();
-      observer.observe(document.body, { childList: true, subtree: true });
-    });
+  function start() {
+    reportTitle();
+    scanMasterStreams();
+    if (document.body) observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "udata", "data-url"] });
   }
+  if (document.body) start(); else document.addEventListener("DOMContentLoaded", start, { once: true });
 })();

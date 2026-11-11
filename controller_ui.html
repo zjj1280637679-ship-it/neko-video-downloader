@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🌸 网页浏览器云控制台 (Remote Browser Control)</title>
+  <style>
+    :root {
+      --primary: #FF6B8B;
+      --bg: #FFF8FA;
+      --border: #FFD1DC;
+      --text: #4A3E3D;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #1E1E2E;
+      color: #EEE;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      user-select: none;
+    }
+    /* 顶部导航条 */
+    .toolbar {
+      background: #252538;
+      border-bottom: 1.5px solid #33334D;
+      padding: 8px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .logo {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--primary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+    .nav-btn {
+      background: #36364F;
+      border: 1px solid #484869;
+      color: #FFF;
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 13px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.2s;
+    }
+    .nav-btn:hover { background: var(--primary); border-color: var(--primary); }
+    .url-input {
+      flex: 1;
+      background: #181824;
+      border: 1.5px solid #3E3E5E;
+      border-radius: 8px;
+      padding: 7px 12px;
+      font-size: 13.5px;
+      color: #FFF;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .url-input:focus { border-color: var(--primary); }
+    .status-tag {
+      font-size: 11.5px;
+      background: #2D3748;
+      color: #A0AEC0;
+      padding: 4px 10px;
+      border-radius: 20px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #48BB78;
+      box-shadow: 0 0 6px #48BB78;
+    }
+    /* 浏览器主视窗 */
+    .main-view {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #12121C;
+      overflow: hidden;
+      position: relative;
+    }
+    #screenCanvas {
+      max-width: 100%;
+      max-height: 100%;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+      cursor: crosshair;
+      border-radius: 4px;
+      display: block;
+    }
+    .loading-tip {
+      position: absolute;
+      font-size: 14px;
+      color: #A0AEC0;
+      pointer-events: none;
+    }
+    /* 底部信息栏 */
+    .footer {
+      background: #181824;
+      padding: 4px 14px;
+      font-size: 11px;
+      color: #718096;
+      display: flex;
+      justify-content: space-between;
+      border-top: 1px solid #2D3748;
+    }
+    .footer a { color: var(--primary); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <div class="logo"><span>🌸</span> 喵喵云控制台</div>
+    <button class="nav-btn" id="btnBack" title="后退">◀</button>
+    <button class="nav-btn" id="btnForward" title="前进">▶</button>
+    <button class="nav-btn" id="btnReload" title="刷新">🔄</button>
+    <input type="text" class="url-input" id="urlInput" placeholder="输入网址并按回车..." value="about:blank">
+    <button class="nav-btn" id="btnGo">前往 🚀</button>
+    <select class="nav-btn" id="tabSelect" aria-label="浏览器标签页" style="max-width:180px"></select>
+    <button class="nav-btn" id="refreshTabs" title="刷新标签页">标签页 ↻</button>
+    <button class="nav-btn" id="connectButton" title="输入令牌或重新连接">连接</button>
+    <div class="status-tag">
+      <span class="status-dot"></span>
+      <span id="connStatus">等待连接浏览器</span>
+    </div>
+  </div>
+
+  <div class="main-view" id="mainContainer">
+    <div class="loading-tip" id="loadingTip">正在建立实时高清视频流通道喵... (◕ᴗ◕✿)</div>
+    <canvas id="screenCanvas"></canvas>
+  </div>
+
+  <div class="footer">
+    <span>💡 直接在上方画面中点击鼠标、输入文字、滚动滚轮即可直接操控真实 Chrome 浏览器！</span>
+    <span id="detailStatus">本地浏览器控制接口</span>
+  </div>
+
+  <dialog id="tokenDialog" style="margin:auto;padding:24px;background:#252538;color:#eee;border:1px solid #484869;border-radius:12px">
+    <form id="tokenForm">
+      <p style="margin-bottom:12px">连接令牌（默认本机模式可留空）</p>
+      <input id="tokenInput" type="password" class="url-input" autocomplete="off" aria-label="调用令牌" style="width:300px">
+      <button class="nav-btn" type="submit" style="margin-left:8px">连接</button>
+      <p style="margin-top:12px;font-size:12px;color:#A0AEC0">仅保存在当前页面会话中。</p>
+    </form>
+  </dialog>
+  <script src="/controller_ui.js"></script>
+</body>
+</html>

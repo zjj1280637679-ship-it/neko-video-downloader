@@ -6,6 +6,8 @@ let tabMediaMap = new Map();
 let tabTitleMap = new Map();
 // 缓存标签页的视频多帧截屏
 let tabFramesMap = new Map();
+// 播放器所在文档，供 iframe 抓拍和原图读取使用。
+let tabPlayersMap = new Map();
 // 记录标签页已侦测到的切片计数
 let tabChunkCountMap = new Map();
 
@@ -15,17 +17,21 @@ const SESSION_KEYS = {
   media: "neko_tabMedia",
   titles: "neko_tabTitles",
   frames: "neko_tabFrames",
-  chunks: "neko_tabChunks"
+  chunks: "neko_tabChunks",
+  players: "neko_tabPlayers"
 };
 
+let saveChain = Promise.resolve();
 function scheduleSave() {
-  // 写透（storage.session 容量 10MB；截屏 dataUrl 总量一般远小于此）
-  chrome.storage.session.set({
-    [SESSION_KEYS.media]: [...tabMediaMap.entries()],
+  // 原图不经过 session；缩略图只存一份，写入按顺序完成。
+  const snapshot = {
+    [SESSION_KEYS.media]: [...tabMediaMap.entries()].map(([id, items]) => [id, items.map(({ frames, ...item }) => item)]),
     [SESSION_KEYS.titles]: [...tabTitleMap.entries()],
     [SESSION_KEYS.frames]: [...tabFramesMap.entries()],
-    [SESSION_KEYS.chunks]: [...tabChunkCountMap.entries()]
-  }).catch(() => {});
+    [SESSION_KEYS.chunks]: [...tabChunkCountMap.entries()],
+    [SESSION_KEYS.players]: [...tabPlayersMap.entries()]
+  };
+  saveChain = saveChain.then(() => chrome.storage.session.set(snapshot)).catch((err) => console.warn("媒体状态保存失败", err));
 }
 
 let restorePromise = null;
@@ -38,46 +44,121 @@ function restoreState() {
       if (data[SESSION_KEYS.titles]) tabTitleMap = new Map(data[SESSION_KEYS.titles]);
       if (data[SESSION_KEYS.frames]) tabFramesMap = new Map(data[SESSION_KEYS.frames]);
       if (data[SESSION_KEYS.chunks]) tabChunkCountMap = new Map(data[SESSION_KEYS.chunks]);
+      if (data[SESSION_KEYS.players]) tabPlayersMap = new Map(data[SESSION_KEYS.players]);
     })
     .catch(() => {});
   return restorePromise;
 }
 restoreState();
 
-// 切片计数应挂在 m3u8 主流卡片上，而不是 mediaList[0]（[0] 可能是先到的 mp4）
-function firstStreamItem(list) {
-  if (!list || list.length === 0) return null;
-  return list.find((m) => m.isM3U8) || list[0];
+function whenReady(action) {
+  return restoreState().then(action).catch((err) => console.warn("媒体状态处理失败", err));
 }
 
-// 判断是否是切片碎片 (绝对不应该作为独立视频卡片展示给用户)
-function isFragmentUrl(url, contentType, contentLength) {
-  // 如果是 m3u8 播放清单本身，绝不是碎片，而是完整视频流入口！
-  if (/\.m3u8($|\?)/i.test(url) || (contentType && contentType.includes("mpegurl"))) {
-    return false;
-  }
+function framesForMedia(tabId, item) {
+  const frames = tabFramesMap.get(tabId) || [];
+  const exact = frames.filter((frame) => frame.sourceUrl === item.url);
+  if (exact.length) return exact.map((frame) => ({ ...frame, sourceMatched: true }));
+  if (!item.isM3U8) return [];
+  const players = (tabPlayersMap.get(tabId) || []).filter((player) =>
+    (!player.sourceUrl || player.sourceUrl.startsWith("blob:")) && playerBelongsToMedia(player, item));
+  if (players.length !== 1) return [];
+  return framesForPlayer(frames, players[0]).map((frame) => ({ ...frame, sourceMatched: false }));
+}
 
-  // 1. MIME 类型明确为 TS 切片
-  if (contentType && (contentType.includes("mp2t") || contentType.includes("iso.segment"))) {
-    return true;
-  }
+function framesForPlayer(frames, player) {
+  return frames.filter((frame) => frame.frameId === player.frameId && frame.videoId === player.videoId &&
+    frame.documentId === player.documentId);
+}
 
-  // 2. URL 包含典型的切片特征 (.ts, .m4s, seg-1, chunk_01, /hls/.../1 等)
-  // 注意：part 必须带分隔符（part-1/part_1）才算切片，part1.mp4 这类正片名不拦
-  const FRAGMENT_REGEX = /(\.(ts|m4s|m4v_frag|f4m|f4f)($|\?))|([/_](seg|segment|chunk|frag|slice)[-_0-9])|([/_]part[-_][0-9])|(\/hls\/.*\/[0-9]+)/i;
-  if (FRAGMENT_REGEX.test(url)) {
-    return true;
-  }
+function frameOptions(target) {
+  return target.documentId ? { documentId: target.documentId } : { frameId: target.frameId || 0 };
+}
 
-  // 3. 小于 12MB 的数字命名分块 (如 /123.ts)——只拦 .ts/.m4s，.mp4 不拦：
-  // 很多站点的正片短视频就是 /123.mp4 这类数字命名，之前会误伤
-  if (contentLength && contentLength > 0 && contentLength < 12 * 1024 * 1024) {
-    if (/\/[0-9]{1,5}\.(ts|m4s)($|\?)/i.test(url)) {
-      return true;
-    }
-  }
+function playerIdentity(player) {
+  return { frameId: player.frameId, documentId: player.documentId, videoId: player.videoId,
+    sourceUrl: player.sourceUrl, title: player.title, isPlaying: player.isPlaying,
+    width: player.width, height: player.height };
+}
 
-  return false;
+function playerBelongsToMedia(player, media) {
+  const contexts = media?.contexts || (media?.frameIds || []).map((frameId) => ({ frameId }));
+  const related = contexts.filter((context) => context.frameId === player.frameId);
+  const documented = related.filter((context) => context.documentId);
+  return documented.length ? documented.some((context) => context.documentId === player.documentId) : related.length > 0;
+}
+
+async function captureFromPlayer(tabId, message) {
+  const allPlayers = [...(tabPlayersMap.get(tabId) || [])];
+  let players;
+  const media = (tabMediaMap.get(tabId) || []).find((item) => item.url === message.sourceUrl);
+  const hasTarget = ["videoId", "frameId", "documentId"].some((key) => message[key] !== undefined);
+  if (hasTarget) {
+    players = allPlayers.filter((player) => ["videoId", "frameId", "documentId"]
+      .every((key) => message[key] === undefined || player[key] === message[key]));
+  } else {
+    const exact = message.sourceUrl ? allPlayers.filter((p) => p.sourceUrl === message.sourceUrl) : [];
+    if (exact.length) players = exact;
+    else if (!message.sourceUrl) players = allPlayers;
+    else if (media?.isM3U8) {
+      // blob 只证明播放器存在。清单所在 frame/document 限定候选范围，失败不能换别处的画面。
+      players = allPlayers.filter((p) => (!p.sourceUrl || p.sourceUrl.startsWith("blob:")) && playerBelongsToMedia(p, media));
+    } else players = [];
+  }
+  if (!players.length) return { success: false, error: hasTarget
+    ? "所选播放器已关闭或文档已刷新，请重新选择播放器"
+    : "这个片源没有对应的当前播放器；可在下方播放器卡片选择需要抓拍的画面" };
+  if (players.length > 1) return { success: false,
+    error: "找到多个可能的播放器，请在下方播放器卡片选择需要抓拍的画面", candidates: players.map(playerIdentity) };
+  const player = players[0];
+  try {
+    const result = await chrome.tabs.sendMessage(tabId, {
+      action: "captureCurrentFrameNow", videoId: player.videoId, sourceUrl: message.sourceUrl,
+      expectedSourceUrl: player.sourceUrl
+    }, frameOptions(player));
+    if (result?.success) return { ...result, sourceMatched: result.frame.sourceUrl === message.sourceUrl,
+      frame: { ...result.frame, frameId: player.frameId, documentId: player.documentId } };
+    return result || { success: false, error: "播放器未返回画面，请重新播放后重试" };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+// 切片计数应挂在 m3u8 主流卡片上，而不是 mediaList[0]（[0] 可能是先到的 mp4）
+function firstStreamItem(list) {
+  const visible = (list || []).filter((item) => !item.isFragment);
+  return visible.find((m) => m.isM3U8) || visible[0] || null;
+}
+
+const FILE_MIMES = {
+  "video/mp4": "mp4", "video/webm": "webm", "video/x-flv": "flv", "video/flv": "flv",
+  "video/quicktime": "mov", "video/ogg": "ogv", "video/x-msvideo": "avi", "video/x-matroska": "mkv",
+  "video/mp2t": "ts"
+};
+
+function isKnownMediaMime(mime) {
+  return /mpegurl|mp2t|iso\.segment/i.test(mime || "") || (mime || "").startsWith("video/");
+}
+
+function classifyMedia(url, evidence) {
+  let pathname;
+  try { pathname = new URL(url).pathname; } catch (_) { pathname = url.split(/[?#]/)[0]; }
+  const pathExt = pathname.match(/\.([a-z0-9_]+)$/i)?.[1].toLowerCase() || "";
+  const responseMime = evidence.responseMime || "";
+  const mime = isKnownMediaMime(responseMime) ? responseMime : (evidence.domMime || "");
+  const isHlsMime = mime.includes("mpegurl");
+  const filePath = ["mp4", "webm", "flv", "mov", "m4v", "ogv", "avi", "mkv", "ts", "m4s"].includes(pathExt);
+  const segmentPath = ["ts", "m4s", "m4v_frag", "f4f"].includes(pathExt);
+  const isM3U8 = !!(isHlsMime || (!isKnownMediaMime(mime) &&
+    (pathExt === "m3u8" || (!filePath && !segmentPath && evidence.streamHint))));
+  const segmentMime = /mp2t|iso\.segment/.test(mime);
+  // 目录/part 名称只作为线索；真实 video MIME 或 <video> 使用证据不能被弱路径规则抹掉。
+  const fragmentHint = /(?:[\/_](?:seg|segment|chunk|frag|slice)[-_0-9])|(?:[\/_]part[-_][0-9])|(?:\/hls\/.*\/[0-9]+)/i.test(pathname);
+  const isFragment = !isM3U8 && !evidence.domVideo && (segmentPath || segmentMime);
+  const ext = isM3U8 ? "m3u8" : FILE_MIMES[mime] ||
+    (filePath ? pathExt : "mp4");
+  return { isM3U8, isFragment, fragmentHint, ext,
+    mime: mime || (isM3U8 ? "application/x-mpegurl" : "video/" + ext) };
 }
 
 // 格式化文件名
@@ -91,7 +172,7 @@ function sanitizeFilename(name) {
 
 // 更新插件角标 (萌系樱花粉色)
 function updateBadge(tabId) {
-  const list = tabMediaMap.get(tabId) || [];
+  const list = (tabMediaMap.get(tabId) || []).filter((item) => !item.isFragment);
   const count = list.length;
   if (count > 0) {
     chrome.action.setBadgeText({ tabId, text: String(count) });
@@ -103,79 +184,54 @@ function updateBadge(tabId) {
 
 // 核心：添加/更新捕获的媒体项目（过滤碎片）
 function addMediaItem(tabId, item) {
-  if (!tabId || tabId < 0) return;
-
+  if (!Number.isInteger(tabId) || tabId < 0) return;
   const url = item.url || "";
-  const contentType = (item.mime || "").toLowerCase();
+  if (!/^https?:\/\//i.test(url)) return;
+  const contentType = (item.mime || "").toLowerCase().split(";")[0].trim();
   const contentLength = item.size || 0;
-
-  // 🔴 智能拦截几 MB 的切片碎片！
-  if (isFragmentUrl(url, contentType, contentLength)) {
-    // 累加该标签页的切片计数，但不作为独立卡片推给用户
-    const currentCount = (tabChunkCountMap.get(tabId) || 0) + 1;
-    tabChunkCountMap.set(tabId, currentCount);
-
-    // 如果当前标签页已经有主 m3u8 流，更新其切片计数
-    const mediaList = tabMediaMap.get(tabId);
-    if (mediaList && mediaList.length > 0) {
-      const target = firstStreamItem(mediaList);
-      if (target) target.chunkCount = currentCount;
-      chrome.runtime.sendMessage({ action: "mediaListUpdated", tabId }).catch(() => {});
-    }
-    scheduleSave();
-    return; // 直接拦截，拒绝展示几MB碎片！
-  }
-
   if (!tabMediaMap.has(tabId)) {
     tabMediaMap.set(tabId, []);
   }
   const mediaList = tabMediaMap.get(tabId);
-
-  // URL 去重
   const existing = mediaList.find(m => m.url === url);
-  if (existing) {
-    if (contentLength && !existing.size) existing.size = contentLength;
-    return;
+  const evidence = { ...(existing?.evidence || {}) };
+  // responseMime 只接收响应头；DOM 类型声明与线路猜测始终保留各自来源。
+  if (item.observation === "response" && contentType &&
+      (isKnownMediaMime(contentType) || !isKnownMediaMime(evidence.responseMime))) evidence.responseMime = contentType;
+  if (item.observation === "dom") {
+    if (contentType) evidence.domMime = contentType;
+    if (item.directVideo) evidence.domVideo = true;
+    if (item.streamHint) evidence.streamHint = true;
   }
-
-  // 识别是否是完整 m3u8 流媒体
-  const isM3U8 = url.includes(".m3u8") || contentType.includes("mpegurl");
-
-  let ext = "mp4";
-  if (isM3U8) ext = "m3u8";
-  else if (/\.webm($|\?)/i.test(url)) ext = "webm";
-  else if (/\.flv($|\?)/i.test(url)) ext = "flv";
-
-  const pageTitle = item.customTitle || tabTitleMap.get(tabId) || "";
-  let baseName = sanitizeFilename(pageTitle);
+  const classification = classifyMedia(url, evidence);
+  let baseName = sanitizeFilename(item.customTitle || existing?.baseName ||
+    existing?.suggestedFilename?.replace(/\.[^/.]+$/, "") || tabTitleMap.get(tabId) || "");
   if (!baseName || baseName === "视频") {
     baseName = "完整高清视频";
   }
-
-  const filename = `${baseName}.${ext}`;
-  const existingFrames = tabFramesMap.get(tabId) || [];
-  const chunkCount = tabChunkCountMap.get(tabId) || 0;
-
-  const mediaObj = {
-    id: `${tabId}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-    url: url,
-    mime: contentType || (isM3U8 ? "application/x-mpegURL" : "video/mp4"),
-    size: contentLength,
-    isM3U8: isM3U8,
-    ext: ext,
-    suggestedFilename: filename,
-    frames: [...existingFrames],
-    chunkCount: chunkCount,
-    timestamp: Date.now()
-  };
-
-  // 完整 m3u8 流媒体具有最高优先级
-  if (isM3U8) {
-    mediaList.unshift(mediaObj);
-  } else {
-    mediaList.push(mediaObj);
+  const frameId = item.frameId ?? 0;
+  const contexts = [...(existing?.contexts || (existing?.frameIds || []).map((id) => ({ frameId: id })))];
+  if (!contexts.some((c) => c.frameId === frameId && c.documentId === item.documentId)) {
+    contexts.push({ frameId, documentId: item.documentId });
   }
-
+  const chunkCount = Math.max(0, (tabChunkCountMap.get(tabId) || 0) +
+    Number(classification.isFragment) - Number(!!existing?.isFragment));
+  tabChunkCountMap.set(tabId, chunkCount);
+  const mediaObj = {
+    ...existing,
+    id: existing?.id || `${tabId}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    url, evidence, ...classification, baseName,
+    size: existing?.size || contentLength,
+    suggestedFilename: `${baseName}.${classification.ext}`,
+    frameIds: [...new Set([...(existing?.frameIds || []), frameId])], contexts,
+    chunkCount, timestamp: existing?.timestamp || Date.now()
+  };
+  // 分片保留可修正身份，但不作为下载卡片展示；同 URL 后到的完整媒体证据可提升它。
+  if (existing) mediaList[mediaList.indexOf(existing)] = mediaObj;
+  else mediaList.push(mediaObj);
+  mediaList.sort((a, b) => Number(b.isM3U8) - Number(a.isM3U8));
+  const target = firstStreamItem(mediaList);
+  if (target) target.chunkCount = chunkCount;
   updateBadge(tabId);
   scheduleSave();
   chrome.runtime.sendMessage({ action: "mediaListUpdated", tabId }).catch(() => {});
@@ -186,11 +242,11 @@ chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.tabId < 0) return;
     if (/\.m3u8($|\?)/i.test(details.url)) {
-      addMediaItem(details.tabId, {
+      whenReady(() => addMediaItem(details.tabId, {
         url: details.url,
-        mime: "application/x-mpegURL",
-        size: 0
-      });
+        observation: "url",
+        size: 0, frameId: details.frameId, documentId: details.documentId
+      }));
     }
   },
   { urls: ["<all_urls>"] }
@@ -216,15 +272,16 @@ chrome.webRequest.onHeadersReceived.addListener(
 
     const isVideoMime = contentType.startsWith("video/") || 
                         contentType.includes("mpegurl") || 
-                        contentType.includes("application/x-mpegurl");
-    const isM3U8Url = details.url.includes(".m3u8");
+                        contentType.includes("mp2t") || contentType.includes("iso.segment");
+    const isM3U8Url = /\.m3u8(?:$|[?#])/i.test(details.url);
+    const isSegmentUrl = /\.(ts|m4s|m4v_frag|f4f)(?:$|[?#])/i.test(details.url);
 
-    if (isVideoMime || isM3U8Url) {
-      addMediaItem(details.tabId, {
+    if (isVideoMime || isM3U8Url || isSegmentUrl) {
+      whenReady(() => addMediaItem(details.tabId, {
         url: details.url,
-        mime: contentType,
-        size: contentLength
-      });
+        mime: contentType, observation: "response",
+        size: contentLength, frameId: details.frameId, documentId: details.documentId
+      }));
     }
   },
   { urls: ["<all_urls>"] },
@@ -232,18 +289,19 @@ chrome.webRequest.onHeadersReceived.addListener(
 );
 
 // 监听消息
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  const tabId = (sender.tab && sender.tab.id) || message.tabId;
+function handleMessage(message, sender, sendResponse) {
+  const tabId = sender.tab?.id ?? message.tabId;
 
   // 接收来自 DOM 的完整流地址 (针对类似 ikanbot 的 lineData udata)
-  if (message.action === "reportMasterStream" && tabId) {
+  if (message.action === "reportMasterStream" && Number.isInteger(tabId)) {
     if (message.title) {
       tabTitleMap.set(tabId, message.title);
     }
     addMediaItem(tabId, {
       url: message.url,
-      mime: "application/x-mpegURL",
-      size: 0,
+      mime: message.mime || "", observation: "dom", directVideo: !!message.directVideo,
+      streamHint: true,
+      size: 0, frameId: sender.frameId, documentId: sender.documentId,
       customTitle: message.name ? `${message.title}_${message.name}` : message.title
     });
     sendResponse({ status: "ok" });
@@ -252,14 +310,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // 接收 DOM 扫描到的普通视频直链（如 <video src> 的 mp4）——之前 content.js 发了这条消息，
   // background 却没有处理分支，正片直接被丢掉，弹窗里看不到
-  if (message.action === "reportDOMVideo" && tabId) {
+  if (message.action === "reportDOMVideo" && Number.isInteger(tabId)) {
     if (message.title) {
       tabTitleMap.set(tabId, message.title);
     }
     addMediaItem(tabId, {
       url: message.url,
-      mime: "video/mp4",
-      size: 0,
+      mime: message.mime || "", observation: "dom", directVideo: message.directVideo !== false,
+      streamHint: !!message.streamHint,
+      size: 0, frameId: sender.frameId, documentId: sender.documentId,
       customTitle: message.title
     });
     sendResponse({ status: "ok" });
@@ -267,20 +326,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   // 接收多帧截屏
-  if (message.action === "reportVideoFrames" && tabId) {
-    tabFramesMap.set(tabId, message.frames || []);
-    const list = tabMediaMap.get(tabId);
-    if (list && list.length > 0) {
-      const target = firstStreamItem(list);
-      if (target) target.frames = message.frames || [];
-    }
+  if (message.action === "reportVideoFrames" && Number.isInteger(tabId)) {
+    const frameId = sender.frameId ?? 0;
+    const player = { frameId, documentId: sender.documentId, videoId: message.videoId,
+      sourceUrl: message.sourceUrl || "", isPlaying: !!message.isPlaying, area: message.area || 0,
+      width: message.width || 0, height: message.height || 0,
+      title: message.title || "", pageUrl: message.pageUrl || sender.url || "" };
+    const samePlayer = (p) => p.frameId === frameId && p.videoId === player.videoId;
+    const staleDocument = (p) => p.frameId === frameId && p.documentId && sender.documentId && p.documentId !== sender.documentId;
+    const players = (tabPlayersMap.get(tabId) || []).filter((p) => !samePlayer(p) && !staleDocument(p));
+    tabPlayersMap.set(tabId, [...players, player]);
+    const oldFrames = (tabFramesMap.get(tabId) || []).filter((f) => !samePlayer(f) && !staleDocument(f));
+    const frames = (message.frames || []).slice(-10).map(({ originalDataUrl, ...frame }) => ({ ...frame, ...player }));
+    tabFramesMap.set(tabId, [...oldFrames, ...frames].slice(-60));
     scheduleSave();
-    chrome.runtime.sendMessage({ action: "framesUpdated", tabId, frames: message.frames }).catch(() => {});
+    chrome.runtime.sendMessage({ action: "framesUpdated", tabId }).catch(() => {});
     sendResponse({ status: "ok" });
     return true;
   }
 
-  if (message.action === "reportPageTitle" && tabId) {
+  if (message.action === "reportPageTitle" && Number.isInteger(tabId)) {
     tabTitleMap.set(tabId, message.title);
     scheduleSave();
     sendResponse({ status: "ok" });
@@ -290,20 +355,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "getMedia") {
     // 先等启动恢复完成，否则 SW 刚被唤醒时列表还是空的
     restoreState().then(() => {
-      const list = tabMediaMap.get(message.tabId) || [];
+      const list = (tabMediaMap.get(message.tabId) || []).filter((item) => !item.isFragment)
+        .map((item) => ({ ...item, frames: framesForMedia(message.tabId, item) }));
       const pageTitle = tabTitleMap.get(message.tabId) || "当前网页";
       const frames = tabFramesMap.get(message.tabId) || [];
+      const players = (tabPlayersMap.get(message.tabId) || [])
+        .map((player) => ({ ...player, frames: framesForPlayer(frames, player) }));
       const chunkCount = tabChunkCountMap.get(message.tabId) || 0;
 
       if (list.length > 0) {
         const target = firstStreamItem(list);
         if (target) {
-          if (frames.length > 0) target.frames = frames;
           target.chunkCount = chunkCount;
         }
       }
-      sendResponse({ media: list, pageTitle, frames, chunkCount });
+      sendResponse({ media: list, pageTitle, frames, players, chunkCount });
     });
+    return true;
+  }
+
+  if (message.action === "captureCurrentFrame") {
+    captureFromPlayer(tabId, message).then(sendResponse).catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "getCapturedFrame") {
+    const frame = (tabFramesMap.get(tabId) || []).find((f) => f.id === message.captureId);
+    if (!frame) { sendResponse({ success: false, error: "原图已失效，请重新抓拍" }); return true; }
+    chrome.tabs.sendMessage(tabId, { action: "getCapturedFrame", videoId: frame.videoId, captureId: frame.id }, frameOptions(frame))
+      .then(sendResponse).catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
   }
 
@@ -324,23 +404,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     );
     return true;
   }
+}
+
+// 监听器同步注册；所有状态操作都排在恢复之后，避免新请求被旧快照覆盖。
+const handledActions = new Set(["reportMasterStream", "reportDOMVideo", "reportVideoFrames", "reportPageTitle", "getMedia", "download", "captureCurrentFrame", "getCapturedFrame"]);
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!handledActions.has(message.action)) return false;
+  restoreState().then(() => handleMessage(message, sender, sendResponse))
+    .catch((err) => sendResponse({ success: false, error: err.message }));
+  return true;
 });
 
 // 清理状态
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === "loading" && changeInfo.url) {
+  // 同 URL 重载只更新 status，不保证同时带 url；新文档不能继续使用旧文档的媒体与原图。
+  if (changeInfo.status === "loading") {
+    whenReady(() => {
     tabMediaMap.delete(tabId);
+    tabTitleMap.delete(tabId);
     tabFramesMap.delete(tabId);
+    tabPlayersMap.delete(tabId);
     tabChunkCountMap.delete(tabId);
     updateBadge(tabId);
     scheduleSave();
+    });
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  whenReady(() => {
   tabMediaMap.delete(tabId);
   tabTitleMap.delete(tabId);
   tabFramesMap.delete(tabId);
+  tabPlayersMap.delete(tabId);
   tabChunkCountMap.delete(tabId);
   scheduleSave();
+  });
 });

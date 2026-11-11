@@ -15,6 +15,7 @@
       --border: #FFD1DC;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    [hidden] { display: none !important; }
     body {
       background: var(--bg);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -110,6 +111,26 @@
       font-size: 12.5px;
       color: var(--muted);
       text-align: center;
+      overflow-wrap: anywhere;
+    }
+    .audio-notice {
+      border: 1px solid #EBC47A;
+      border-radius: 12px;
+      background: #FFF8E8;
+      padding: 14px;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .audio-notice textarea {
+      display: block;
+      width: 100%;
+      min-height: 64px;
+      margin: 10px 0;
+      padding: 8px;
+      border: 1px solid #EBC47A;
+      border-radius: 6px;
+      resize: vertical;
+      font: inherit;
     }
     .btn-group {
       display: flex;
@@ -183,6 +204,13 @@
       </div>
     </div>
 
+    <section class="audio-notice" id="audioNotice" hidden aria-label="独立音轨说明">
+      <strong>检测到独立音轨</strong>
+      <p id="audioNoticeText"></p>
+      <textarea id="audioUrls" readonly aria-label="独立音轨清单地址"></textarea>
+      <button class="btn btn-secondary" id="btnCopyAudio">📋 复制音轨清单地址</button>
+    </section>
+
     <div class="progress-box">
       <div class="progress-header">
         <span id="progressText">等待开始...</span>
@@ -191,28 +219,34 @@
       <div class="progress-bar-bg">
         <div class="progress-bar-fill" id="progressFill"></div>
       </div>
-      <div class="status-msg" id="statusMsg">(=^･ω･^=) 准备就绪，点击下方按钮开始下载合并吧！</div>
+      <div class="status-msg" id="transferStats"></div>
+      <div class="status-msg" id="statusMsg" role="status" aria-live="polite">(=^･ω･^=) 正在读取播放清单...</div>
     </div>
 
     <div class="btn-group">
-      <button class="btn btn-primary" id="btnStart">
+      <button class="btn btn-primary" id="btnStart" disabled>
         <span>✨</span> 开始合并下载 (转为MP4/TS)
       </button>
+      <button class="btn btn-secondary" id="btnCancel" hidden disabled>取消下载</button>
       <button class="btn btn-secondary" id="btnDownloadM3U8">
-        <span>📄</span> 仅保存 m3u8 文件
+        <span>📄</span> 保存原始 m3u8 文件
       </button>
       <button class="btn btn-secondary" id="btnCopyUrl">
-        <span>📋</span> 复制 m3u8 直链
+        <span>📋</span> 复制原始 m3u8 地址
       </button>
     </div>
 
     <div class="tips">
       💡 <b>温馨说明：</b><br>
-      • 本功能会在浏览器内存中将所有切片（.ts）按顺序并发抓取，并直接合并为一个完整的视频文件后自动保存到你的下载目录。<br>
-      • 下载期间请勿关闭此网页标签哦，合成完毕后会自动弹出保存文件窗口喵！(◕ᴗ◕✿)
+      • 根据并发分片数量与总下载速度的变化自动寻找合适的并发量，下载的切片按原顺序保存。<br>
+      • 支持时会先选择保存位置并直接写入文件；无法直接写入时使用内存合并，大文件可能占用较多内存。<br>
+      • 下载期间请保持本页开启。取消保存框或点击“取消下载”会停止本次任务；全部切片失败时不保存空视频。<br>
+      • 独立音轨不会自动合并。检测到独立音轨时会显示提示和清单地址，你仍可选择仅保存视频流。
     </div>
   </div>
 
+  <script src="adaptive-concurrency.js"></script>
+  <script src="adaptive-download.js"></script>
   <script src="downloader.js"></script>
 </body>
 </html>

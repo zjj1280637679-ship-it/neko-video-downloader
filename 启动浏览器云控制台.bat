@@ -10,7 +10,23 @@ echo    💡 脚本将拉起 Chrome 并生成实时网页控制链接
 echo ======================================================================
 echo.
 
-start "" "http://localhost:8899"
-python browser_controller.py
+where py >nul 2>nul
+if not errorlevel 1 (
+    py -3 -c "import aiohttp" >nul 2>nul
+    if errorlevel 1 (
+        echo 请先运行: py -3 -m pip install -r requirements.txt
+        pause
+        exit /b 1
+    )
+    py -3 browser_controller.py --open %*
+) else (
+    python -c "import aiohttp" >nul 2>nul
+    if errorlevel 1 (
+        echo 请安装 Python 3.10+ 并运行: python -m pip install -r requirements.txt
+        pause
+        exit /b 1
+    )
+    python browser_controller.py --open %*
+)
 
 pause
