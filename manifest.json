@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "🌸 喵喵视频下载姬",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "minimum_chrome_version": "116",
   "description": "在弹窗下载 MP4 与 HLS，关闭弹窗后后台继续。支持总速度自适应并行、分片续传、AES-128、保存设置和视频截图。",
   "icons": {

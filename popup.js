@@ -50,8 +50,14 @@ document.addEventListener("DOMContentLoaded", async () => {
       $(`${pane}Tab`).setAttribute("aria-selected", String(selected));
       $(`${pane}Tab`).tabIndex = selected ? 0 : -1;
     }
+    syncArtMotion();
     if (focus) $(`${name}Tab`).focus();
   }
+  function syncArtMotion() {
+    $("appContent").dataset.artPaused = String(document.hidden || $("sourcePanel").hidden || !$("settingsModal").hidden || !$("imageModal").hidden);
+  }
+  document.addEventListener("visibilitychange", syncArtMotion);
+  syncArtMotion();
   for (const name of ["source", "jobs"]) {
     $(`${name}Tab`).addEventListener("click", () => showPane(name));
     $(`${name}Tab`).addEventListener("keydown", event => {
@@ -60,13 +66,38 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
     });
   }
+  function createCaptureArt(phase) {
+    const art = node("div", `neko-art neko-art-${phase}`); art.setAttribute("aria-hidden", "true");
+    art.append(node("span", "neko-halo"), node("span", "neko-spark neko-spark-one"), node("span", "neko-spark neko-spark-two"), node("span", "neko-shadow"));
+    if (phase === "sniffing") art.append(node("span", "neko-orbit-ring"));
+    const cat = node("div", "neko-cat"), face = node("div", "neko-face"), eyes = node("div", "neko-gaze");
+    eyes.append(node("span", "neko-eye"), node("span", "neko-eye"));
+    face.append(node("span", "neko-blush neko-blush-left"), node("span", "neko-blush neko-blush-right"), eyes, node("span", "neko-nose"), node("span", "neko-mouth"));
+    cat.append(node("span", "neko-ear neko-ear-left"), node("span", "neko-ear neko-ear-right"), face);
+    art.append(cat, node("span", "neko-ledge"), node("span", "neko-paw neko-paw-left"), node("span", "neko-paw neko-paw-right"));
+    if (phase === "waiting") {
+      const bubble = node("span", "neko-play-bubble"); bubble.append(node("span", "neko-play-icon")); art.append(bubble);
+    } else {
+      art.append(node("span", "neko-orbit-dot neko-orbit-trail-two"), node("span", "neko-orbit-dot neko-orbit-trail-one"), node("span", "neko-orbit-dot neko-orbit-light"));
+    }
+    return art;
+  }
   function emptyState(container, title, description, hint = "", phase = "") {
     const signature = JSON.stringify([title, description, hint, phase]);
-    if (container.querySelector(".empty-box")?.dataset.signature === signature) return;
+    const existing = container.querySelector(".empty-box");
+    if (existing?.dataset.signature === signature) return;
+    // Keep the illustration's timeline when only a discovery hint changes.
+    if (existing && existing.dataset.phase === phase) {
+      existing.dataset.signature = signature; setText(existing.querySelector(".empty-title"), title); setText(existing.querySelector(".empty-desc"), description);
+      const hintNode = existing.querySelector(".empty-hint");
+      if (hint) { if (hintNode) setText(hintNode, hint); else existing.append(node("p", "empty-hint", hint)); }
+      else hintNode?.remove();
+      return;
+    }
     const empty = node("div", "empty-box"); empty.dataset.signature = signature; empty.dataset.phase = phase;
     const symbol = { checking: "○", unconfirmed: "○", waiting: "▶", sniffing: "⌕", "no-source": "…", unavailable: "—" }[phase] || "(=^･ω･^=)";
     const icon = node("p", "empty-cat", symbol); icon.setAttribute("aria-hidden", "true");
-    empty.append(icon, node("p", "empty-title", title), node("p", "empty-desc", description));
+    empty.append(["waiting", "sniffing"].includes(phase) ? createCaptureArt(phase) : icon, node("p", "empty-title", title), node("p", "empty-desc", description));
     if (hint) empty.append(node("p", "empty-hint", hint));
     container.replaceChildren(empty);
   }
@@ -354,8 +385,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     $("concurrencyCountRow").hidden = !manual;
     setText($("concurrencyModeHint"), manual ? "手动固定并行数，不会自动调整。" : "根据并行数变化后的总下载速度调整：持续提速时增加，提速不明显时停止增加，降速时尝试减少。");
   }
-  function openModal(id, trigger, focusId) { modalTrigger = trigger; $(id).hidden = false; $("appContent").inert = true; $(focusId).focus(); }
-  function closeModal(id) { $(id).hidden = true; $("appContent").inert = false; if (modalTrigger?.isConnected) modalTrigger.focus(); else $("sourceTab").focus(); }
+  function openModal(id, trigger, focusId) { modalTrigger = trigger; $(id).hidden = false; $("appContent").inert = true; syncArtMotion(); $(focusId).focus(); }
+  function closeModal(id) { $(id).hidden = true; $("appContent").inert = false; syncArtMotion(); if (modalTrigger?.isConnected) modalTrigger.focus(); else $("sourceTab").focus(); }
   async function openSettings(trigger) {
     $("settingsError").hidden = true; $("settingsSave").disabled = true; $("subfolder").disabled = true; $("askWhereToSave").disabled = true; $("concurrency").disabled = true; $("concurrencyMode").disabled = true;
     fillSettingsForm();

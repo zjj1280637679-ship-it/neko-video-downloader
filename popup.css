@@ -107,3 +107,63 @@ select{font:inherit}select:focus-visible{outline:3px solid #cba7e0;outline-offse
 .empty-box[data-phase="checking"],.empty-box[data-phase="unconfirmed"],.empty-box[data-phase="unavailable"],.empty-box[data-phase="no-source"]{background:#fcfafc;border-color:#dfd6de}
 .empty-box[data-phase="waiting"] .empty-cat,.empty-box[data-phase="sniffing"] .empty-cat,.empty-box[data-phase="checking"] .empty-cat,.empty-box[data-phase="unconfirmed"] .empty-cat,.empty-box[data-phase="unavailable"] .empty-cat,.empty-box[data-phase="no-source"] .empty-cat{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;font-size:21px}
 @keyframes capture-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.8)}}
+
+/* Two tiny companions: waiting for a play click, then following a video signal. */
+.empty-box[data-phase="waiting"]{background:#fff9fc;border-color:#e6cedb}
+.empty-box[data-phase="waiting"],.empty-box[data-phase="sniffing"]{padding-top:15px;padding-bottom:20px}
+.neko-art{--cat-line:#bd8da6;--cat-fur:#fffaf6;position:relative;isolation:isolate;width:170px;height:115px;flex:none;margin:0 auto 11px;pointer-events:none}
+.neko-art span,.neko-art div{position:absolute;display:block;box-sizing:border-box}
+.neko-halo{left:19px;top:15px;width:132px;height:90px;border-radius:50%;background:radial-gradient(ellipse at 48% 38%,#fff7fa 12%,#f9e3ed 80%);opacity:.9}
+.neko-art-sniffing .neko-halo{background:radial-gradient(ellipse at 48% 38%,#faf7ff 12%,#eae1f7 80%)}
+.neko-shadow{left:35px;bottom:6px;width:103px;height:10px;border-radius:50%;background:#dcc4d430;filter:blur(1px)}
+.neko-cat{left:45px;top:30px;width:80px;height:64px;transform-origin:50% 100%;z-index:2}
+.neko-ear{top:-9px;width:26px;height:33px;background:var(--cat-fur);border:2px solid var(--cat-line);border-radius:7px 15px 3px 3px}
+.neko-ear-left{left:3px;transform:rotate(-20deg)}.neko-ear-right{right:3px;transform:rotate(20deg);border-radius:15px 7px 3px 3px}
+.neko-ear:before{content:"";position:absolute;inset:6px 5px 7px;background:#f2bfd0;border-radius:4px 8px 2px 2px}
+.neko-ear-right:before{border-radius:8px 4px 2px 2px}
+.neko-face{inset:0;border:2px solid var(--cat-line);border-radius:43% 43% 46% 46%;background:var(--cat-fur);box-shadow:0 3px 0 #e5c8d51a}
+.neko-face:before,.neko-face:after{content:"";position:absolute;top:38px;width:11px;height:1px;background:#cea2b7;box-shadow:0 5px 0 #cea2b7}
+.neko-face:before{left:-6px;transform:rotate(9deg)}.neko-face:after{right:-6px;transform:rotate(-9deg)}
+.neko-gaze{left:19px;top:23px;width:38px;height:11px}
+.neko-eye{top:0;width:7px;height:10px;border-radius:50%;background:#71566b;transform-origin:center 65%;animation:neko-blink 4.6s ease-in-out infinite}
+.neko-eye:first-child{left:0}.neko-eye:last-child{right:0}
+.neko-eye:before{content:"";position:absolute;left:1px;top:2px;width:2px;height:3px;border-radius:50%;background:#fffafc}
+.neko-blush{top:36px;width:13px;height:7px;border-radius:50%;background:#f4c7d2;opacity:.8}
+.neko-blush-left{left:7px}.neko-blush-right{right:7px}
+.neko-nose{left:34px;top:35px;width:8px;height:5px;border-radius:45% 45% 60% 60%;background:#c78ba2}
+.neko-mouth{left:29px;top:39px;width:18px;height:8px}
+.neko-mouth:before,.neko-mouth:after{content:"";position:absolute;top:0;width:9px;height:7px;border:1.5px solid #ac7e98;border-top:0;border-radius:0 0 8px 8px}
+.neko-mouth:before{left:1px}.neko-mouth:after{right:0}
+.neko-ledge{left:22px;top:91px;width:126px;height:12px;border:1px solid #ead0de;border-radius:8px;background:linear-gradient(#fffafd,#f8eaf1);z-index:3;box-shadow:0 3px 7px #bb90a30c}
+.neko-paw{top:87px;width:19px;height:13px;background:var(--cat-fur);border:1.5px solid var(--cat-line);border-radius:8px 8px 7px 7px;z-index:4}
+.neko-paw:before{content:"";position:absolute;left:5px;top:6px;width:1px;height:3px;background:#dfb6c7;box-shadow:5px 0 0 #dfb6c7}
+.neko-paw-left{left:54px}.neko-paw-right{right:54px}
+.neko-play-bubble{left:125px;top:12px;width:31px;height:28px;border:1.5px solid #d5a5bd;border-radius:10px;background:#fffafd;box-shadow:0 3px 9px #bc79991a;z-index:5;animation:neko-bubble 3.8s ease-in-out infinite}
+.neko-play-bubble:after{content:"";position:absolute;bottom:-4px;left:7px;width:7px;height:7px;border-bottom:1.5px solid #d5a5bd;border-right:1.5px solid #d5a5bd;background:#fffafd;transform:rotate(45deg)}
+.neko-play-icon{left:11px;top:7px;width:0;height:0;border-top:6px solid transparent;border-bottom:6px solid transparent;border-left:8px solid #c8799d}
+.neko-spark{width:9px;height:9px;z-index:1;animation:neko-twinkle 3.8s ease-in-out infinite}
+.neko-spark:before,.neko-spark:after{content:"";position:absolute;background:#d9aec6;border-radius:2px}
+.neko-spark:before{left:4px;top:0;width:2px;height:10px}.neko-spark:after{left:0;top:4px;width:10px;height:2px}
+.neko-spark-one{left:25px;top:35px}.neko-spark-two{right:23px;top:70px;transform:scale(.65);animation-delay:-1.8s}
+.neko-art-waiting .neko-cat{animation:neko-peek 4.6s ease-in-out infinite}
+.neko-art-waiting .neko-paw-right{animation:neko-paw-pat 4.6s ease-in-out infinite}
+.neko-art-sniffing{--cat-line:#a793bd}
+.neko-art-sniffing .neko-cat{animation:neko-search-head 3.8s ease-in-out infinite}
+.neko-art-sniffing .neko-gaze{animation:neko-search-eyes 3.8s ease-in-out infinite}
+.neko-art-sniffing .neko-ear:before{background:#e3c6e7}.neko-art-sniffing .neko-ledge{border-color:#ddd1eb;background:linear-gradient(#fefbff,#eee7f7)}
+.neko-art-sniffing .neko-spark:before,.neko-art-sniffing .neko-spark:after{background:#c3afd9}
+.neko-orbit-ring{left:27px;top:16px;width:116px;height:72px;border:1px dashed #c8b5dc;border-radius:50%;opacity:.58;z-index:1}
+.neko-orbit-dot{left:0;top:0;offset-path:path("M 27 52 C 27 4,143 4,143 52 C 143 100,27 100,27 52 Z");offset-rotate:0deg;animation:neko-search-orbit 3.8s linear infinite;border-radius:50%;z-index:5}
+.neko-orbit-light{width:10px;height:10px;background:#fff9df;border:1.5px solid #d4a5cb;box-shadow:0 0 0 4px #e9c8ee66,0 0 13px 4px #dbb9e866}
+.neko-orbit-trail-one{width:5px;height:5px;background:#d4afdf;opacity:.65;animation-delay:-3.62s}
+.neko-orbit-trail-two{width:3px;height:3px;background:#cbb4e0;opacity:.4;animation-delay:-3.44s}
+@keyframes neko-peek{0%,100%{transform:translateY(7px) rotate(-2deg)}25%,60%{transform:translateY(-2px) rotate(2deg)}75%{transform:translateY(1px) rotate(-1deg)}}
+@keyframes neko-blink{0%,40%,46%,85%,91%,100%{transform:scaleY(1)}43%,88%{transform:scaleY(.12)}}
+@keyframes neko-paw-pat{0%,30%,65%,100%{transform:translateY(0) rotate(0)}42%,55%{transform:translateY(-3px) rotate(7deg)}}
+@keyframes neko-bubble{0%,100%{transform:translateY(0) rotate(2deg)}50%{transform:translateY(-6px) rotate(-4deg)}}
+@keyframes neko-twinkle{0%,100%{opacity:.4}50%{opacity:.95}}
+@keyframes neko-search-head{0%,100%{transform:rotate(-5deg)}25%{transform:translateY(-2px) rotate(-1deg)}50%{transform:rotate(5deg)}75%{transform:translateY(2px) rotate(1deg)}}
+@keyframes neko-search-eyes{0%,100%{transform:translate(-4px,0)}25%{transform:translate(0,-3px)}50%{transform:translate(4px,0)}75%{transform:translate(0,2px)}}
+@keyframes neko-search-orbit{to{offset-distance:100%}}
+.app-container[data-art-paused="true"] .neko-art *,.app-container[data-art-paused="true"] .neko-art *:before,.app-container[data-art-paused="true"] .neko-art *:after,.app-container[data-art-paused="true"] .status-radar{animation-play-state:paused!important}
+@media(prefers-reduced-motion:reduce){.neko-art *,.neko-art *:before,.neko-art *:after{animation:none!important;transition:none!important}.neko-art-waiting .neko-cat{transform:translateY(-1px)}.neko-orbit-trail-one{offset-distance:95%}.neko-orbit-trail-two{offset-distance:90%}}
