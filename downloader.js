@@ -104,56 +104,110 @@ document.addEventListener("DOMContentLoaded", async () => {
     return out;
   }
 
-  // 按字节范围拉取；服务器若无视 Range 返回 200 全量，则本地切片
+  // 每次等待网络数据最多 30 秒；本地写盘背压不计入网络超时。
+  const NETWORK_IDLE_MS = 30000;
+  async function readResponse(url, headers, signal, telemetry) {
+    throwIfAborted(signal);
+    const request = new AbortController();
+    let timer = null;
+    let timedOut = false;
+    let reader = null;
+    let complete = false;
+    const clearDeadline = () => { clearTimeout(timer); timer = null; };
+    const armDeadline = () => {
+      clearDeadline();
+      timer = setTimeout(() => { timedOut = true; request.abort(); }, NETWORK_IDLE_MS);
+    };
+    const cancel = () => request.abort();
+    if (signal) signal.addEventListener("abort", cancel, { once: true });
+    try {
+      armDeadline();
+      const res = await fetch(url, { headers, signal: request.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      let buffer;
+      if (res.body && typeof res.body.getReader === "function") {
+        reader = res.body.getReader();
+        const chunks = [];
+        let length = 0;
+        while (true) {
+          clearDeadline();
+          throwIfAborted(signal);
+          if (telemetry) await telemetry.waitForCapacity();
+          armDeadline();
+          const { done, value } = await reader.read();
+          clearDeadline();
+          if (done) break;
+          if (telemetry) telemetry.bytes(value.byteLength);
+          chunks.push(value);
+          length += value.byteLength;
+        }
+        const combined = new Uint8Array(length);
+        let offset = 0;
+        for (const chunk of chunks) { combined.set(chunk, offset); offset += chunk.byteLength; }
+        buffer = combined.buffer;
+      } else {
+        if (telemetry) telemetry.unmeasurable();
+        armDeadline();
+        buffer = await res.arrayBuffer();
+        if (telemetry) telemetry.bytes(buffer.byteLength);
+      }
+      throwIfAborted(signal);
+      if (timedOut) throw new Error("Network timeout");
+      complete = true;
+      return { res, buffer };
+    } catch (error) {
+      if (signal?.aborted) throw abortError();
+      if (timedOut) {
+        const timeout = new Error("网络请求连续 30 秒未收到数据，可重试或取消");
+        timeout.name = "TimeoutError";
+        throw timeout;
+      }
+      throw error;
+    } finally {
+      clearDeadline();
+      if (signal) signal.removeEventListener("abort", cancel);
+      if (!complete) request.abort();
+      if (reader) {
+        if (!complete) { try { await reader.cancel(); } catch (_) {} }
+        reader.releaseLock();
+      }
+    }
+  }
+
+  // 接受合法 206，或从足够长的 200 全量响应中切出所需范围。
+  // 长度/范围不符必须进入重试，不能将错误字节交给写盘端。
   async function fetchBytes(url, byteRange, signal, telemetry) {
     const headers = {};
+    let end;
     if (byteRange) {
-      headers.Range = `bytes=${byteRange.offset}-${byteRange.offset + byteRange.length - 1}`;
+      const { offset, length } = byteRange;
+      end = offset + length - 1;
+      if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length <= 0 || !Number.isSafeInteger(end)) {
+        throw new Error("清单字节范围无效");
+      }
+      headers.Range = `bytes=${offset}-${end}`;
     }
     let received = false;
     if (telemetry) telemetry.start();
     try {
-      const res = await fetch(url, { headers, signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      let buf;
-      if (telemetry && res.body && typeof res.body.getReader === "function") {
-        const reader = res.body.getReader();
-        const chunks = [];
-        let length = 0;
-        try {
-          while (true) {
-            throwIfAborted(signal);
-            await telemetry.waitForCapacity();
-            const { done, value } = await reader.read();
-            if (done) break;
-            // Measure actual bytes as they arrive, before the segment finishes.
-            // Retries count the bytes actually received again, not prior bytes.
-            telemetry.bytes(value.byteLength);
-            chunks.push(value);
-            length += value.byteLength;
+      const { res, buffer } = await readResponse(url, headers, signal, telemetry);
+      let result = buffer;
+      if (byteRange) {
+        if (res.status === 206) {
+          const match = /^bytes (\d+)-(\d+)\/(\d+|\*)$/i.exec(res.headers.get("Content-Range") || "");
+          if (!match || Number(match[1]) !== byteRange.offset || Number(match[2]) !== end ||
+              (match[3] !== "*" && (!Number.isSafeInteger(Number(match[3])) || Number(match[3]) <= end)) ||
+              buffer.byteLength !== byteRange.length) {
+            throw new Error("服务器返回的 Content-Range 或字节数与请求范围不符");
           }
-        } finally {
-          reader.releaseLock();
+        } else if (res.status === 200 && buffer.byteLength > end) {
+          result = buffer.slice(byteRange.offset, end + 1);
+        } else {
+          throw new Error(`服务器未返回完整请求范围：需要 ${byteRange.offset}-${end}，收到 ${buffer.byteLength} 字节（HTTP ${res.status}）`);
         }
-        const combined = new Uint8Array(length);
-        let offset = 0;
-        for (const chunk of chunks) {
-          combined.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
-        buf = combined.buffer;
-      } else {
-        // Compatibility fallback only. Without chunk arrival times this body
-        // cannot provide a valid throughput observation for the controller.
-        if (telemetry) telemetry.unmeasurable();
-        buf = await res.arrayBuffer();
-        if (telemetry) telemetry.bytes(buf.byteLength);
       }
       received = true;
-      if (byteRange && res.status === 200 && buf.byteLength > byteRange.length) {
-        return buf.slice(byteRange.offset, byteRange.offset + byteRange.length);
-      }
-      return buf;
+      return result;
     } finally {
       if (telemetry) telemetry.end({ discarded: !received });
     }
@@ -161,9 +215,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // ---------- 密钥缓存 ----------
   const keyCache = new Map(); // keyUri -> { bytes, cryptoKey }
-  async function getKey(keyUri) {
+  async function getKey(keyUri, signal) {
     if (keyCache.has(keyUri)) return keyCache.get(keyUri);
-    const bytes = await fetchBytes(keyUri, null);
+    const bytes = await fetchBytes(keyUri, null, signal);
     if (bytes.byteLength !== 16) {
       throw new Error(`密钥长度异常（${bytes.byteLength} 字节，应为 16）：${keyUri}`);
     }
@@ -189,8 +243,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     return key;
   }
 
-  async function prepareKey(key) {
-    if (key && !key.keyEntry) key.keyEntry = await getKey(key.uri);
+  async function prepareKey(key, signal) {
+    if (key && !key.keyEntry) key.keyEntry = await getKey(key.uri, signal);
     return key;
   }
 
@@ -213,17 +267,16 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // 返回 { segments: [{url, key, iv, mapId, mapUri, byteRange, sequence, discontinuity}],
   //         initSegments: Map(mapId -> ArrayBuffer), isFmp4, variantSelections }
-  async function planPlaylist(targetUrl, externalAudio = [], ancestors = new Set()) {
+  async function planPlaylist(targetUrl, externalAudio = [], ancestors = new Set(), signal) {
     if (ancestors.has(targetUrl)) throw new Error(`清单引用循环：${targetUrl}`);
-    const resp = await fetch(targetUrl);
-    if (!resp.ok) throw new Error(`拉取清单失败 HTTP ${resp.status}：${targetUrl}`);
+    const { res: resp, buffer } = await readResponse(targetUrl, {}, signal);
     // 相对 URI 属于最终收到的清单地址；重定向可能同时改变域名和目录。
     const playlistUrl = resp.url || targetUrl;
     if (ancestors.has(playlistUrl)) throw new Error(`清单引用循环：${playlistUrl}`);
     const path = new Set(ancestors);
     path.add(targetUrl);
     path.add(playlistUrl);
-    const text = await resp.text();
+    const text = new TextDecoder().decode(buffer);
     const lines = text.split(/\r?\n/).map((l) => l.trim());
     if (lines[0] !== "#EXTM3U") {
       throw new Error(`响应不是有效的 HLS 清单，缺少 #EXTM3U 文件头：${playlistUrl}`);
@@ -270,7 +323,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           }));
         statusMsg.textContent = `检测到 ${variants.length} 档码率，正在检查第 ${index + 1} 档（${variant.bandwidth} bps）... (✧ω✧)`;
         try {
-          const selected = await planPlaylist(variant.uri, [...externalAudio, ...selectedAudio], path);
+          const selected = await planPlaylist(variant.uri, [...externalAudio, ...selectedAudio], path, signal);
           if (selected.segments.length === 0) throw new Error("清单中没有可下载的分片");
           return {
             ...selected,
@@ -280,6 +333,7 @@ document.addEventListener("DOMContentLoaded", async () => {
             }, ...selected.variantSelections]
           };
         } catch (error) {
+          throwIfAborted(signal);
           failures.push({ url: variant.uri, bandwidth: variant.bandwidth, reason: error.message });
         }
       }
@@ -349,7 +403,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           if (mapKey && !mapKey.ivHex) {
             throw new Error("AES-128 加密初始化段缺少显式 IV，无法解密该初始化段");
           }
-          await prepareKey(mapKey);
+          await prepareKey(mapKey, signal);
           const mapIv = mapKey ? hexToBytes(mapKey.ivHex) : null;
           // URI 相同不代表初始化段相同：范围、密钥和 IV 都参与身份判断。
           curMap.id = JSON.stringify([
@@ -357,11 +411,11 @@ document.addEventListener("DOMContentLoaded", async () => {
             mapKey ? [mapKey.method, mapKey.uri, [...new Uint8Array(mapKey.keyEntry.bytes)], [...mapIv]] : null
           ]);
           if (!initSegments.has(curMap.id)) {
-            const raw = await fetchBytes(curMap.uri, curMap.byteRange);
+            const raw = await fetchBytes(curMap.uri, curMap.byteRange, signal);
             initSegments.set(curMap.id, await decryptBytes(raw, mapKey, mapIv, "初始化段"));
           }
         }
-        const key = await prepareKey(selectKey(keyFormats, `分片 #${sequence}`));
+        const key = await prepareKey(selectKey(keyFormats, `分片 #${sequence}`), signal);
         const iv = key ? (key.ivHex ? hexToBytes(key.ivHex) : sequenceToIv(sequence)) : null;
         segments.push({ url, key, iv, mapId: curMap && curMap.id, mapUri: curMap && curMap.uri, byteRange, sequence, discontinuity });
         if (discontinuity) discontinuity = false;
@@ -389,41 +443,70 @@ document.addEventListener("DOMContentLoaded", async () => {
     return await decryptBytes(buffer, seg.key, seg.iv, `分片 #${seg.sequence}`);
   }
 
-  // ---------- 初始解析 ----------
-  statusMsg.textContent = "正在拉取 m3u8 播放清单喵... (◕ᴗ◕✿)";
-  try {
-    plan = await planPlaylist(m3u8Url);
-  } catch (err) {
-    console.error(err);
-    statusMsg.textContent = "解析清单失败: " + err.message + "，请尝试复制直链用外部工具下载喵~";
+  // 初始解析、取消和重试共享同一生命周期；控制按钮在请求前注册。
+  async function loadPlan() {
+    if (isDownloading) return;
+    isDownloading = true;
+    const controller = new AbortController();
+    activeController = controller;
+    plan = null;
+    keyCache.clear();
     btnStart.disabled = true;
-    plan = { segments: [], initSegments: new Map(), isFmp4: false, externalAudio: [], variantSelections: [] };
-  }
-
-  if (plan.segments.length > 0) {
-    const encNote = plan.segments.some((s) => s.key) ? "（AES-128 加密，已备好密钥解密）" : "";
-    const mapNote = plan.isFmp4 ? "（fMP4）" : "";
-    const selectionNotes = plan.variantSelections.map((selection) => {
-      const failures = selection.failures.map((failure) => `${failure.bandwidth} bps：${failure.reason}`).join("；");
-      return `已选 ${selection.bandwidth} bps（第 ${selection.rank}/${selection.total} 档）${failures ? `，此前候选失败：${failures}` : ""}`;
-    }).join("；");
-    // 保留在清单信息中，下载进度和最终保存提示不会覆盖所选档位及失败原因。
-    segmentVal.textContent = `共解析到 ${plan.segments.length} 个切片${encNote}${mapNote}${selectionNotes ? `；${selectionNotes}` : ""}`;
-    statusMsg.textContent = `(=^･ω･^=) 切片清单已准备完毕，共 ${plan.segments.length} 个分段，快点击下载吧！`;
-    if (plan.isFmp4 && plan.initSegments.size === 0) {
-      statusMsg.textContent += " ⚠️ 未检测到初始化段（#EXT-X-MAP），合并后可能无法播放。";
+    btnCancel.hidden = false;
+    btnCancel.disabled = false;
+    audioNotice.hidden = true;
+    audioUrls.value = "";
+    segmentVal.textContent = "正在解析…";
+    statusMsg.textContent = "正在拉取 m3u8 播放清单喵... (◕ᴗ◕✿)";
+    try {
+      const candidate = await planPlaylist(m3u8Url, [], new Set(), controller.signal);
+      throwIfAborted(controller.signal);
+      if (!candidate.segments.length) throw new Error("清单中没有可下载的分片");
+      plan = candidate;
+      btnStart.textContent = "开始下载";
+      renderPlan();
+    } catch (error) {
+      plan = null;
+      segmentVal.textContent = "清单尚未准备完成";
+      statusMsg.textContent = controller.signal.aborted ? "已取消清单加载，可重新解析。"
+        : "解析清单失败：" + error.message + "；可重试、复制地址或保存原始清单。";
+      btnStart.textContent = "重新解析清单";
+    } finally {
+      activeController = null;
+      isDownloading = false;
+      btnStart.disabled = false;
+      btnCancel.hidden = true;
+      btnCancel.disabled = true;
     }
-    btnStart.disabled = false;
-  } else {
-    segmentVal.textContent = "未能解析出切片列表 (可能是跨域或密钥限制)";
-    btnStart.disabled = true;
   }
 
-  if (plan.externalAudio.length > 0) {
-    audioNotice.hidden = false;
-    audioNoticeText.textContent = `此视频使用独立音轨（${plan.externalAudio.map((track) => track.name).join("、")}）。本页仅保存所选视频流，不会合并这些音轨，生成文件可能没有声音。可复制音轨清单或原始 m3u8 地址，交给支持音视频合并的工具。`;
-    audioUrls.value = plan.externalAudio.map((track) => track.url).join("\n");
-    btnStart.textContent = "下载视频（不合并独立音轨）";
+  function renderPlan() {
+    if (plan.segments.length > 0) {
+      const encNote = plan.segments.some((s) => s.key) ? "（AES-128 加密，已备好密钥解密）" : "";
+      const mapNote = plan.isFmp4 ? "（fMP4）" : "";
+      const selectionNotes = plan.variantSelections.map((selection) => {
+        const failures = selection.failures.map((failure) => `${failure.bandwidth} bps：${failure.reason}`).join("；");
+        return `已选 ${selection.bandwidth} bps（第 ${selection.rank}/${selection.total} 档）${failures ? `，此前候选失败：${failures}` : ""}`;
+      }).join("；");
+      // 保留在清单信息中，下载进度和最终保存提示不会覆盖所选档位及失败原因。
+      segmentVal.textContent = `共解析到 ${plan.segments.length} 个切片${encNote}${mapNote}${selectionNotes ? `；${selectionNotes}` : ""}`;
+      statusMsg.textContent = `(=^･ω･^=) 切片清单已准备完毕，共 ${plan.segments.length} 个分段，快点击下载吧！`;
+      if (plan.isFmp4 && plan.initSegments.size === 0) {
+        statusMsg.textContent += " ⚠️ 未检测到初始化段（#EXT-X-MAP），合并后可能无法播放。";
+      }
+
+    } else {
+      segmentVal.textContent = "未能解析出切片列表 (可能是跨域或密钥限制)";
+
+    }
+
+    if (plan.externalAudio.length > 0) {
+      audioNotice.hidden = false;
+      audioNoticeText.textContent = `此视频使用独立音轨（${plan.externalAudio.map((track) => track.name).join("、")}）。本页仅保存所选视频流，不会合并这些音轨，生成文件可能没有声音。可复制音轨清单或原始 m3u8 地址，交给支持音视频合并的工具。`;
+      audioUrls.value = plan.externalAudio.map((track) => track.url).join("\n");
+      btnStart.textContent = "下载视频（不合并独立音轨）";
+    }
+
   }
 
   btnCopyAudio.addEventListener("click", async () => {
@@ -463,7 +546,8 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // 并发目标只由实际并发与总吞吐的测量曲线计算；网络补位与按序写盘各自推进。
   btnStart.addEventListener("click", async () => {
-    if (isDownloading || !plan || plan.segments.length === 0) return;
+    if (isDownloading) return;
+    if (!plan) { await loadPlan(); return; }
     isDownloading = true;
     const controller = new AbortController();
     const signal = controller.signal;
@@ -580,7 +664,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
       throwIfAborted(signal);
       if (failed.length === total) {
-        throw new Error("全部切片下载失败，未保存视频文件。请检查网络或换线路重试。");
+        throw new Error(`全部切片下载失败，未保存视频文件。首个失败原因：${failed[0].error}；可重试下载。`);
       }
       // 提交文件后无法撤销，所以提交阶段关闭取消按钮。
       btnCancel.disabled = true;
@@ -641,4 +725,6 @@ document.addEventListener("DOMContentLoaded", async () => {
       isDownloading = false;
     }
   });
+
+  await loadPlan();
 });

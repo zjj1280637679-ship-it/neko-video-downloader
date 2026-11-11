@@ -63,7 +63,11 @@ async function boot(options = {}) {
     state.events.push(`fetch:${url}`);
     if (options.fetch) {
       const response = await options.fetch(url, init, state);
-      if (response !== undefined) return response;
+      if (response !== undefined) {
+        // Redirect fixtures use plain objects to provide a final URL.
+        if (response.text && !response.arrayBuffer) response.arrayBuffer = async () => new TextEncoder().encode(await response.text()).buffer;
+        return response;
+      }
     }
     if (Object.hasOwn(routes, url)) return new Response(routes[url]);
     const index = /^s(\d+)\.ts$/.exec(url.slice(base.length));
@@ -82,12 +86,12 @@ async function boot(options = {}) {
   TestURL.revokeObjectURL = () => {};
   const context = vm.createContext({
     document, window, URLSearchParams, URL: TestURL,
-    Uint8Array, ArrayBuffer, Map, Blob, AbortController, crypto: webcrypto, fetch,
+    Uint8Array, ArrayBuffer, Map, Blob, AbortController, TextDecoder, crypto: webcrypto, fetch,
     navigator: { clipboard: { async writeText(value) { state.copied.push(value); } } },
     chrome: { downloads: { download() {} } },
     console: { warn() {}, error() {} },
     performance, setInterval, clearInterval,
-    setTimeout(fn, ms) { return ms >= 60000 ? null : setTimeout(fn, 0); },
+    setTimeout(fn, ms) { return ms >= 60000 ? null : setTimeout(fn, ms === 30000 ? (options.idleTimeoutMs ?? ms) : 0); },
     clearTimeout
   });
   for (const file of ["adaptive-concurrency.js", "adaptive-download.js"]) {
@@ -100,9 +104,10 @@ async function boot(options = {}) {
     };
   }
   vm.runInContext(source, context);
-  await onReady();
+  const ready = onReady();
+  if (!options.deferReady) await ready;
   return {
-    state, element,
+    state, element, ready,
     async click(id) {
       const target = element(id);
       assert.equal(target.disabled, false, `${id} should be enabled`);
@@ -312,7 +317,7 @@ test("MAP transitions and byte ranges preserve init bytes, implicit offsets and 
     fetch: async (url, { headers }) => {
       if (url.endsWith("init-b.bin")) {
         assert.equal(headers.Range, "bytes=2-2");
-        return new Response(bytes(22), { status: 206 });
+        return new Response(bytes(22), { status: 206, headers: { "Content-Range": "bytes 2-2/3" } });
       }
       return undefined;
     }
@@ -394,7 +399,8 @@ test("key capability is checked where it applies, without treating unknown encry
       const app = await boot({
         playlist: `#EXTM3U\n${prefix}#EXT-X-KEY:METHOD=AES-128,URI="vendor.key",KEYFORMAT="vendor.test"\n#EXTINF:1\ns0.ts\n#EXT-X-ENDLIST`
       });
-      assert.equal(app.element("btnStart").disabled, true);
+      assert.equal(app.element("btnStart").disabled, false);
+      assert.equal(app.element("btnStart").textContent, "重新解析清单");
       assert.match(app.element("statusMsg").textContent, /没有可用的密钥格式.*vendor\.test/);
       assert.equal(app.state.requests.length, 1);
       assert.equal(app.state.blobs.length, 0);
@@ -404,7 +410,8 @@ test("key capability is checked where it applies, without treating unknown encry
     const app = await boot({
       playlist: '#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI="sample.key"\n#EXTINF:1\ns0.ts\n#EXT-X-ENDLIST'
     });
-    assert.equal(app.element("btnStart").disabled, true);
+    assert.equal(app.element("btnStart").disabled, false);
+      assert.equal(app.element("btnStart").textContent, "重新解析清单");
     assert.match(app.element("statusMsg").textContent, /METHOD=SAMPLE-AES/);
     assert.equal(app.state.requests.length, 1);
   });
@@ -477,7 +484,8 @@ test("an encrypted MAP without explicit IV reports the missing condition and exp
   const app = await boot({
     playlist: '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n#EXT-X-MAP:URI="init.bin"\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:1\ns0.ts\n#EXT-X-ENDLIST'
   });
-  assert.equal(app.element("btnStart").disabled, true);
+  assert.equal(app.element("btnStart").disabled, false);
+      assert.equal(app.element("btnStart").textContent, "重新解析清单");
   assert.match(app.element("statusMsg").textContent, /初始化段缺少显式 IV/);
   assert.equal(app.state.requests.length, 1);
   assert.equal(app.state.blobs.length, 0);
@@ -578,7 +586,8 @@ test("all failed variants report every candidate rather than silently selecting 
     routes: { [`${base}empty.m3u8`]: "#EXTM3U\n#EXT-X-ENDLIST" },
     fetch: async (url) => url.endsWith("unavailable.m3u8") ? new Response("Not found", { status: 404 }) : undefined
   });
-  assert.equal(app.element("btnStart").disabled, true);
+  assert.equal(app.element("btnStart").disabled, false);
+      assert.equal(app.element("btnStart").textContent, "重新解析清单");
   assert.match(app.element("statusMsg").textContent, /全部 2 档码率均不可用/);
   assert.match(app.element("statusMsg").textContent, /900 bps：.*HTTP 404/);
   assert.match(app.element("statusMsg").textContent, /100 bps：清单中没有可下载的分片/);
@@ -608,7 +617,8 @@ test("invalid root responses report a missing HLS header without interpreting bo
   ]) {
     await t.test(name, async () => {
       const app = await boot({ playlist });
-      assert.equal(app.element("btnStart").disabled, true);
+      assert.equal(app.element("btnStart").disabled, false);
+      assert.equal(app.element("btnStart").textContent, "重新解析清单");
       assert.match(app.element("statusMsg").textContent, /响应不是有效的 HLS 清单，缺少 #EXTM3U 文件头/);
       assert.equal(app.state.requests.length, 1);
       assert.equal(app.state.blobs.length, 0);
@@ -628,7 +638,8 @@ test("master cycle detection recognizes redirect aliases and leaves acyclic nest
         text: async () => '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=900\nalias.m3u8'
       } : undefined
     });
-    assert.equal(app.element("btnStart").disabled, true);
+    assert.equal(app.element("btnStart").disabled, false);
+      assert.equal(app.element("btnStart").textContent, "重新解析清单");
     assert.match(app.element("statusMsg").textContent, /清单引用循环/);
     assert.equal(app.state.requests.length, 2);
   });
@@ -645,5 +656,105 @@ test("master cycle detection recognizes redirect aliases and leaves acyclic nest
     await app.click("btnStart");
     assert.deepEqual([...new Uint8Array(await app.state.blobs[0].arrayBuffer())], [1]);
     assert.equal(app.state.requests.filter((request) => request.url.endsWith(".m3u8")).length, 21);
+  });
+});
+
+function stalledFetch(signal) {
+  return new Promise((_resolve, reject) => {
+    const fail = () => reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+    if (signal.aborted) fail();
+    else signal.addEventListener('abort', fail, { once: true });
+  });
+}
+
+test('playlist loading keeps copy/cancel alive and can retry in the same page', async () => {
+  let stall = true;
+  const app = await boot({ deferReady: true,
+    fetch: (url, { signal }) => stall ? stalledFetch(signal) : undefined });
+  await app.click('btnCopyUrl');
+  assert.deepEqual(app.state.copied, [masterUrl]);
+  await app.click('btnCancel');
+  await app.ready;
+  assert.equal(app.state.requests[0].signal.aborted, true);
+  assert.match(app.element('statusMsg').textContent, /已取消清单加载/);
+  stall = false;
+  await app.click('btnStart'); // Reparse only, no surprise download.
+  assert.equal(app.state.requests.length, 2);
+  assert.equal(app.state.blobs.length, 0);
+  await app.click('btnStart');
+  assert.deepEqual([...new Uint8Array(await app.state.blobs[0].arrayBuffer())], [1]);
+});
+
+test('cancel reaches key/MAP preparation and does not fall through to another variant', async (t) => {
+  for (const stage of ['key.bin', 'init.bin']) await t.test(stage, async () => {
+    const reached = deferred();
+    const app = await boot({ deferReady: true,
+      playlist: '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=900\nhigh.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=100\nlow.m3u8',
+      routes: { [`${base}high.m3u8`]: stage === 'key.bin'
+        ? '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n#EXTINF:1\ns0.ts'
+        : '#EXTM3U\n#EXT-X-MAP:URI="init.bin"\n#EXTINF:1\ns0.ts' },
+      fetch: (url, { signal }) => {
+        if (url.endsWith(stage)) { reached.resolve(); return stalledFetch(signal); }
+      }
+    });
+    await reached.promise;
+    await app.click('btnCancel'); await app.ready;
+    assert.match(app.element('statusMsg').textContent, /已取消/);
+    assert.equal(app.state.requests.some(r => r.url.endsWith('low.m3u8')), false);
+    assert.equal(app.state.blobs.length, 0);
+  });
+});
+
+test('idle deadline covers both response headers and body then permits retry', async (t) => {
+  for (const stage of ['headers', 'body']) await t.test(stage, async () => {
+    const app = await boot({ idleTimeoutMs: 10,
+      fetch: (_url, { signal }) => stage === 'headers' ? stalledFetch(signal)
+        : new Response(new ReadableStream({ start(controller) {
+          signal.addEventListener('abort', () => controller.error(Object.assign(new Error('Aborted'), { name: 'AbortError' })), { once: true });
+        } }))
+    });
+    assert.match(app.element('statusMsg').textContent, /30 秒未收到数据/);
+    assert.equal(app.element('btnStart').textContent, '重新解析清单');
+    assert.equal(app.element('btnStart').disabled, false);
+    await app.click('btnCopyUrl');
+    assert.deepEqual(app.state.copied, [masterUrl]);
+  });
+});
+
+test('invalid Range bodies retry but cannot commit corrupt bytes', async (t) => {
+  const cases = [
+    ['short 200', 200, [1,2,3], {}],
+    ['length equals range but misses offset', 200, [1,2,3,4], {}],
+    ['short 206', 206, [1,2,3], { 'Content-Range': 'bytes 4-7/8' }],
+    ['wrong offset 206', 206, [1,2,3,4], { 'Content-Range': 'bytes 0-3/8' }],
+    ['missing Content-Range', 206, [1,2,3,4], {}],
+    ['invalid total', 206, [1,2,3,4], { 'Content-Range': 'bytes 4-7/7' }]
+  ];
+  for (const [name,status,body,headers] of cases) await t.test(name, async () => {
+    const {state,writer}=makeWriter();
+    const app=await boot({playlist:'#EXTM3U\n#EXT-X-BYTERANGE:4@4\n#EXTINF:1\nrange.ts\n#EXT-X-ENDLIST',
+      picker:async()=>({createWritable:async()=>writer}),
+      fetch:async url=>url.endsWith('range.ts')?new Response(bytes(...body),{status,headers}):undefined});
+    await app.click('btnStart');
+    assert.equal(app.state.requests.filter(r=>r.url.endsWith('range.ts')).length,3);
+    assert.deepEqual(state.writes,[]); assert.equal(state.closes,0); assert.equal(state.aborts,1);
+    assert.match(app.element('statusMsg').textContent,/全部切片下载失败/);
+  });
+});
+
+test('Range retry accepts a later valid 206 and valid full 200 is sliced exactly', async (t) => {
+  for (const full of [false,true]) await t.test(full?'full 200':'retry 206',async()=>{
+    let attempt=0;
+    const app=await boot({playlist:'#EXTM3U\n#EXT-X-BYTERANGE:4@4\n#EXTINF:1\nrange.ts\n#EXT-X-ENDLIST',
+      fetch:async url=>{
+        if(!url.endsWith('range.ts'))return;
+        attempt++;
+        if(full)return new Response(bytes(0,1,2,3,4,5,6,7));
+        return attempt===1 ? new Response(bytes(1,2,3)) : new Response(bytes(4,5,6,7),{status:206,headers:{'Content-Range':'bytes 4-7/8'}});
+      }});
+    await app.click('btnStart');
+    assert.deepEqual([...new Uint8Array(await app.state.blobs[0].arrayBuffer())],[4,5,6,7]);
+    assert.equal(attempt,full?1:2);
+    assert.match(app.element('statusMsg').textContent,/视频文件已保存/);
   });
 });
