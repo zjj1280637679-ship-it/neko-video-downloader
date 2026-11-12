@@ -1,52 +1,44 @@
 {
   "manifest_version": 3,
-  "name": "🌸 喵喵视频下载姬",
-  "version": "1.2.0",
-  "description": "超可爱的网页视频嗅探与下载神器，一键捕捉 MP4 与 HLS/m3u8 动漫视频喵~ (◕ᴗ◕✿)",
+  "name": "羊魔 · 视频收藏",
+  "version": "2.2.1",
+  "minimum_chrome_version": "116",
+  "description": "简洁的网页视频收藏助手。识别当前线路，下载直链与 AES-128 HLS 点播；解释来源、并发策略和保存结果。",
   "icons": {
-    "16": "icons/icon16.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
+    "16": "icons/yangmo-mascot.png",
+    "48": "icons/yangmo-mascot.png",
+    "128": "icons/yangmo-mascot.png"
   },
   "permissions": [
     "webRequest",
     "downloads",
     "storage",
-    "activeTab"
+    "activeTab",
+    "scripting",
+    "offscreen"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "http://*/*",
+    "https://*/*"
   ],
   "background": {
     "service_worker": "background.js"
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "🌸 喵喵视频下载姬 (点击查看视频)",
+    "default_title": "羊魔 · 视频收藏",
     "default_icon": {
-      "16": "icons/icon16.png",
-      "48": "icons/icon48.png",
-      "128": "icons/icon128.png"
+      "16": "icons/yangmo-mascot.png",
+      "48": "icons/yangmo-mascot.png",
+      "128": "icons/yangmo-mascot.png"
     }
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": ["http://*/*", "https://*/*"],
       "js": ["content.js"],
       "run_at": "document_idle",
       "all_frames": true
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "downloader.html",
-        "downloader.js",
-        "adaptive-concurrency.js",
-        "adaptive-download.js",
-        "icons/*"
-      ],
-      "matches": ["<all_urls>"]
     }
   ]
 }

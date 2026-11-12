@@ -1,443 +1,468 @@
-// 🌸 喵喵视频下载姬 - Background Service Worker (防碎片智能过滤版)
-
-// 缓存每个标签页的媒体列表
-let tabMediaMap = new Map();
-// 缓存网页标题
-let tabTitleMap = new Map();
-// 缓存标签页的视频多帧截屏
-let tabFramesMap = new Map();
-// 播放器所在文档，供 iframe 抓拍和原图读取使用。
-let tabPlayersMap = new Map();
-// 记录标签页已侦测到的切片计数
-let tabChunkCountMap = new Map();
-
-// ---------- MV3 service worker 内存态持久化 ----------
-// service worker 闲置约 30 秒即被系统回收，内存里的 Map 会丢；写透到 chrome.storage.session，启动时恢复。
+// 喵喵视频下载姬 — MV3 media capture. Downloads belong to the trusted manager.
+if (typeof importScripts === 'function') importScripts('domain/media.js', 'download-manager.js');
+const mediaRules = globalThis.NekoMedia;
 const SESSION_KEYS = {
-  media: "neko_tabMedia",
-  titles: "neko_tabTitles",
-  frames: "neko_tabFrames",
-  chunks: "neko_tabChunks",
-  players: "neko_tabPlayers"
+  media: "neko_tabMedia", titles: "neko_tabTitles",
+  chunks: "neko_tabChunks", playback: "neko_tabPlayback", documents: "neko_tabDocuments",
+  retired: "neko_retiredDocuments", networkRetired: "neko_retiredNetworkDocuments", parents: "neko_frameParents",
+  fragments: "neko_fragments"
 };
-
+let tabMediaMap = new Map();
+let tabTitleMap = new Map();
+let tabChunkCountMap = new Map();
+let tabPlaybackMap = new Map();
+let retiredDocuments = new Map();
+let frameParents = new Map();
+let tabDocuments = new Map();
+let retiredNetworkDocuments = new Map();
+let fragmentMediaMap = new Map();
+const MAX_MEDIA = 60;
+const mediaRefreshes = new Map();
+let saveTimer;
 let saveChain = Promise.resolve();
+
+// Mutations wait for hydration so a cold worker cannot overwrite new captures.
+const restorePromise = chrome.storage.session.get(Object.values(SESSION_KEYS)).then(async data => {
+  const restore = key => new Map(Array.isArray(data[key]) ? data[key] : []);
+  tabMediaMap = restore(SESSION_KEYS.media);
+  const hasLegacyFrames = [...tabMediaMap.values()].some(list => list.some(item => Object.hasOwn(item, 'frames')));
+  tabMediaMap = new Map([...tabMediaMap].map(([id, list]) => [id, list.map(({ frames, ...item }) => item)]));
+  tabTitleMap = restore(SESSION_KEYS.titles);
+  tabChunkCountMap = restore(SESSION_KEYS.chunks);
+  tabPlaybackMap = restore(SESSION_KEYS.playback);
+  tabDocuments = restore(SESSION_KEYS.documents);
+  frameParents = restore(SESSION_KEYS.parents);
+  retiredDocuments = new Map([...restore(SESSION_KEYS.retired)].map(([key, values]) => [key, new Set(values)]));
+  retiredNetworkDocuments = new Map([...restore(SESSION_KEYS.networkRetired)].map(([key, values]) => [key, new Set(values)]));
+  fragmentMediaMap = new Map([...restore(SESSION_KEYS.fragments)].map(([key, values]) => [key, new Map(values)]));
+  // Older versions saved screenshots in both places. Remove those image bytes
+  // without discarding media evidence or titles still used for filenames.
+  const cleanup = await Promise.allSettled([
+    chrome.storage.session.remove('neko_tabFrames'),
+    hasLegacyFrames ? chrome.storage.session.set({ [SESSION_KEYS.media]: [...tabMediaMap] }) : undefined
+  ]);
+  for (const result of cleanup) if (result.status === 'rejected') console.warn("Neko preview cleanup:", result.reason.message);
+}).catch(error => console.warn("Neko session restore:", error.message));
+let eventQueue = restorePromise;
+function enqueue(action) {
+  const result = eventQueue.then(action);
+  eventQueue = result.catch(error => console.warn("Neko capture:", error.message));
+  return result;
+}
 function scheduleSave() {
-  // 原图不经过 session；缩略图只存一份，写入按顺序完成。
-  const snapshot = {
-    [SESSION_KEYS.media]: [...tabMediaMap.entries()].map(([id, items]) => [id, items.map(({ frames, ...item }) => item)]),
-    [SESSION_KEYS.titles]: [...tabTitleMap.entries()],
-    [SESSION_KEYS.frames]: [...tabFramesMap.entries()],
-    [SESSION_KEYS.chunks]: [...tabChunkCountMap.entries()],
-    [SESSION_KEYS.players]: [...tabPlayersMap.entries()]
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    const snapshot = {
+      [SESSION_KEYS.media]: [...tabMediaMap],
+      [SESSION_KEYS.titles]: [...tabTitleMap],
+      [SESSION_KEYS.chunks]: [...tabChunkCountMap], [SESSION_KEYS.playback]: [...tabPlaybackMap],
+      [SESSION_KEYS.documents]: [...tabDocuments], [SESSION_KEYS.parents]: [...frameParents],
+      [SESSION_KEYS.retired]: [...retiredDocuments].map(([key, values]) => [key, [...values]]),
+      [SESSION_KEYS.networkRetired]: [...retiredNetworkDocuments].map(([key, values]) => [key, [...values]]),
+      [SESSION_KEYS.fragments]: [...fragmentMediaMap].map(([key, values]) => [key, [...values]])
+    };
+    saveChain = saveChain.then(() => chrome.storage.session.set(snapshot))
+      .catch(error => console.warn("Neko session save:", error.message));
+  }, 150);
+}
+function notify(message) { chrome.runtime.sendMessage(message).catch(() => {}); }
+function validTab(tabId) { return Number.isInteger(tabId) && tabId >= 0; }
+function validFrame(frameId) { return Number.isInteger(frameId) && frameId >= 0; }
+function mediaSnapshot(tabId) {
+  const list = (tabMediaMap.get(tabId) || []).map(item => ({ ...item }));
+  return { media: list, chunkCount: tabChunkCountMap.get(tabId) || 0, ...captureStatus(tabId, list) };
+}
+function invalidateRefresh(tabId) {
+  const refresh = mediaRefreshes.get(tabId);
+  if (refresh) refresh.invalidated = true;
+}
+function retireRefreshDocuments(tabId, refresh) {
+  // A result belongs to the old page only when its browser documentId was
+  // observed before navigation. An injection may instead land on the new page;
+  // never erase that document merely because the older refresh was invalidated.
+  const stale = (refresh.results || []).filter(result => typeof result.documentId === 'string' &&
+    refresh.documents.has(result.documentId));
+  if (!stale.length) return;
+  const ids = new Set(stale.map(result => result.documentId));
+  const frames = tabPlaybackMap.get(tabId) || {}, documents = tabDocuments.get(tabId) || {};
+  for (const result of stale) {
+    retireNetworkDocument(tabId, result.documentId);
+    if (validFrame(result.frameId) && typeof result.result?.documentToken === 'string') {
+      retireDocument(tabId, result.frameId, { documentKey: `${result.documentId}:${result.result.documentToken}` });
+    }
+  }
+  let changed = false;
+  for (const [id, state] of Object.entries(frames)) {
+    if (stale.some(result => state.documentKey?.startsWith(`${result.documentId}:`))) {
+      retireDocument(tabId, id, state); delete frames[id]; changed = true;
+      if (id === '0' && ids.has(documents[id])) tabTitleMap.delete(tabId);
+    }
+  }
+  for (const [id, documentId] of Object.entries(documents)) if (ids.has(documentId)) delete documents[id];
+  const retain = item => {
+    const contexts = (item.contexts || [{ frameId: item.frameId, documentId: item.documentId || '' }])
+      .filter(context => !ids.has(context.documentId));
+    if (contexts.length === (item.contexts?.length ?? 1)) return item;
+    changed = true;
+    return contexts.length ? { ...item, contexts, frameId: contexts[0].frameId, documentId: contexts[0].documentId } : null;
   };
-  saveChain = saveChain.then(() => chrome.storage.session.set(snapshot)).catch((err) => console.warn("媒体状态保存失败", err));
-}
-
-let restorePromise = null;
-function restoreState() {
-  if (restorePromise) return restorePromise;
-  restorePromise = chrome.storage.session
-    .get(Object.values(SESSION_KEYS))
-    .then((data) => {
-      if (data[SESSION_KEYS.media]) tabMediaMap = new Map(data[SESSION_KEYS.media]);
-      if (data[SESSION_KEYS.titles]) tabTitleMap = new Map(data[SESSION_KEYS.titles]);
-      if (data[SESSION_KEYS.frames]) tabFramesMap = new Map(data[SESSION_KEYS.frames]);
-      if (data[SESSION_KEYS.chunks]) tabChunkCountMap = new Map(data[SESSION_KEYS.chunks]);
-      if (data[SESSION_KEYS.players]) tabPlayersMap = new Map(data[SESSION_KEYS.players]);
-    })
-    .catch(() => {});
-  return restorePromise;
-}
-restoreState();
-
-function whenReady(action) {
-  return restoreState().then(action).catch((err) => console.warn("媒体状态处理失败", err));
-}
-
-function framesForMedia(tabId, item) {
-  const frames = tabFramesMap.get(tabId) || [];
-  const exact = frames.filter((frame) => frame.sourceUrl === item.url);
-  if (exact.length) return exact.map((frame) => ({ ...frame, sourceMatched: true }));
-  if (!item.isM3U8) return [];
-  const players = (tabPlayersMap.get(tabId) || []).filter((player) =>
-    (!player.sourceUrl || player.sourceUrl.startsWith("blob:")) && playerBelongsToMedia(player, item));
-  if (players.length !== 1) return [];
-  return framesForPlayer(frames, players[0]).map((frame) => ({ ...frame, sourceMatched: false }));
-}
-
-function framesForPlayer(frames, player) {
-  return frames.filter((frame) => frame.frameId === player.frameId && frame.videoId === player.videoId &&
-    frame.documentId === player.documentId);
-}
-
-function frameOptions(target) {
-  return target.documentId ? { documentId: target.documentId } : { frameId: target.frameId || 0 };
-}
-
-function playerIdentity(player) {
-  return { frameId: player.frameId, documentId: player.documentId, videoId: player.videoId,
-    sourceUrl: player.sourceUrl, title: player.title, isPlaying: player.isPlaying,
-    width: player.width, height: player.height };
-}
-
-function playerBelongsToMedia(player, media) {
-  const contexts = media?.contexts || (media?.frameIds || []).map((frameId) => ({ frameId }));
-  const related = contexts.filter((context) => context.frameId === player.frameId);
-  const documented = related.filter((context) => context.documentId);
-  return documented.length ? documented.some((context) => context.documentId === player.documentId) : related.length > 0;
-}
-
-async function captureFromPlayer(tabId, message) {
-  const allPlayers = [...(tabPlayersMap.get(tabId) || [])];
-  let players;
-  const media = (tabMediaMap.get(tabId) || []).find((item) => item.url === message.sourceUrl);
-  const hasTarget = ["videoId", "frameId", "documentId"].some((key) => message[key] !== undefined);
-  if (hasTarget) {
-    players = allPlayers.filter((player) => ["videoId", "frameId", "documentId"]
-      .every((key) => message[key] === undefined || player[key] === message[key]));
-  } else {
-    const exact = message.sourceUrl ? allPlayers.filter((p) => p.sourceUrl === message.sourceUrl) : [];
-    if (exact.length) players = exact;
-    else if (!message.sourceUrl) players = allPlayers;
-    else if (media?.isM3U8) {
-      // blob 只证明播放器存在。清单所在 frame/document 限定候选范围，失败不能换别处的画面。
-      players = allPlayers.filter((p) => (!p.sourceUrl || p.sourceUrl.startsWith("blob:")) && playerBelongsToMedia(p, media));
-    } else players = [];
+  if (tabMediaMap.has(tabId)) tabMediaMap.set(tabId, tabMediaMap.get(tabId).map(retain).filter(Boolean));
+  const fragments = fragmentMediaMap.get(tabId);
+  if (fragments) for (const [url, item] of fragments) {
+    const remaining = retain(item); if (remaining) fragments.set(url, remaining); else fragments.delete(url);
   }
-  if (!players.length) return { success: false, error: hasTarget
-    ? "所选播放器已关闭或文档已刷新，请重新选择播放器"
-    : "这个片源没有对应的当前播放器；可在下方播放器卡片选择需要抓拍的画面" };
-  if (players.length > 1) return { success: false,
-    error: "找到多个可能的播放器，请在下方播放器卡片选择需要抓拍的画面", candidates: players.map(playerIdentity) };
-  const player = players[0];
-  try {
-    const result = await chrome.tabs.sendMessage(tabId, {
-      action: "captureCurrentFrameNow", videoId: player.videoId, sourceUrl: message.sourceUrl,
-      expectedSourceUrl: player.sourceUrl
-    }, frameOptions(player));
-    if (result?.success) return { ...result, sourceMatched: result.frame.sourceUrl === message.sourceUrl,
-      frame: { ...result.frame, frameId: player.frameId, documentId: player.documentId } };
-    return result || { success: false, error: "播放器未返回画面，请重新播放后重试" };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-}
-
-// 切片计数应挂在 m3u8 主流卡片上，而不是 mediaList[0]（[0] 可能是先到的 mp4）
-function firstStreamItem(list) {
-  const visible = (list || []).filter((item) => !item.isFragment);
-  return visible.find((m) => m.isM3U8) || visible[0] || null;
-}
-
-const FILE_MIMES = {
-  "video/mp4": "mp4", "video/webm": "webm", "video/x-flv": "flv", "video/flv": "flv",
-  "video/quicktime": "mov", "video/ogg": "ogv", "video/x-msvideo": "avi", "video/x-matroska": "mkv",
-  "video/mp2t": "ts"
-};
-
-function isKnownMediaMime(mime) {
-  return /mpegurl|mp2t|iso\.segment/i.test(mime || "") || (mime || "").startsWith("video/");
-}
-
-function classifyMedia(url, evidence) {
-  let pathname;
-  try { pathname = new URL(url).pathname; } catch (_) { pathname = url.split(/[?#]/)[0]; }
-  const pathExt = pathname.match(/\.([a-z0-9_]+)$/i)?.[1].toLowerCase() || "";
-  const responseMime = evidence.responseMime || "";
-  const mime = isKnownMediaMime(responseMime) ? responseMime : (evidence.domMime || "");
-  const isHlsMime = mime.includes("mpegurl");
-  const filePath = ["mp4", "webm", "flv", "mov", "m4v", "ogv", "avi", "mkv", "ts", "m4s"].includes(pathExt);
-  const segmentPath = ["ts", "m4s", "m4v_frag", "f4f"].includes(pathExt);
-  const isM3U8 = !!(isHlsMime || (!isKnownMediaMime(mime) &&
-    (pathExt === "m3u8" || (!filePath && !segmentPath && evidence.streamHint))));
-  const segmentMime = /mp2t|iso\.segment/.test(mime);
-  // 目录/part 名称只作为线索；真实 video MIME 或 <video> 使用证据不能被弱路径规则抹掉。
-  const fragmentHint = /(?:[\/_](?:seg|segment|chunk|frag|slice)[-_0-9])|(?:[\/_]part[-_][0-9])|(?:\/hls\/.*\/[0-9]+)/i.test(pathname);
-  const isFragment = !isM3U8 && !evidence.domVideo && (segmentPath || segmentMime);
-  const ext = isM3U8 ? "m3u8" : FILE_MIMES[mime] ||
-    (filePath ? pathExt : "mp4");
-  return { isM3U8, isFragment, fragmentHint, ext,
-    mime: mime || (isM3U8 ? "application/x-mpegurl" : "video/" + ext) };
-}
-
-// 格式化文件名
-function sanitizeFilename(name) {
-  return (name || "视频")
-    .replace(/[\\/:*?"<>|]/g, "_")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 80);
-}
-
-// 更新插件角标 (萌系樱花粉色)
-function updateBadge(tabId) {
-  const list = (tabMediaMap.get(tabId) || []).filter((item) => !item.isFragment);
-  const count = list.length;
-  if (count > 0) {
-    chrome.action.setBadgeText({ tabId, text: String(count) });
-    chrome.action.setBadgeBackgroundColor({ tabId, color: "#FF6584" });
-  } else {
-    chrome.action.setBadgeText({ tabId, text: "" });
-  }
-}
-
-// 核心：添加/更新捕获的媒体项目（过滤碎片）
-function addMediaItem(tabId, item) {
-  if (!Number.isInteger(tabId) || tabId < 0) return;
-  const url = item.url || "";
-  if (!/^https?:\/\//i.test(url)) return;
-  const contentType = (item.mime || "").toLowerCase().split(";")[0].trim();
-  const contentLength = item.size || 0;
-  if (!tabMediaMap.has(tabId)) {
-    tabMediaMap.set(tabId, []);
-  }
-  const mediaList = tabMediaMap.get(tabId);
-  const existing = mediaList.find(m => m.url === url);
-  const evidence = { ...(existing?.evidence || {}) };
-  // responseMime 只接收响应头；DOM 类型声明与线路猜测始终保留各自来源。
-  if (item.observation === "response" && contentType &&
-      (isKnownMediaMime(contentType) || !isKnownMediaMime(evidence.responseMime))) evidence.responseMime = contentType;
-  if (item.observation === "dom") {
-    if (contentType) evidence.domMime = contentType;
-    if (item.directVideo) evidence.domVideo = true;
-    if (item.streamHint) evidence.streamHint = true;
-  }
-  const classification = classifyMedia(url, evidence);
-  let baseName = sanitizeFilename(item.customTitle || existing?.baseName ||
-    existing?.suggestedFilename?.replace(/\.[^/.]+$/, "") || tabTitleMap.get(tabId) || "");
-  if (!baseName || baseName === "视频") {
-    baseName = "完整高清视频";
-  }
-  const frameId = item.frameId ?? 0;
-  const contexts = [...(existing?.contexts || (existing?.frameIds || []).map((id) => ({ frameId: id })))];
-  if (!contexts.some((c) => c.frameId === frameId && c.documentId === item.documentId)) {
-    contexts.push({ frameId, documentId: item.documentId });
-  }
-  const chunkCount = Math.max(0, (tabChunkCountMap.get(tabId) || 0) +
-    Number(classification.isFragment) - Number(!!existing?.isFragment));
-  tabChunkCountMap.set(tabId, chunkCount);
-  const mediaObj = {
-    ...existing,
-    id: existing?.id || `${tabId}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-    url, evidence, ...classification, baseName,
-    size: existing?.size || contentLength,
-    suggestedFilename: `${baseName}.${classification.ext}`,
-    frameIds: [...new Set([...(existing?.frameIds || []), frameId])], contexts,
-    chunkCount, timestamp: existing?.timestamp || Date.now()
-  };
-  // 分片保留可修正身份，但不作为下载卡片展示；同 URL 后到的完整媒体证据可提升它。
-  if (existing) mediaList[mediaList.indexOf(existing)] = mediaObj;
-  else mediaList.push(mediaObj);
-  mediaList.sort((a, b) => Number(b.isM3U8) - Number(a.isM3U8));
-  const target = firstStreamItem(mediaList);
-  if (target) target.chunkCount = chunkCount;
-  updateBadge(tabId);
   scheduleSave();
-  chrome.runtime.sendMessage({ action: "mediaListUpdated", tabId }).catch(() => {});
-}
-
-// 1. 请求发出前嗅探（确保即使响应头没有 content-type 也能抓到 m3u8）
-chrome.webRequest.onBeforeRequest.addListener(
-  (details) => {
-    if (details.tabId < 0) return;
-    if (/\.m3u8($|\?)/i.test(details.url)) {
-      whenReady(() => addMediaItem(details.tabId, {
-        url: details.url,
-        observation: "url",
-        size: 0, frameId: details.frameId, documentId: details.documentId
-      }));
-    }
-  },
-  { urls: ["<all_urls>"] }
-);
-
-// 2. 响应头嗅探
-chrome.webRequest.onHeadersReceived.addListener(
-  (details) => {
-    if (details.tabId < 0) return;
-
-    let contentType = "";
-    let contentLength = 0;
-
-    for (const h of details.responseHeaders || []) {
-      const name = h.name.toLowerCase();
-      if (name === "content-type") {
-        contentType = (h.value || "").toLowerCase();
-      }
-      if (name === "content-length") {
-        contentLength = parseInt(h.value, 10) || 0;
-      }
-    }
-
-    const isVideoMime = contentType.startsWith("video/") || 
-                        contentType.includes("mpegurl") || 
-                        contentType.includes("mp2t") || contentType.includes("iso.segment");
-    const isM3U8Url = /\.m3u8(?:$|[?#])/i.test(details.url);
-    const isSegmentUrl = /\.(ts|m4s|m4v_frag|f4f)(?:$|[?#])/i.test(details.url);
-
-    if (isVideoMime || isM3U8Url || isSegmentUrl) {
-      whenReady(() => addMediaItem(details.tabId, {
-        url: details.url,
-        mime: contentType, observation: "response",
-        size: contentLength, frameId: details.frameId, documentId: details.documentId
-      }));
-    }
-  },
-  { urls: ["<all_urls>"] },
-  ["responseHeaders"]
-);
-
-// 监听消息
-function handleMessage(message, sender, sendResponse) {
-  const tabId = sender.tab?.id ?? message.tabId;
-
-  // 接收来自 DOM 的完整流地址 (针对类似 ikanbot 的 lineData udata)
-  if (message.action === "reportMasterStream" && Number.isInteger(tabId)) {
-    if (message.title) {
-      tabTitleMap.set(tabId, message.title);
-    }
-    addMediaItem(tabId, {
-      url: message.url,
-      mime: message.mime || "", observation: "dom", directVideo: !!message.directVideo,
-      streamHint: true,
-      size: 0, frameId: sender.frameId, documentId: sender.documentId,
-      customTitle: message.name ? `${message.title}_${message.name}` : message.title
-    });
-    sendResponse({ status: "ok" });
-    return true;
-  }
-
-  // 接收 DOM 扫描到的普通视频直链（如 <video src> 的 mp4）——之前 content.js 发了这条消息，
-  // background 却没有处理分支，正片直接被丢掉，弹窗里看不到
-  if (message.action === "reportDOMVideo" && Number.isInteger(tabId)) {
-    if (message.title) {
-      tabTitleMap.set(tabId, message.title);
-    }
-    addMediaItem(tabId, {
-      url: message.url,
-      mime: message.mime || "", observation: "dom", directVideo: message.directVideo !== false,
-      streamHint: !!message.streamHint,
-      size: 0, frameId: sender.frameId, documentId: sender.documentId,
-      customTitle: message.title
-    });
-    sendResponse({ status: "ok" });
-    return true;
-  }
-
-  // 接收多帧截屏
-  if (message.action === "reportVideoFrames" && Number.isInteger(tabId)) {
-    const frameId = sender.frameId ?? 0;
-    const player = { frameId, documentId: sender.documentId, videoId: message.videoId,
-      sourceUrl: message.sourceUrl || "", isPlaying: !!message.isPlaying, area: message.area || 0,
-      width: message.width || 0, height: message.height || 0,
-      title: message.title || "", pageUrl: message.pageUrl || sender.url || "" };
-    const samePlayer = (p) => p.frameId === frameId && p.videoId === player.videoId;
-    const staleDocument = (p) => p.frameId === frameId && p.documentId && sender.documentId && p.documentId !== sender.documentId;
-    const players = (tabPlayersMap.get(tabId) || []).filter((p) => !samePlayer(p) && !staleDocument(p));
-    tabPlayersMap.set(tabId, [...players, player]);
-    const oldFrames = (tabFramesMap.get(tabId) || []).filter((f) => !samePlayer(f) && !staleDocument(f));
-    const frames = (message.frames || []).slice(-10).map(({ originalDataUrl, ...frame }) => ({ ...frame, ...player }));
-    tabFramesMap.set(tabId, [...oldFrames, ...frames].slice(-60));
-    scheduleSave();
-    chrome.runtime.sendMessage({ action: "framesUpdated", tabId }).catch(() => {});
-    sendResponse({ status: "ok" });
-    return true;
-  }
-
-  if (message.action === "reportPageTitle" && Number.isInteger(tabId)) {
-    tabTitleMap.set(tabId, message.title);
-    scheduleSave();
-    sendResponse({ status: "ok" });
-    return true;
-  }
-
-  if (message.action === "getMedia") {
-    // 先等启动恢复完成，否则 SW 刚被唤醒时列表还是空的
-    restoreState().then(() => {
-      const list = (tabMediaMap.get(message.tabId) || []).filter((item) => !item.isFragment)
-        .map((item) => ({ ...item, frames: framesForMedia(message.tabId, item) }));
-      const pageTitle = tabTitleMap.get(message.tabId) || "当前网页";
-      const frames = tabFramesMap.get(message.tabId) || [];
-      const players = (tabPlayersMap.get(message.tabId) || [])
-        .map((player) => ({ ...player, frames: framesForPlayer(frames, player) }));
-      const chunkCount = tabChunkCountMap.get(message.tabId) || 0;
-
-      if (list.length > 0) {
-        const target = firstStreamItem(list);
-        if (target) {
-          target.chunkCount = chunkCount;
-        }
-      }
-      sendResponse({ media: list, pageTitle, frames, players, chunkCount });
-    });
-    return true;
-  }
-
-  if (message.action === "captureCurrentFrame") {
-    captureFromPlayer(tabId, message).then(sendResponse).catch((err) => sendResponse({ success: false, error: err.message }));
-    return true;
-  }
-
-  if (message.action === "getCapturedFrame") {
-    const frame = (tabFramesMap.get(tabId) || []).find((f) => f.id === message.captureId);
-    if (!frame) { sendResponse({ success: false, error: "原图已失效，请重新抓拍" }); return true; }
-    chrome.tabs.sendMessage(tabId, { action: "getCapturedFrame", videoId: frame.videoId, captureId: frame.id }, frameOptions(frame))
-      .then(sendResponse).catch((err) => sendResponse({ success: false, error: err.message }));
-    return true;
-  }
-
-  if (message.action === "download") {
-    chrome.downloads.download(
-      {
-        url: message.url,
-        filename: message.filename || "完整视频.mp4",
-        saveAs: true
-      },
-      (downloadId) => {
-        if (chrome.runtime.lastError) {
-          sendResponse({ success: false, error: chrome.runtime.lastError.message });
-        } else {
-          sendResponse({ success: true, downloadId });
-        }
-      }
-    );
-    return true;
+  if (changed) {
+    tabChunkCountMap.set(tabId, fragments?.size || 0);
+    updateBadge(tabId); notify({ action: 'mediaListUpdated', tabId });
   }
 }
-
-// 监听器同步注册；所有状态操作都排在恢复之后，避免新请求被旧快照覆盖。
-const handledActions = new Set(["reportMasterStream", "reportDOMVideo", "reportVideoFrames", "reportPageTitle", "getMedia", "download", "captureCurrentFrame", "getCapturedFrame"]);
+function fromPopup(sender) {
+  return sender.id === chrome.runtime.id && !sender.tab && sender.url === chrome.runtime.getURL('popup.html');
+}
+async function refreshableTab(tabId) {
+  let tab;
+  try { tab = await chrome.tabs.get(tabId); }
+  catch { throw new Error('当前标签页已关闭或不可用'); }
+  if (tab.discarded) throw new Error('当前标签页已休眠，请先切换到该网页后重试');
+  if (!/^https?:\/\//i.test(tab.url || '')) throw new Error('只能重新扫描 HTTP / HTTPS 网页');
+  return tab;
+}
+function refreshMedia(tabId) {
+  const existing = mediaRefreshes.get(tabId);
+  if (existing && !existing.invalidated) return existing.promise;
+  const refresh = { invalidated: false, expired: false, documents: new Set(), results: [], promise: null };
+  mediaRefreshes.set(tabId, refresh);
+  const checkNavigation = () => {
+    if (refresh.invalidated) throw new Error('扫描期间网页已变化，请重新刷新列表');
+    if (refresh.expired) throw new Error('页面扫描超时，请再次刷新列表');
+  };
+  refresh.promise = (async () => {
+    // This short barrier waits for hydration/navigation mutations. The script
+    // itself must run OUTSIDE eventQueue: it awaits reports handled by that queue.
+    await enqueue(() => {});
+    for (const documentId of Object.values(tabDocuments.get(tabId) || {})) refresh.documents.add(documentId);
+    const initial = await refreshableTab(tabId);
+    checkNavigation();
+    let timer;
+    try {
+      const scanning = (async () => {
+        let results, partial = false;
+        try {
+          results = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['content.js'] });
+        } catch (error) {
+          checkNavigation();
+          // A protected child frame can reject an all-frames request. Retry the
+          // accessible main frame without clearing network or earlier evidence.
+          partial = true;
+          try { results = await chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ['content.js'] }); }
+          catch { throw new Error(`无法重新扫描网页，请检查扩展的网站访问权限后重试：${error.message || '脚本注入失败'}`); }
+        }
+        refresh.results = Array.isArray(results) ? results : [];
+        if (refresh.invalidated) await enqueue(() => retireRefreshDocuments(tabId, refresh));
+        checkNavigation();
+        const confirmed = result => result?.result?.success === true && typeof result.result.documentToken === 'string' &&
+          result.result.documentToken.length > 0 && Number.isSafeInteger(result.result.generation) &&
+          Number.isSafeInteger(result.result.reports) && result.result.reports > 0 && !result.result.inactive;
+        if (!Array.isArray(results) || !results.some(confirmed)) throw new Error('页面未确认完成扫描，请再次刷新列表');
+        partial ||= results.some(result => !confirmed(result));
+        const current = await refreshableTab(tabId);
+        checkNavigation();
+        if (current.url !== initial.url) throw new Error('扫描期间网页已变化，请重新刷新列表');
+        return partial ? '部分页面框架无法扫描，已保留可读取的视频来源' : '';
+      })();
+      const recoveryWarning = await Promise.race([scanning, new Promise((_, reject) => {
+        timer = setTimeout(() => { refresh.expired = true; reject(new Error('页面扫描超时，请再次刷新列表')); }, 10000);
+      })]);
+      // executeScript resolves only after the content script's report ACKs.
+      return await enqueue(() => {
+        checkNavigation();
+        return { success: true, ...mediaSnapshot(tabId), ...(recoveryWarning ? { recoveryWarning } : {}) };
+      });
+    } finally {
+      clearTimeout(timer);
+      if (refresh.invalidated) await enqueue(() => retireRefreshDocuments(tabId, refresh));
+    }
+  })().finally(() => { if (mediaRefreshes.get(tabId) === refresh) mediaRefreshes.delete(tabId); });
+  return refresh.promise;
+}
+function documentKey(message, sender) {
+  const token = typeof message.documentToken === "string" ? message.documentToken.slice(0, 100) : "";
+  return typeof sender.documentId === "string" && sender.documentId ? `${sender.documentId}:${token}` : token;
+}
+function retireNetworkDocument(tabId, documentId) {
+  if (typeof documentId !== 'string' || !documentId) return;
+  let retired = retiredNetworkDocuments.get(tabId);
+  if (!retired) retiredNetworkDocuments.set(tabId, retired = new Set());
+  retired.add(documentId);
+  if (retired.size > 200) retired.delete(retired.values().next().value);
+}
+function networkDocumentAllowed(details) {
+  const { tabId, frameId, documentId } = details;
+  if (!documentId) return true; // Chrome supplies documentId; tolerate older stored/test evidence.
+  if (retiredNetworkDocuments.get(tabId)?.has(documentId)) return false;
+  let documents = tabDocuments.get(tabId);
+  if (!documents) tabDocuments.set(tabId, documents = {});
+  if (documents[frameId] && documents[frameId] !== documentId) return false;
+  documents[frameId] = documentId;
+  return true;
+}
+function retireDocument(tabId, frameId, state) {
+  if (!state?.documentKey) return;
+  const key = `${tabId}:${frameId}`;
+  let retired = retiredDocuments.get(key);
+  if (!retired) retiredDocuments.set(key, retired = new Set());
+  retired.add(state.documentKey);
+  if (retired.size > 40) retired.delete(retired.values().next().value);
+}
+function isStaleDocument(tabId, frameId, message, sender) {
+  const key = documentKey(message, sender);
+  if (!key) return false;
+  if (retiredDocuments.get(`${tabId}:${frameId}`)?.has(key)) return true;
+  const previous = tabPlaybackMap.get(tabId)?.[frameId];
+  if (!previous) return false;
+  if (previous.documentKey === key) return Number.isInteger(message.generation) && message.generation < previous.generation;
+  return Number.isFinite(message.documentStartedAt) && message.documentStartedAt < previous.documentStartedAt;
+}
+function reportPlayback(tabId, frameId, message, sender) {
+  const key = documentKey(message, sender);
+  if (!key || !Number.isFinite(message.documentStartedAt) || message.documentStartedAt <= 0 ||
+      !Number.isSafeInteger(message.generation) || message.generation < 0 || isStaleDocument(tabId, frameId, message, sender)) return;
+  if (message.inactive === true) {
+    if (frameId === 0) clearTab(tabId);
+    else clearFrame(tabId, frameId);
+    retireDocument(tabId, frameId, { documentKey: key });
+    return;
+  }
+  let frames = tabPlaybackMap.get(tabId);
+  if (!frames) tabPlaybackMap.set(tabId, frames = {});
+  const previous = frames[frameId];
+  const sameSource = previous?.documentKey === key && previous.generation === message.generation;
+  const count = value => Number.isInteger(value) && value >= 0 ? Math.min(value, 1000) : 0;
+  const videoCount = count(message.videoCount);
+  const hasPlayed = videoCount > 0 && message.hasPlayed === true;
+  const next = {
+    documentKey: key, documentStartedAt: message.documentStartedAt, generation: message.generation,
+    videoCount, iframeCount: count(message.iframeCount), hasPlayed,
+    playing: hasPlayed && message.playing === true,
+    observedAt: hasPlayed ? (sameSource && previous.hasPlayed ? previous.observedAt : Date.now()) : null
+  };
+  if (previous && Object.keys(next).every(field => next[field] === previous[field])) return;
+  if (previous && previous.documentKey !== key) retireDocument(tabId, frameId, previous);
+  if (sender.documentId) {
+    let documents = tabDocuments.get(tabId);
+    if (!documents) tabDocuments.set(tabId, documents = {});
+    if (documents[frameId] !== sender.documentId) retireNetworkDocument(tabId, documents[frameId]);
+    documents[frameId] = sender.documentId;
+    // A fresh BFCache activation can use the same browser documentId.
+    retiredNetworkDocuments.get(tabId)?.delete(sender.documentId);
+  }
+  frames[frameId] = next;
+  scheduleSave(); notify({ action: "mediaListUpdated", tabId });
+}
+function captureStatus(tabId, media) {
+  const byFrame = tabPlaybackMap.get(tabId) || {};
+  const frames = Object.values(byFrame);
+  const observedFrames = frames.filter(frame => frame.hasPlayed);
+  const videoCount = frames.reduce((total, frame) => total + frame.videoCount, 0);
+  // Cross-origin/blank frames may not have a content script. Their absence is
+  // uncertainty, not evidence that this page contains no player.
+  const uncertain = !byFrame[0] || frames.length - 1 < frames.reduce((total, frame) => total + frame.iframeCount, 0);
+  const observedAt = observedFrames.length ? Math.min(...observedFrames.map(frame => frame.observedAt)) : null;
+  const playback = {
+    observed: observedFrames.length > 0, hasVideo: videoCount > 0, playing: frames.some(frame => frame.playing),
+    videoCount, observedAt, frameCount: frames.length, uncertain
+  };
+  const capturePhase = media.length ? "found" : playback.observed
+    ? Date.now() - observedAt >= 10000 ? "no-source" : "sniffing"
+    : playback.hasVideo ? "waiting" : !frames.length || uncertain ? "checking" : "no-video";
+  return { playback, capturePhase };
+}
+function isPlaylist(url, mime = "") { return /\.m3u8(?:$|[?#])/i.test(url) || /mpegurl/i.test(mime); }
+function isFragmentUrl(url, contentType = "") {
+  if (isPlaylist(url, contentType)) return false;
+  return /mp2t|iso\.segment/i.test(contentType) || /\.(?:ts|m4s|m4v_frag|f4f)(?:$|[?#])/i.test(url);
+}
+function updateBadge(tabId) {
+  chrome.action.setBadgeText({ tabId, text: String(tabMediaMap.get(tabId)?.length || "") }).catch(() => {});
+  chrome.action.setBadgeBackgroundColor({ tabId, color: "#DC7091" }).catch(() => {});
+}
+function clearTab(tabId) {
+  for (const [frameId, state] of Object.entries(tabPlaybackMap.get(tabId) || {})) retireDocument(tabId, frameId, state);
+  for (const documentId of Object.values(tabDocuments.get(tabId) || {})) retireNetworkDocument(tabId, documentId);
+  tabMediaMap.delete(tabId); tabTitleMap.delete(tabId);
+  tabChunkCountMap.delete(tabId); fragmentMediaMap.delete(tabId);
+  tabPlaybackMap.delete(tabId); frameParents.delete(tabId); tabDocuments.delete(tabId);
+  updateBadge(tabId); scheduleSave(); notify({ action: "mediaListUpdated", tabId });
+}
+function clearFrame(tabId, frameId) {
+  const removed = new Set([frameId]);
+  const parents = frameParents.get(tabId) || {};
+  let expanded;
+  do {
+    expanded = false;
+    for (const [child, parent] of Object.entries(parents)) if (removed.has(parent) && !removed.has(Number(child))) {
+      removed.add(Number(child)); expanded = true;
+    }
+  } while (expanded);
+  const frames = tabPlaybackMap.get(tabId) || {};
+  const documents = tabDocuments.get(tabId) || {};
+  for (const id of removed) {
+    retireDocument(tabId, id, frames[id]); delete frames[id]; delete parents[id];
+    retireNetworkDocument(tabId, documents[id]); delete documents[id];
+  }
+  const media = tabMediaMap.get(tabId);
+  const retainContexts = item => {
+    const contexts = (item.contexts || [{ frameId: item.frameId, documentId: item.documentId || '' }])
+      .filter(context => !removed.has(context.frameId));
+    return contexts.length ? { ...item, contexts, frameId: contexts[0].frameId, documentId: contexts[0].documentId } : null;
+  };
+  if (media) tabMediaMap.set(tabId, media.map(retainContexts).filter(Boolean));
+  const fragments = fragmentMediaMap.get(tabId);
+  if (fragments) {
+    for (const [url, item] of fragments) {
+      const retained = retainContexts(item);
+      if (retained) fragments.set(url, retained); else fragments.delete(url);
+    }
+    tabChunkCountMap.set(tabId, fragments.size);
+  }
+  updateBadge(tabId); scheduleSave(); notify({ action: "mediaListUpdated", tabId });
+}
+function addMediaItem(tabId, item) {
+  const url = mediaRules.normalizeUrl(item.url);
+  if (!validTab(tabId) || !url) return;
+  let list = tabMediaMap.get(tabId);
+  if (!list) tabMediaMap.set(tabId, list = []);
+  let fragments = fragmentMediaMap.get(tabId);
+  if (!fragments) fragmentMediaMap.set(tabId, fragments = new Map());
+  const existing = list.find(entry => entry.url === url) || fragments.get(url);
+  const observations = mediaRules.mergeObservations(existing?.observations, item);
+  const classification = mediaRules.classify(url, observations);
+  const context = { frameId: item.frameId ?? 0, documentId: item.documentId || '' };
+  const contexts = [...(existing?.contexts || (existing ? [{ frameId: existing.frameId, documentId: existing.documentId || '' }] : []))];
+  if (!contexts.some(entry => entry.frameId === context.frameId && entry.documentId === context.documentId)) contexts.push(context);
+  const baseName = mediaRules.sanitizeFilename(item.customTitle || existing?.baseName ||
+    existing?.suggestedFilename?.replace(/\.[^/.]+$/, '') || tabTitleMap.get(tabId) || '视频');
+  const media = {
+    ...existing, id: existing?.id || `${tabId}_${crypto.randomUUID()}`, url, observations, ...classification,
+    size: classification.isM3U8 ? 0 : Math.max(existing?.size || 0, Number(item.size) || 0),
+    baseName, suggestedFilename: `${baseName}.${classification.ext}`,
+    name: String(item.name || existing?.name || '').slice(0, 80), source: item.source || existing?.source || 'network',
+    contexts, frameId: item.frameId ?? existing?.frameId ?? 0, documentId: item.documentId || existing?.documentId || '',
+    pageUrl: item.pageUrl || existing?.pageUrl || '', active: Boolean(item.active || existing?.active),
+    timestamp: item.active ? Date.now() : existing?.timestamp || Date.now()
+  };
+  if (existing && JSON.stringify(existing) === JSON.stringify(media)) return;
+  const index = list.indexOf(existing);
+  if (index >= 0) list.splice(index, 1);
+  fragments.delete(url);
+  if (classification.isFragment) {
+    fragments.set(url, media);
+    // Keep evidence so a later <video> observation can promote a .ts resource.
+    if (fragments.size > 1000) fragments.delete(fragments.keys().next().value);
+  } else {
+    if (item.active) for (const entry of list) entry.active = false;
+    list.push(media);
+    list.sort((a, b) => Number(Boolean(b.active)) - Number(Boolean(a.active)) ||
+      Number(Boolean(b.isM3U8)) - Number(Boolean(a.isM3U8)) || (b.timestamp || 0) - (a.timestamp || 0));
+    if (list.length > MAX_MEDIA) list.length = MAX_MEDIA;
+  }
+  tabChunkCountMap.set(tabId, fragments.size);
+  updateBadge(tabId); scheduleSave(); notify({ action: 'mediaListUpdated', tabId });
+}
+chrome.webRequest.onBeforeRequest.addListener(details => {
+  if (!validTab(details.tabId)) return;
+  if (details.type === "main_frame") {
+    invalidateRefresh(details.tabId);
+    // Reset before new media requests, including same-URL reloads.
+    enqueue(() => clearTab(details.tabId));
+  } else if (details.type === "sub_frame" && validFrame(details.frameId)) {
+    enqueue(() => {
+      clearFrame(details.tabId, details.frameId);
+      let parents = frameParents.get(details.tabId);
+      if (!parents) frameParents.set(details.tabId, parents = {});
+      if (validFrame(details.parentFrameId)) parents[details.frameId] = details.parentFrameId;
+    });
+  } else {
+    enqueue(() => {
+      if (!networkDocumentAllowed(details)) return;
+      if (isPlaylist(details.url)) addMediaItem(details.tabId, {
+        url: details.url, observation: 'url', frameId: details.frameId, documentId: details.documentId,
+        pageUrl: details.documentUrl || details.initiator || ''
+      });
+    });
+  }
+}, { urls: ["<all_urls>"] });
+chrome.webRequest.onHeadersReceived.addListener(details => {
+  if (!validTab(details.tabId) || details.statusCode >= 400 || (details.statusCode >= 300 && details.statusCode !== 304)) return;
+  const headers = Object.fromEntries((details.responseHeaders || []).map(header => [header.name.toLowerCase(), header.value || ""]));
+  const mime = headers["content-type"] || "";
+  if (!/^(?:video|audio)\//i.test(mime) && !isPlaylist(details.url, mime) && !isFragmentUrl(details.url, mime)) return;
+  // Content-Length on a 206 response is only the current byte range.
+  const total = /\/([0-9]+)$/.exec(headers["content-range"] || "")?.[1];
+  enqueue(() => {
+    if (!networkDocumentAllowed(details)) return;
+    addMediaItem(details.tabId, {
+      url: details.url, mime, observation: 'response', size: Number(total || headers["content-length"]) || 0,
+      frameId: details.frameId, documentId: details.documentId, pageUrl: details.documentUrl || details.initiator || ""
+    });
+  });
+}, { urls: ["<all_urls>"] }, ["responseHeaders"]);
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!handledActions.has(message.action)) return false;
-  restoreState().then(() => handleMessage(message, sender, sendResponse))
-    .catch((err) => sendResponse({ success: false, error: err.message }));
+  if (!message || typeof message.action !== "string") return;
+  if (message.action === 'refreshMedia') {
+    if (!fromPopup(sender) || !validTab(message.tabId)) {
+      sendResponse({ success: false, error: '重新扫描请求无效或来源未授权' }); return;
+    }
+    refreshMedia(message.tabId).then(sendResponse).catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+  const supported = ["reportMasterStream", "reportDOMVideo", "reportPageTitle", "reportPlaybackState", "getMedia"];
+  if (!supported.includes(message.action)) return;
+  const tabId = message.action === "getMedia" ? sender.tab?.id ?? message.tabId : sender.tab?.id;
+  const refresh = mediaRefreshes.get(tabId);
+  if (message.action !== 'getMedia' && refresh && !refresh.invalidated && !refresh.expired && typeof sender.documentId === 'string') {
+    refresh.documents.add(sender.documentId);
+  }
+  enqueue(async () => {
+    if (message.action !== "getMedia" && (!validTab(tabId) || !validFrame(sender.frameId) ||
+        (sender.documentLifecycle && sender.documentLifecycle !== 'active') ||
+        isStaleDocument(tabId, sender.frameId, message, sender))) return { status: "ignored" };
+    if (message.action === "reportPlaybackState") {
+      reportPlayback(tabId, sender.frameId, message, sender);
+      return { status: "ok" };
+    }
+    if (["reportMasterStream", "reportDOMVideo"].includes(message.action)) {
+      const title = tabTitleMap.get(tabId) || message.title;
+      addMediaItem(tabId, {
+        url: message.url, mime: message.mime || '', observation: 'dom',
+        directVideo: message.directVideo === true || (message.action === 'reportDOMVideo' && message.directVideo !== false),
+        streamHint: message.action === 'reportMasterStream', documentId: sender.documentId,
+        customTitle: message.name ? `${title || "视频"}_${message.name}` : title,
+        name: message.name, active: message.active, source: "dom", frameId: sender.frameId, pageUrl: sender.tab?.url || sender.url
+      });
+      return { status: "ok" };
+    }
+    if (message.action === "reportPageTitle" && validTab(tabId)) {
+      if (!sender.frameId && message.title) tabTitleMap.set(tabId, String(message.title).slice(0, 300));
+      scheduleSave(); return { status: "ok" };
+    }
+    if (message.action === "getMedia") {
+      return mediaSnapshot(tabId);
+    }
+    return { status: "ignored" };
+  }).then(result => { if (result !== undefined) sendResponse(result); })
+    .catch(error => sendResponse({ success: false, error: error.message }));
   return true;
 });
-
-// 清理状态
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  // 同 URL 重载只更新 status，不保证同时带 url；新文档不能继续使用旧文档的媒体与原图。
-  if (changeInfo.status === "loading") {
-    whenReady(() => {
-    tabMediaMap.delete(tabId);
-    tabTitleMap.delete(tabId);
-    tabFramesMap.delete(tabId);
-    tabPlayersMap.delete(tabId);
-    tabChunkCountMap.delete(tabId);
-    updateBadge(tabId);
-    scheduleSave();
-    });
-  }
+  if (changeInfo.title) enqueue(() => { tabTitleMap.set(tabId, changeInfo.title); scheduleSave(); });
 });
-
-chrome.tabs.onRemoved.addListener((tabId) => {
-  whenReady(() => {
-  tabMediaMap.delete(tabId);
-  tabTitleMap.delete(tabId);
-  tabFramesMap.delete(tabId);
-  tabPlayersMap.delete(tabId);
-  tabChunkCountMap.delete(tabId);
-  scheduleSave();
+chrome.tabs.onRemoved.addListener(tabId => {
+  invalidateRefresh(tabId);
+  enqueue(() => {
+    clearTab(tabId);
+    retiredNetworkDocuments.delete(tabId);
+    for (const key of retiredDocuments.keys()) if (key.startsWith(`${tabId}:`)) retiredDocuments.delete(key);
   });
 });

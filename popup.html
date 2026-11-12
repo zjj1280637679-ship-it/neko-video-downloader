@@ -3,70 +3,42 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>喵喵视频下载姬</title>
+  <title>羊魔 · 视频收藏</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <div class="app-container">
-    <!-- 头部可爱猫耳导航栏 -->
+  <div class="app-container" id="appContent">
     <header class="header">
-      <div class="cat-ears">
-        <span class="ear left-ear"></span>
-        <span class="ear right-ear"></span>
-      </div>
-      <div class="title-row">
-        <span class="sparkle">✨</span>
-        <h1 class="title">喵喵视频下载姬</h1>
-        <span class="sparkle">✨</span>
-      </div>
-      <p class="subtitle">(◕ᴗ◕✿) 为你捕捉每一帧心动~</p>
+      <div class="brand-mark" aria-hidden="true"><img src="icons/yangmo-mascot.png" alt=""></div>
+      <div class="brand-copy"><p class="eyebrow">YANGMO / VIDEO</p><h1>羊魔 · 视频收藏</h1><p class="subtitle">把喜欢的画面，留在身边。</p></div>
+      <button type="button" class="btn-refresh" id="btnRefresh" aria-label="重新读取视频来源" title="重新读取视频来源"><span class="refresh-icon" aria-hidden="true">↻</span><span class="refresh-label">重新读取<small>视频来源</small></span></button>
     </header>
-
-    <!-- 当前网页信息条 -->
-    <div class="page-bar">
-      <span class="page-icon">🌐</span>
-      <span class="page-title" id="pageTitle">正在连接网页...</span>
-    </div>
-
-    <!-- 极速捕捉状态条 -->
-    <div class="status-bar" id="statusBar">
-      <div class="status-left">
-        <span class="status-radar"></span>
-        <span id="statusText">正在捕捉视频信号中喵... (✧ω✧)</span>
-      </div>
-      <button class="btn-icon" id="btnRefresh" title="强制刷新">🔄</button>
-    </div>
-
-    <!-- 视频列表容器 -->
-    <main class="media-list" id="mediaList">
-      <!-- 动态渲染 -->
-    </main>
-
-    <!-- 底部可爱版权/提示 -->
-    <footer class="footer">
-      <span>(=^･ω･^=) 极速高频嗅探中 · 仅供学习交流使用哦</span>
-    </footer>
+    <nav class="view-tabs" role="tablist" aria-label="视频与下载">
+      <button id="sourceTab" class="view-tab" role="tab" aria-selected="true" aria-controls="sourcePanel">视频来源 <span id="sourceTabCount">0</span></button>
+      <button id="jobsTab" class="view-tab" role="tab" aria-selected="false" aria-controls="jobsPanel" tabindex="-1">下载任务 <span id="jobsTabCount">0</span></button>
+    </nav>
+    <section class="view-panel" id="sourcePanel" role="tabpanel" aria-labelledby="sourceTab">
+      <div class="status-bar" id="statusBar" data-state="checking"><span class="status-radar" aria-hidden="true"></span><span id="statusText" role="status" aria-live="polite">正在确认播放器状态…</span></div>
+      <main class="media-list" id="mediaList" aria-label="视频来源"></main>
+    </section>
+    <section class="view-panel" id="jobsPanel" role="tabpanel" aria-labelledby="jobsTab" hidden>
+      <p class="jobs-hint"><span aria-hidden="true">✓</span> 关掉弹窗也会继续下载，下次打开可查看进度。</p>
+      <p id="jobsStatus" class="jobs-status" role="status" aria-live="polite" hidden></p>
+      <div class="job-list" id="jobList" aria-label="最近下载任务"></div>
+      <section class="concurrency-bar" aria-label="下载并发">
+        <div class="concurrency-control"><label for="concurrency">分片并发</label><div class="concurrency-slider"><span id="concurrencyCalm" class="concurrency-endpoint">稳</span><input id="concurrency" type="range" min="1" max="375" step="1" value="64" aria-describedby="concurrencyHint saveError saveStatus" title="1–375 路，实时控制所有分片任务；降低并发时，已发请求会自然结束。普通视频文件由 Chrome 管理。" disabled><span id="concurrencyFast" class="concurrency-endpoint">急</span></div><output id="concurrencyValue" for="concurrency">64</output></div>
+        <div class="concurrency-meta"><p id="concurrencyHint" class="concurrency-hint">实时控制所有分片任务</p><span id="saveStatus" class="save-status" role="status" aria-live="polite">读取中…</span><button type="button" id="btnReloadPreferences" class="preference-retry" hidden>重新读取</button></div>
+        <p class="save-error" id="saveError" role="alert" hidden></p>
+      </section>
+      <section class="save-bar" aria-label="保存位置">
+        <div class="save-heading"><span>保存位置</span><span id="saveLocation">Chrome 默认下载目录</span></div>
+      </section>
+    </section>
   </div>
-
-  <!-- 截图大图预览弹窗 -->
-  <div class="modal" id="imageModal">
-    <div class="modal-content">
-      <div class="modal-header">
-        <span class="modal-title" id="modalTimeTag">⏱️ 截屏时间: 00:00</span>
-        <button class="modal-close" id="modalClose">✕</button>
-      </div>
-      <img id="modalImg" class="modal-img" src="" alt="截屏预览">
-      <div class="modal-actions">
-        <button class="btn btn-primary" id="btnSaveFrame">
-          <span>💾</span> 保存该帧截图 (JPG)
-        </button>
-      </div>
-    </div>
-  </div>
-
-  <!-- 萌系悬浮 Toast 提示 -->
-  <div class="toast" id="toast"></div>
-
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="ui/format.js"></script>
+  <script src="ui/explain.js"></script>
+  <script src="ui/capture.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

@@ -1,2 +1,0 @@
-# The CLI uses only Python's standard library. Python 3.10+ recommended.
-aiohttp>=3.9,<4

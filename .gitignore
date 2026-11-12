@@ -5,7 +5,5 @@ Thumbs.db
 .vscode/
 .idea/
 *.tmp
-__pycache__/
-*.py[cod]
-.venv/
-controller-profile/
+node_modules/
+dist/
