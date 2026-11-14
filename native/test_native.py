@@ -66,6 +66,23 @@ class NativeTests(unittest.TestCase):
         for value in (0, 376, 1.5, True):
             with self.assertRaises(ValueError): policy({'concurrency': value})
 
+    def test_worker_reuses_unchanged_control_and_observes_same_revision_cancellation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory) / 'control.json'
+            atomic_json(control, {'concurrency': 64, 'concurrencyRevision': 2, 'cancelled': False})
+            progress = Progress(control)
+            original_read = Path.read_text
+            with patch.object(Path, 'read_text', autospec=True, side_effect=original_read) as read:
+                for _ in range(1000):
+                    self.assertEqual(progress.control()['concurrency'], 64)
+                self.assertEqual(read.call_count, 1)
+                atomic_json(control, {'concurrency': 65, 'concurrencyRevision': 3, 'cancelled': False})
+                self.assertEqual(progress.control()['concurrency'], 65)
+                # Cancellation does not necessarily bump the concurrency revision.
+                atomic_json(control, {'concurrency': 65, 'concurrencyRevision': 3, 'cancelled': True})
+                self.assertTrue(progress.control()['cancelled'])
+                self.assertEqual(read.call_count, 3)
+
     def test_cookies_domain_and_non_persistence(self):
         cookie = {'name': 'SESSION_TEST', 'value': 'SECRET_NOT_FOR_DISK', 'domain': '.youtube.com', 'path': '/', 'secure': True}
         self.assertEqual(len(youtube_cookies([cookie])), 1)

@@ -44,8 +44,15 @@
     function metrics() {
       const time = now(); trim(time);
       const since = Math.max(started, time - windowMs), seconds = (time - since) / 1000;
-      const rate = field => finished || seconds <= 0 ? 0 : buckets.reduce((sum, b) => sum + (b.time > since ? b[field] : 0), 0) / seconds;
-      return { bytesPerSecond: rate('useful'), networkBytesPerSecond: rate('bytes'), inFlightRequests: requests.size,
+      let useful = 0, received = 0;
+      if (!finished && seconds > 0) {
+        for (const bucket of buckets) {
+          if (bucket.time <= since) continue;
+          useful += bucket.useful; received += bucket.bytes;
+        }
+        useful /= seconds; received /= seconds;
+      }
+      return { bytesPerSecond: useful, networkBytesPerSecond: received, inFlightRequests: requests.size,
         sampleCount: samples, responseSampleCount: responses, ttfbMs: ttfb, requestDurationMs: duration };
     }
     return { onRequestStart, onResponse, onBytes, onRequestEnd, onRequestInvalid, metrics, finish() { finished = true; } };

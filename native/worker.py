@@ -35,14 +35,20 @@ class Progress:
                         'totalSegments': 0, 'bytesPerSecond': 0, 'etaSeconds': None,
                         'targetConcurrency': 0, 'inFlightRequests': 0}
         self.last_control = {'concurrency': 64, 'concurrencyRevision': 0}
+        self.control_stamp = None
 
     def control(self):
         with self.lock:
             try:
+                metadata = self.control_path.stat()
+                stamp = (metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+                if stamp == self.control_stamp:
+                    return dict(self.last_control)
                 value = json.loads(self.control_path.read_text(encoding='utf-8'))
                 checked = policy(value)
                 if checked['concurrencyRevision'] >= self.last_control['concurrencyRevision']:
                     self.last_control = {**checked, 'cancelled': bool(value.get('cancelled'))}
+                self.control_stamp = stamp
             except (OSError, ValueError):
                 pass  # Atomic replacement can briefly race antivirus on Windows.
             return dict(self.last_control)

@@ -5,6 +5,8 @@ const { createOffscreenRunner } = require('../offscreen.js');
 const core = require('../hls-core.js');
 const { createMemoryOpfs } = require('./helpers/memory-opfs.cjs');
 const directoryFor = id => `neko-cache-${createHash('sha256').update(id).digest('hex')}`;
+const hasCachedSegment = (fs, id, index) => fs.paths().some(path =>
+  path.startsWith(`${directoryFor(id)}/${index}.`) && path.endsWith('.bin'));
 const terminal = new Set(['complete', 'interrupted', 'cancelled']);
 async function until(predicate, description = 'worker condition') {
   const deadline = Date.now() + 5000;
@@ -85,8 +87,8 @@ test('AES interruption retains two verified peers; same-id resume fetches only m
   assert.deepEqual(f.segmentCounts(), [1, 6, 1]);
   assert.equal(f.saves.length, 0);
   assert.ok(f.progress.some(job => job.retryAttempt > 0 && /解密失败/.test(job.retryMessage)));
-  assert.ok(f.fs.paths().includes(`${directoryFor('resumable')}/0.bin`));
-  assert.ok(f.fs.paths().includes(`${directoryFor('resumable')}/2.bin`));
+  assert.ok(hasCachedSegment(f.fs, 'resumable', 0));
+  assert.ok(hasCachedSegment(f.fs, 'resumable', 2));
   assert.equal(f.fs.paths().some(path => /^neko-download-.*\.part$/.test(path)), false, 'Partial merged output must be removed after failure');
   f.flags.damageSecond = false;
   const resumed = await f.run('resumable', { resume: true }); assert.equal(resumed.success, true);
@@ -107,8 +109,8 @@ test('transient playlist failure during resume retains checkpoints and still off
   await until(() => f.status('plan-failure').state === 'interrupted', 'resumed playlist failure');
   assert.equal(f.status('plan-failure').cachedSegments, 2); assert.equal(f.status('plan-failure').resumable, true);
   assert.deepEqual(f.segmentCounts(), before);
-  assert.ok(f.fs.paths().includes(`${directoryFor('plan-failure')}/0.bin`));
-  assert.ok(f.fs.paths().includes(`${directoryFor('plan-failure')}/2.bin`));
+  assert.ok(hasCachedSegment(f.fs, 'plan-failure', 0));
+  assert.ok(hasCachedSegment(f.fs, 'plan-failure', 2));
   f.flags.failPlan = false; f.flags.damageSecond = false;
   await f.run('plan-failure', { resume: true });
   await until(() => f.status('plan-failure').state === 'complete');

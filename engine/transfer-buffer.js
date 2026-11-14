@@ -58,7 +58,9 @@
       for (;;) {
         check(signal);
         if (expected.has(index) && payloadBytes > expected.get(index)) throw new Error('分片正文超过声明大小');
-        const previous = held.get(index) || 0, projected = used - previous + amount;
+        const previous = held.get(index) || 0;
+        if (amount === previous) return;
+        const projected = used - previous + amount;
         if (fitsFutureHeads(index, projected)) {
           used = projected; held.set(index, amount); peak = Math.max(peak, used);
           if (amount < previous) notify();

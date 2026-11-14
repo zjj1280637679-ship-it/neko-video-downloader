@@ -354,6 +354,37 @@ test('reopened popup restores global jobs even on a Chrome internal tab', async 
   assert.equal(card.querySelector('.job-state').textContent, '已取消');
 });
 
+test('job refresh only rewrites cards with changed snapshots', async () => {
+  const jobs = Array.from({ length: 25 }, (_, index) => ({
+    id: `job-${index}`, filename: `video-${index}.ts`, state: index ? 'complete' : 'downloading',
+    totalSegments: 10, completedSegments: index ? 10 : 1
+  }));
+  const ui = await setup({ jobs });
+  const list = ui.elements.get('jobList');
+  const cards = list.querySelectorAll('.job-card'), writes = [];
+  for (const [index, card] of cards.entries()) {
+    const progress = card.querySelector('.job-progress');
+    const setAttribute = progress.setAttribute.bind(progress);
+    progress.setAttribute = (name, value) => {
+      if (name === 'aria-valuenow') writes.push(index);
+      setAttribute(name, value);
+    };
+  }
+
+  await ui.advance(2000);
+  assert.deepEqual(writes, []);
+
+  jobs[0].completedSegments = 3;
+  await ui.updateJobs();
+  assert.deepEqual(writes, [0]);
+  assert.equal(cards[0].querySelector('.job-percent').textContent, '30%');
+
+  ui.state.jobs = [...jobs].reverse();
+  await ui.updateJobs();
+  assert.deepEqual(list.querySelectorAll('.job-card'), [...cards].reverse());
+  assert.deepEqual(writes, [0]);
+});
+
 test('opening scans the page while jobs and preferences are blocked, without overriding the selected tab later', async () => {
   const ui = await setup({ media: [media()], deferInitialJobs: true, deferredActions: ['getSettings'], leaveInitializationPending: true,
     jobs: [{ id: 'active', state: 'downloading', isM3U8: true }] });

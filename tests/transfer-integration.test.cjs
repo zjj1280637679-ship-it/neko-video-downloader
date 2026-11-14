@@ -90,6 +90,41 @@ test('waiting for local payload budget does not cause network timeout or retries
   assert.deepEqual(output.map(bytes => bytes[0]), [1, 2, 3, 4, 5, 6, 7, 8]);
 });
 
+test('a fixed-length stream with steady chunks can outlast the network idle deadline', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const chunks = [Uint8Array.of(1, 2), Uint8Array.of(3, 4), Uint8Array.of(5, 6)];
+  let stream, requestSignal;
+  const output = [];
+  const client = createClient({ timeoutMs: 20, retries: 1, fetch: async (_url, { signal }) => {
+    requestSignal = signal;
+    return new Response(new ReadableStream({ start(controller) {
+      stream = controller;
+      signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+    } }), { headers: { 'Content-Length': '6' } });
+  } });
+  const pending = client.download(plan(1), { async write(bytes) { output.push(Buffer.from(bytes)); } });
+  pending.catch(() => {});
+  await settle();
+  for (const chunk of chunks) {
+    t.mock.timers.tick(15);
+    assert.equal(requestSignal.aborted, false);
+    stream.enqueue(chunk);
+    await settle();
+  }
+  stream.close();
+  await pending;
+  assert.deepEqual(Buffer.concat(output), Buffer.from([1, 2, 3, 4, 5, 6]));
+});
+
+test('fixed-length payloads reject a short or oversized stream before writing', async () => {
+  for (const declared of [3, 5]) {
+    const client = createClient({ retries: 1, fetch: async () =>
+      new Response(Uint8Array.of(1, 2, 3, 4), { headers: { 'Content-Length': String(declared) } }) });
+    await assert.rejects(client.download(plan(1), { async write() { assert.fail('Invalid body was written'); } }),
+      /实际长度与响应声明不符/);
+  }
+});
+
 test('later cache failure promptly aborts a waiting head request', async () => {
   let headAborted = false;
   const client = createClient({ retries: 1, fetch: async (url, { signal }) => {

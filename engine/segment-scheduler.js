@@ -21,7 +21,7 @@
     const eta = options.createEtaEstimator({ totalSegments: plan.segments.length, now });
     const operation = new AbortController(), pending = new Map(), resident = new Map(), ready = new Set(), results = new Map();
     let bytes = 0, completed = 0, lastMap = null, next = 0, running = 0, firstFailure = null, filling = false, writing = null;
-    let stopped = false, unsubscribe, writerWake;
+    let stopped = false, unsubscribe, writerWake, bufferedBytes = 0;
     const wakeWriter = () => { const wake = writerWake; writerWake = null; wake?.(); };
     const active = () => { if (operation.signal.aborted) throw operation.signal.reason || abortError(); };
     const abort = () => { operation.abort(options.signal.reason || abortError()); wakeWriter(); };
@@ -31,12 +31,19 @@
       const concurrency = target();
       const metrics = { ...meter.metrics(), ...eta.metrics(), activeConcurrency: concurrency, targetConcurrency: concurrency,
         concurrencyMode: 'manual', concurrencyReason: 'manual',
-        bufferedBytes: [...resident.values()].reduce((sum, size) => sum + size, 0), bufferedSegments: ready.size,
+        bufferedBytes, bufferedSegments: ready.size,
         reservedBufferBytes: buffer.stats().reservedBytes, bufferBudgetBytes: budgetBytes };
       try { Promise.resolve(options.onMetrics?.(metrics)).catch(() => {}); } catch { /* Telemetry cannot stop a transfer. */ }
       return metrics;
     }
-    function release(index) { resident.delete(index); ready.delete(index); buffer.release(index); }
+    function trackResident(index, size) {
+      bufferedBytes += size - (resident.get(index) || 0);
+      resident.set(index, size);
+    }
+    function release(index) {
+      bufferedBytes -= resident.get(index) || 0;
+      resident.delete(index); ready.delete(index); buffer.release(index);
+    }
     function discardReady() {
       // Drop the actual ArrayBuffer references before releasing reservations.
       for (const index of [...ready]) { const result = results.get(index); if (result) result.data = null; results.delete(index); release(index); }
@@ -60,7 +67,7 @@
           const cached = await hooks.getSegment(index, segment, async size => { buffer.setExpectedSize(index, size); await reserve(size); }); active();
           if (cached != null) {
             if (Object.prototype.toString.call(cached) !== '[object ArrayBuffer]' || !cached.byteLength) throw new Error('已缓存的分片内容无效');
-            await reserve(cached.byteLength); resident.set(index, cached.byteLength); eta.recordCached(index);
+            await reserve(cached.byteLength); trackResident(index, cached.byteLength); eta.recordCached(index);
             return { data: cached };
           }
           release(index); reservation = 0;
@@ -77,13 +84,13 @@
           prepareBody: reserve,
           onStart(id) { meter.onRequestStart(id); emit(); },
           onResponse(id) { meter.onResponse(id); emit(); },
-          onBytes(id, size) { resident.set(index, (resident.get(index) || 0) + size); meter.onBytes(id, size); },
+          onBytes(id, size) { trackResident(index, (resident.get(index) || 0) + size); meter.onBytes(id, size); },
           onEnd(id, result) { meter.onRequestEnd(id, result); emit(); },
           onInvalid(id) { meter.onRequestInvalid(id); },
           onFailure() { release(index); reservation = 0; emit(); }
         });
         active(); await buffer.reserve(index, data.byteLength, operation.signal);
-        resident.set(index, data.byteLength); eta.recordNetwork(index, data.byteLength);
+        trackResident(index, data.byteLength); eta.recordNetwork(index, data.byteLength);
         if (hooks.putSegment) {
           stage = 'cache-write';
           await hooks.putSegment(index, segment, data);

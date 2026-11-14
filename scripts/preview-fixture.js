@@ -9,10 +9,23 @@
     const saved = JSON.parse(localStorage.getItem(settingsKey) || 'null');
     if (saved && typeof saved === 'object') settings = { concurrency: Number.isInteger(saved.concurrency) && saved.concurrency >= 1 && saved.concurrency <= 375 ? saved.concurrency : 64 };
   } catch {}
-  const media = ['empty', 'error'].includes(scenario) ? [] : [{ id: 'demo-source', url: 'https://media.example.test/video/index.m3u8?signature=hidden',
+  const nativePreview = scenario === 'platforms' || scenario === 'platform-jobs';
+  const platformMedia = [
+    { id: 'demo-bilibili', url: 'https://www.bilibili.com/video/BV13x41117TL/?p=2', page: 2,
+      engine: 'bilibili-native', site: 'bilibili', suggestedFilename: '周末散步 · P2.mp4', active: true },
+    { id: 'demo-youtube', url: 'https://www.youtube.com/watch?v=BaW_jenozKc',
+      engine: 'youtube-native', site: 'youtube', suggestedFilename: '城市街角.mp4' }
+  ];
+  const media = nativePreview ? platformMedia : ['empty', 'error'].includes(scenario) ? [] : [{ id: 'demo-source', url: 'https://media.example.test/video/index.m3u8?signature=hidden',
     name: '第1集', title: '窗边的小旅行', suggestedFilename: '窗边的小旅行_第1集.m3u8', isM3U8: true, ext: 'm3u8',
     mime: 'application/vnd.apple.mpegurl', active: true, source: 'dom', evidence: ['dom-selection', 'network-mime'], timestamp: Date.now() }];
-  const jobs = scenario === 'jobs' ? [{ id: 'demo-job', title: '窗边的小旅行 · 第1集', url: media[0].url, isM3U8: true,
+  const jobs = scenario === 'platform-jobs' ? [
+    { ...platformMedia[0], state: 'muxing', filename: '周末散步 · P2.mp4', bytesReceived: 52428800,
+      totalBytes: 52428800, qualityLabel: '1080p', segmented: false, updatedAt: Date.now() },
+    { ...platformMedia[1], state: 'downloading', filename: '城市街角.mp4', bytesReceived: 15728640,
+      totalBytes: 41943040, bytesPerSecond: 3145728, etaSeconds: 9, qualityLabel: '720p',
+      segmented: false, updatedAt: Date.now() - 1 }
+  ] : scenario === 'jobs' ? [{ id: 'demo-job', title: '窗边的小旅行 · 第1集', url: media[0].url, isM3U8: true,
     state: 'downloading', bytesReceived: 52428800, totalBytes: 0, completedSegments: 180, totalSegments: 576,
     bytesPerSecond: 3145728, concurrency: settings.concurrency, targetConcurrency: settings.concurrency,
     etaSeconds: 124, etaBasis: 'network-segments',
@@ -54,7 +67,8 @@
         case 'retryJob': { const job = jobs.find(j => j.id === message.jobId); if (job) Object.assign(job, { state: 'queued', cancelRequested: false, concurrency: settings.concurrency, targetConcurrency: settings.concurrency }); response.job = job; break; }
         case 'discardJob': { const job = jobs.find(j => j.id === message.jobId); if (job) job.resumable = false; break; }
       }
-      callback(response); if (!message.action.startsWith('get')) queueMicrotask(notify);
+      // Chrome runtime messaging JSON-serializes replies, giving the popup its own snapshot.
+      callback(JSON.parse(JSON.stringify(response))); if (!message.action.startsWith('get')) queueMicrotask(notify);
     } },
     tabs: { query: async () => [{ id: 1, url: 'https://example.test/watch' }] }
   };

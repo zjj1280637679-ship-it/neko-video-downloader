@@ -236,6 +236,11 @@
       let timedOut = false, httpStatus, succeeded = false;
       const startTimeout = () => setTimeout(() => { timedOut = true; controller.abort(new DOMException("资源请求超时", "TimeoutError")); }, options.timeoutMs ?? 30000);
       let timer = startTimeout();
+      const refreshTimeout = () => {
+        ensureActive(operationSignal);
+        clearTimeout(timer);
+        timer = startTimeout();
+      };
       const requestId = ++requestSequence;
       observer?.onStart?.(requestId);
       try {
@@ -265,7 +270,8 @@
         let data = await readBoundedBody(response, limit, asText ? '播放清单' : '单个分片', observer ? {
           onBytes: size => observer.onBytes?.(requestId, size),
           declare: size => observer.declareBody?.(size),
-          reserve
+          reserve,
+          refreshTimeout
         } : null);
         if (asText) { succeeded = true; return { text: new TextDecoder().decode(data), url: response.url || url, httpStatus }; }
         if (byteRange) {
@@ -318,11 +324,17 @@
         await observer?.reserve?.(data.byteLength);
         return data;
       }
-      const reader = response.body.getReader(), chunks = [];
+      const reader = response.body.getReader();
       let size = 0;
       try {
+        // The scheduler has already reserved a trusted length in full. Write
+        // chunks into that buffer while retaining an idle deadline per read.
+        const preallocated = exactLength !== null && observer?.reserve;
+        let exactData;
+        const chunks = preallocated ? null : [];
         for (;;) {
-          await observer?.reserve?.(exactLength ?? Math.min(limit, size + 65536));
+          if (preallocated) observer.refreshTimeout();
+          else await observer?.reserve?.(exactLength ?? Math.min(limit, size + 65536));
           const { done, value } = await reader.read();
           if (done) break;
           size += value.byteLength;
@@ -332,10 +344,16 @@
           // exceed the read-ahead reservation; browser-owned buffers are not
           // part of the scheduler's payload budget.
           observer?.onBytes?.(value.byteLength);
-          await observer?.reserve?.(size);
-          chunks.push(value);
+          if (preallocated) {
+            exactData ||= new Uint8Array(exactLength);
+            exactData.set(value, size - value.byteLength);
+          } else {
+            await observer?.reserve?.(size);
+            chunks.push(value);
+          }
         }
         checkLength(size);
+        if (exactData) return exactData.buffer;
         const data = new Uint8Array(size);
         let offset = 0;
         for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.byteLength; }

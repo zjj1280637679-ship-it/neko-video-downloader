@@ -9,9 +9,9 @@
 <body>
   <div class="app-container" id="appContent">
     <header class="header">
-      <div class="brand-mark" aria-hidden="true"><img src="icons/yangmo-mascot.png" alt=""></div>
-      <div class="brand-copy"><p class="eyebrow">YANGMO / VIDEO</p><h1>羊魔 · 视频收藏</h1><p class="subtitle">把喜欢的画面，留在身边。</p></div>
-      <button type="button" class="btn-refresh" id="btnRefresh" aria-label="重新读取视频来源" title="重新读取视频来源"><span class="refresh-icon" aria-hidden="true">↻</span><span class="refresh-label">重新读取<small>视频来源</small></span></button>
+      <div class="brand-mark" aria-hidden="true"><img src="icons/yangmo-mascot.png" alt="" width="54" height="54"></div>
+      <h1>羊魔 <span>视频收藏</span></h1>
+      <button type="button" class="btn-refresh" id="btnRefresh" aria-label="重新读取视频来源" title="重新读取视频来源"><span class="refresh-icon" aria-hidden="true">↻</span><span>重新读取<br>视频来源</span></button>
     </header>
     <nav class="view-tabs" role="tablist" aria-label="视频与下载">
       <button id="sourceTab" class="view-tab" role="tab" aria-selected="true" aria-controls="sourcePanel">视频来源 <span id="sourceTabCount">0</span></button>
@@ -22,17 +22,19 @@
       <main class="media-list" id="mediaList" aria-label="视频来源"></main>
     </section>
     <section class="view-panel" id="jobsPanel" role="tabpanel" aria-labelledby="jobsTab" hidden>
-      <p class="jobs-hint"><span aria-hidden="true">✓</span> 关掉弹窗也会继续下载，下次打开可查看进度。</p>
+      <p class="jobs-hint"><span aria-hidden="true">✓</span> 关闭弹窗后，任务会继续在后台下载。</p>
       <p id="jobsStatus" class="jobs-status" role="status" aria-live="polite" hidden></p>
       <div class="job-list" id="jobList" aria-label="最近下载任务"></div>
-      <section class="concurrency-bar" aria-label="下载并发">
-        <div class="concurrency-control"><label for="concurrency">分片并发</label><div class="concurrency-slider"><span id="concurrencyCalm" class="concurrency-endpoint">稳</span><input id="concurrency" type="range" min="1" max="375" step="1" value="64" aria-describedby="concurrencyHint saveError saveStatus" title="1–375 路，实时控制所有分片任务；降低并发时，已发请求会自然结束。非分片任务正常下载，不受滑块影响。" disabled><span id="concurrencyFast" class="concurrency-endpoint">急</span></div><output id="concurrencyValue" for="concurrency">64</output></div>
-        <div class="concurrency-meta"><p id="concurrencyHint" class="concurrency-hint">实时控制所有分片任务</p><span id="saveStatus" class="save-status" role="status" aria-live="polite">读取中…</span><button type="button" id="btnReloadPreferences" class="preference-retry" hidden>重新读取</button></div>
-        <p class="save-error" id="saveError" role="alert" hidden></p>
-      </section>
-      <section class="save-bar" aria-label="保存位置">
-        <div class="save-heading"><span>保存位置</span><span id="saveLocation">Chrome 默认下载目录</span></div>
-      </section>
+      <footer class="job-preferences">
+        <section class="concurrency-bar" aria-label="下载并发">
+          <div class="concurrency-control"><label for="concurrency">分片并发</label><div class="concurrency-slider"><span id="concurrencyCalm" class="concurrency-endpoint">稳</span><input id="concurrency" type="range" min="1" max="375" step="1" value="64" aria-describedby="concurrencyHint saveError saveStatus" title="1–375 路，实时控制所有分片任务；降低并发时，已发请求会自然结束。非分片任务维持正常下载。" disabled><span id="concurrencyFast" class="concurrency-endpoint">急</span></div><output id="concurrencyValue" for="concurrency">64</output></div>
+          <div class="concurrency-meta"><p id="concurrencyHint" class="concurrency-hint">实时控制所有分片任务</p><span id="saveStatus" class="save-status" role="status" aria-live="polite">读取中…</span><button type="button" id="btnReloadPreferences" class="preference-retry" hidden>重新读取</button></div>
+          <p class="save-error" id="saveError" role="alert" hidden></p>
+        </section>
+        <section class="save-bar" aria-label="保存位置">
+          <div class="save-heading"><span>保存位置</span><span id="saveLocation">Chrome 默认下载目录</span></div>
+        </section>
+      </footer>
     </section>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
