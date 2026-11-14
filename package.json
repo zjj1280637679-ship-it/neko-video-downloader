@@ -1,6 +1,6 @@
 {
   "name": "neko-video-downloader",
-  "version": "2.2.1",
+  "version": "2.4.0",
   "private": true,
   "description": "Explainable, modular Yangmo video downloader for Chrome",
   "scripts": {

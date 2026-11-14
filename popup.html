@@ -26,7 +26,7 @@
       <p id="jobsStatus" class="jobs-status" role="status" aria-live="polite" hidden></p>
       <div class="job-list" id="jobList" aria-label="最近下载任务"></div>
       <section class="concurrency-bar" aria-label="下载并发">
-        <div class="concurrency-control"><label for="concurrency">分片并发</label><div class="concurrency-slider"><span id="concurrencyCalm" class="concurrency-endpoint">稳</span><input id="concurrency" type="range" min="1" max="375" step="1" value="64" aria-describedby="concurrencyHint saveError saveStatus" title="1–375 路，实时控制所有分片任务；降低并发时，已发请求会自然结束。普通视频文件由 Chrome 管理。" disabled><span id="concurrencyFast" class="concurrency-endpoint">急</span></div><output id="concurrencyValue" for="concurrency">64</output></div>
+        <div class="concurrency-control"><label for="concurrency">分片并发</label><div class="concurrency-slider"><span id="concurrencyCalm" class="concurrency-endpoint">稳</span><input id="concurrency" type="range" min="1" max="375" step="1" value="64" aria-describedby="concurrencyHint saveError saveStatus" title="1–375 路，实时控制所有分片任务；降低并发时，已发请求会自然结束。非分片任务正常下载，不受滑块影响。" disabled><span id="concurrencyFast" class="concurrency-endpoint">急</span></div><output id="concurrencyValue" for="concurrency">64</output></div>
         <div class="concurrency-meta"><p id="concurrencyHint" class="concurrency-hint">实时控制所有分片任务</p><span id="saveStatus" class="save-status" role="status" aria-live="polite">读取中…</span><button type="button" id="btnReloadPreferences" class="preference-retry" hidden>重新读取</button></div>
         <p class="save-error" id="saveError" role="alert" hidden></p>
       </section>
@@ -36,6 +36,9 @@
     </section>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="domain/youtube.js"></script>
+  <script src="domain/bilibili.js"></script>
+  <script src="domain/sites.js"></script>
   <script src="ui/format.js"></script>
   <script src="ui/explain.js"></script>
   <script src="ui/capture.js"></script>

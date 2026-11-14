@@ -36,7 +36,7 @@ function makeBackground({ deferRestore = false, restored = {}, now = 100000 } = 
     }
   };
   class ClockDate extends Date { static now() { return now; } }
-  const context = vm.createContext({ chrome, NekoMedia: mediaRules, crypto: webcrypto, URL, console, Date: ClockDate, setTimeout(fn) { timers.push(fn); return timers.length; }, clearTimeout() {} });
+  const context = vm.createContext({ chrome, NekoMedia: mediaRules, NekoSites: require('../domain/sites.js'), crypto: webcrypto, URL, console, Date: ClockDate, setTimeout(fn) { timers.push(fn); return timers.length; }, clearTimeout() {} });
   vm.runInContext(background, context);
   const message = (body, sender = {}) => new Promise(resolve => {
     const result = chrome.runtime.onMessage.listeners[0](body, sender, resolve);

@@ -32,3 +32,24 @@ test('each public state has a user-readable execution explanation', () => {
   assert.match(state.describe({ state: 'downloading', isM3U8: true }), /并行.*顺序/);
   assert.match(state.describe({ state: 'saving' }), /等待 Chrome/);
 });
+
+test('native muxing stays active and cannot move backwards into network download', () => {
+  assert.ok(state.ACTIVE.includes('muxing'));
+  assert.equal(state.canAdvance('downloading', 'muxing'), true);
+  assert.equal(state.canAdvance('muxing', 'saving'), true);
+  assert.equal(state.canAdvance('muxing', 'downloading'), false);
+  assert.match(state.describe({ engine: 'youtube-native', state: 'parsing' }), /YouTube/);
+  assert.match(state.describe({ engine: 'youtube-native', state: 'muxing' }), /尚未保存/);
+});
+
+test('Bilibili native descriptions use the same protocol without claiming Chrome is downloading its tracks', () => {
+  const job = { engine: 'bilibili-native', site: 'bilibili', state: 'parsing' };
+  assert.match(state.describe(job), /B站/);
+  assert.doesNotMatch(state.describe(job), /YouTube|播放清单/);
+  job.state = 'downloading';
+  assert.match(state.describe(job), /本机内核/); assert.doesNotMatch(state.describe(job), /Chrome/);
+  job.segmented = true;
+  assert.match(state.describe(job), /实时并发.*按序/);
+  job.state = 'saving';
+  assert.match(state.describe(job), /等待 Chrome/);
+});

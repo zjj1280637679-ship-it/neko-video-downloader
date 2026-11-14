@@ -80,3 +80,25 @@ test('invalid concurrency is never presented as a task setting', () => {
     assert.doesNotMatch(jobExplanation(job).concurrency, /并发 \d/);
   }
 });
+
+test('YouTube explanations separate native nonfragment transfer, live segments and unconfirmed muxing', () => {
+  const direct = jobExplanation({ engine: 'youtube-native', segmented: false, state: 'downloading', targetConcurrency: 64 });
+  assert.equal(direct.source, 'YouTube 视频页面'); assert.match(direct.concurrency, /不受滑块影响/);
+  assert.doesNotMatch(direct.concurrency, /并发 64|由 Chrome 管理/);
+  const fragments = jobExplanation({ engine: 'youtube-native', segmented: true, state: 'downloading', targetConcurrency: 375 });
+  assert.match(fragments.concurrency, /并发 375/); assert.match(fragments.order, /合并检查.*Chrome/);
+  const muxing = jobExplanation({ engine: 'youtube-native', state: 'muxing' });
+  assert.match(muxing.phase, /合并.*尚未保存/); assert.match(muxing.result, /尚未确认/);
+});
+
+test('Bilibili explanation identifies the current part and only actual fragments use concurrency', () => {
+  const job = { engine: 'bilibili-native', site: 'bilibili', page: 3, state: 'parsing', segmented: false, targetConcurrency: 64 };
+  assert.equal(jobExplanation(job).source, 'B站 视频页面 · P3');
+  assert.match(jobExplanation(job).phase, /解析 B站/);
+  assert.doesNotMatch(jobExplanation(job).concurrency, /并发 64/);
+  Object.assign(job, { state: 'downloading', segmented: true });
+  assert.match(jobExplanation(job).concurrency, /并发 64/);
+  Object.assign(job, { state: 'muxing' });
+  assert.match(jobExplanation(job).phase, /尚未保存/);
+  assert.doesNotMatch(Object.values(jobExplanation(job)).join(' '), /YouTube/);
+});

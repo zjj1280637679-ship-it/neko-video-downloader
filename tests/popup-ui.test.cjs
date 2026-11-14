@@ -10,13 +10,14 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 // opening a browser or downloading network content.
 async function setup(options = {}) {
   let ready, poll;
-  const elements = new Map(), messages = [], downloadCalls = [], runtimeListeners = new Set(), pendingActions = new Map(), windowListeners = new Map(), documentListeners = new Map();
+  const elements = new Map(), messages = [], downloadCalls = [], permissionCalls = [], runtimeListeners = new Set(), pendingActions = new Map(), windowListeners = new Map(), documentListeners = new Map();
   const timers = { intervals: 0, timeouts: 0 };
   const state = {
     media: options.media || [], jobs: options.jobs || [],
     settings: options.settings || { concurrency: 64 }, deferJobs: Boolean(options.deferInitialJobs), deferMedia: false, recoveryError: options.recoveryError || null,
     settingsError: null, getSettingsError: options.getSettingsError || null, liveApplied: options.liveApplied, liveWarning: options.liveWarning, nextJob: 1, now: 1000,
-    capturePhase: options.capturePhase || (options.media?.length ? 'found' : 'checking'), playback: options.playback || {}, chunkCount: 0
+    capturePhase: options.capturePhase || (options.media?.length ? 'found' : 'checking'), playback: options.playback || {}, chunkCount: 0,
+    permissionGranted: options.permissionGranted === true
   };
   const document = { hidden: false, activeElement: null, addEventListener(name, fn) { if (name === 'DOMContentLoaded') ready = fn; else documentListeners.set(name, fn); }, getElementById(id) { assert.ok(elements.has(id), `Missing HTML element ${id}`); return elements.get(id); } };
   class Element {
@@ -67,6 +68,11 @@ async function setup(options = {}) {
   }
   document.createElement = tag => new Element(tag);
   const chrome = {
+    permissions: { request(request) {
+      permissionCalls.push(structuredClone(request));
+      if (options.deferPermission) return new Promise(resolve => pendingActions.set('permission', () => resolve(state.permissionGranted)));
+      return Promise.resolve(state.permissionGranted);
+    } },
     runtime: {
       onMessage: { addListener(fn) { runtimeListeners.add(fn); }, removeListener(fn) { runtimeListeners.delete(fn); } },
       sendMessage(message, callback) {
@@ -129,12 +135,13 @@ async function setup(options = {}) {
   };
   class Clock extends Date { static now() { return state.now; } }
   const context = vm.createContext({ document, chrome, window: { addEventListener(name, fn) { windowListeners.set(name, fn); } }, navigator: { clipboard: { async writeText() {} } }, URL, URLSearchParams, Date: Clock, console, queueMicrotask, setTimeout() { timers.timeouts++; return 1; }, clearTimeout() {}, setInterval(fn, duration) { timers.intervals++; assert.equal(duration, 2000); poll = fn; return 2; }, clearInterval() {} });
+  for (const name of ['youtube', 'bilibili', 'sites']) vm.runInContext(fs.readFileSync(require.resolve(`../domain/${name}.js`), 'utf8'), context);
   for (const name of ["format", "explain", "capture"]) vm.runInContext(fs.readFileSync(require.resolve(`../ui/${name}.js`), "utf8"), context);
   vm.runInContext(source, context); const initialized = ready();
   if (!options.leaveInitializationPending) await initialized;
   await tick();
   return {
-    elements, messages, downloadCalls, state, document, timers, initialized,
+    elements, messages, downloadCalls, permissionCalls, state, document, timers, initialized,
     async visibility(hidden) { document.hidden = hidden; documentListeners.get('visibilitychange')?.(); await tick(); },
     async finishAction(action) {
       const pending = pendingActions.get(action);
@@ -166,6 +173,169 @@ test('both HLS and direct video start background jobs without opening a page', a
     assert.equal(ui.elements.get('sourcePanel').hidden, true);
     assert.equal(ui.downloadCalls.length, 0);
     assert.equal(ui.elements.get('jobList').querySelector('.job-state').textContent, '等待下载');
+  }
+});
+
+test('YouTube source starts the native adapter and retry never mislabels segments as HLS', async () => {
+  const item = { url: 'https://www.youtube.com/watch?v=BaW_jenozKc', engine: 'youtube-native', kind: 'youtube',
+    isM3U8: false, ext: 'mp4', suggestedFilename: '中文视频.mp4' };
+  const ui = await setup({ media: [item] });
+  assert.equal(ui.elements.get('mediaList').querySelector('.badge-tag').textContent, 'YouTube');
+  assert.equal(ui.elements.get('mediaList').querySelector('.media-size').textContent, '自动合并');
+  await ui.click(ui.elements.get('mediaList').querySelector('.btn-primary'));
+  const request = ui.messages.find(message => message.action === 'startDownload');
+  assert.equal(request.engine, 'youtube-native'); assert.equal(request.isM3U8, false);
+  Object.assign(ui.state.jobs[0], { state: 'interrupted', totalSegments: 10, engine: 'youtube-native' });
+  await ui.updateJobs(); await ui.click(ui.elements.get('jobList').querySelectorAll('.job-button')[1]);
+  const retried = ui.messages.filter(message => message.action === 'startDownload').at(-1);
+  assert.equal(retried.engine, 'youtube-native'); assert.equal(retried.isM3U8, false);
+});
+
+test('native nonfragment jobs hide concurrency and muxing keeps cancellation without pretending saved', async () => {
+  const job = { id: 'native', engine: 'youtube-native', url: 'https://www.youtube.com/watch?v=BaW_jenozKc',
+    filename: '中文视频.mp4', state: 'downloading', segmented: false, targetConcurrency: 64, bytesReceived: 5, totalBytes: 10 };
+  const ui = await setup({ jobs: [job] }); const card = ui.elements.get('jobList').querySelector('.job-card');
+  assert.equal(card.querySelector('.job-concurrency').hidden, true);
+  Object.assign(ui.state.jobs[0], { segmented: true, totalSegments: 10, completedSegments: 4 }); await ui.updateJobs();
+  assert.equal(card.querySelector('.job-concurrency').hidden, false); assert.equal(card.querySelector('.job-concurrency').textContent, '并发 64');
+  Object.assign(ui.state.jobs[0], { state: 'muxing', completedSegments: 10, bytesReceived: 10 }); await ui.updateJobs();
+  assert.equal(card.querySelector('.job-state').textContent, '合并音视频');
+  assert.equal(card.querySelector('.job-eta').hidden, true); assert.equal(card.querySelectorAll('.job-button')[0].hidden, false);
+  assert.equal(card.querySelectorAll('.job-button')[2].hidden, true); assert.equal(card.dataset.animating, 'true');
+});
+
+test('authentication retry requests cookies in the click gesture and denial never starts a download', async () => {
+  const job = { id: 'auth', runId: 'attempt-1', engine: 'youtube-native', state: 'interrupted', authRequired: true,
+    url: 'https://www.youtube.com/watch?v=BaW_jenozKc', filename: '中文视频.mp4' };
+  const ui = await setup({ jobs: [job], deferPermission: true });
+  const card = ui.elements.get('jobList').querySelector('.job-card'), retry = card.querySelectorAll('.job-button')[1];
+  assert.equal(retry.textContent, '使用 YouTube 登录状态重试');
+  assert.equal(card.querySelector('.job-auth-status').hidden, false);
+  assert.match(card.querySelector('.job-auth-status').textContent, /仅将 YouTube 登录状态交给本机下载内核.*此视频/);
+  assert.equal(ui.permissionCalls.length, 0, 'Rendering or polling never requests login access');
+  const pending = ui.click(retry);
+  assert.equal(ui.permissionCalls.length, 1, 'Permission request happens synchronously before the first await');
+  assert.deepEqual(ui.permissionCalls[0], { permissions: ['cookies'] });
+  assert.equal(ui.messages.some(message => message.action === 'startDownload'), false);
+  await ui.finishAction('permission'); await pending;
+  assert.equal(ui.messages.some(message => message.action === 'startDownload'), false);
+  assert.match(ui.elements.get('toast').textContent, /未授权.*下载未开始/);
+  assert.match(card.querySelector('.job-error').textContent, /未授权/);
+  assert.equal(retry.disabled, false);
+});
+
+test('approved authentication retry sends only an explicit session boolean for the same YouTube task', async () => {
+  const ui = await setup({ permissionGranted: true, jobs: [{ id: 'auth', runId: 'attempt-1', engine: 'youtube-native',
+    state: 'interrupted', authRequired: true, url: 'https://www.youtube.com/watch?v=BaW_jenozKc', filename: '中文视频.mp4' }] });
+  await ui.click(ui.elements.get('jobList').querySelectorAll('.job-button')[1]);
+  const request = ui.messages.find(message => message.action === 'startDownload');
+  assert.equal(request.engine, 'youtube-native'); assert.equal(request.site, 'youtube'); assert.equal(request.useSiteSession, true);
+  assert.equal('useYouTubeSession' in request, false);
+  assert.equal(request.url, 'https://www.youtube.com/watch?v=BaW_jenozKc'); assert.equal(request.isM3U8, false);
+  assert.equal('cookies' in request, false); assert.equal('authRequired' in request, false);
+  assert.equal(ui.permissionCalls.length, 1);
+});
+
+test('ordinary starts and non-auth retries remain anonymous even if an old record contains a session flag', async () => {
+  const source = { engine: 'youtube-native', authRequired: true, useYouTubeSession: true,
+    url: 'https://www.youtube.com/watch?v=BaW_jenozKc', suggestedFilename: '来源.mp4' };
+  const fresh = await setup({ media: [source], permissionGranted: true });
+  await fresh.click(fresh.elements.get('mediaList').querySelector('.btn-primary'));
+  assert.equal(fresh.permissionCalls.length, 0); assert.equal('useYouTubeSession' in fresh.messages.find(message => message.action === 'startDownload'), false);
+  for (const extra of [
+    { engine: 'youtube-native', authRequired: false, state: 'interrupted' },
+    { engine: 'youtube-native', authRequired: true, state: 'cancelled' },
+    { engine: 'other', authRequired: true, state: 'interrupted' }
+  ]) {
+    const ui = await setup({ jobs: [{ id: 'retry', url: source.url, filename: '视频.mp4', useYouTubeSession: true, ...extra }] });
+    const card = ui.elements.get('jobList').querySelector('.job-card');
+    assert.equal(card.querySelector('.job-auth-status').hidden, true);
+    assert.equal(card.querySelectorAll('.job-button')[1].textContent, '重新下载');
+    await ui.click(card.querySelectorAll('.job-button')[1]);
+    assert.equal(ui.permissionCalls.length, 0); assert.equal('useYouTubeSession' in ui.messages.find(message => message.action === 'startDownload'), false);
+  }
+});
+
+test('a permission result cannot launch a task that changed while the consent prompt was open', async () => {
+  const job = { id: 'auth', runId: 'attempt-1', engine: 'youtube-native', state: 'interrupted', authRequired: true,
+    url: 'https://www.youtube.com/watch?v=BaW_jenozKc', filename: '视频.mp4' };
+  const ui = await setup({ jobs: [job], permissionGranted: true, deferPermission: true });
+  const pending = ui.click(ui.elements.get('jobList').querySelectorAll('.job-button')[1]);
+  job.runId = 'new-attempt'; await ui.updateJobs();
+  await ui.finishAction('permission'); await pending;
+  assert.equal(ui.messages.some(message => message.action === 'startDownload'), false);
+  assert.match(ui.elements.get('toast').textContent, /任务已变化/);
+});
+
+test('Bilibili source starts only its current part anonymously with the proper engine', async () => {
+  const ui = await setup({ permissionGranted: true, media: [{ engine: 'bilibili-native', site: 'bilibili', page: 3,
+    url: 'https://www.bilibili.com/video/BV13x41117TL/?p=3', suggestedFilename: '第三部分.mp4', useSiteSession: true }] });
+  assert.equal(ui.elements.get('mediaList').querySelector('.badge-tag').textContent, 'B站 · P3');
+  assert.equal(ui.elements.get('mediaList').querySelector('.media-size').textContent, '自动合并');
+  await ui.click(ui.elements.get('mediaList').querySelector('.btn-primary'));
+  const request = ui.messages.find(message => message.action === 'startDownload');
+  assert.equal(request.engine, 'bilibili-native'); assert.equal(request.site, 'bilibili'); assert.equal(request.page, 3);
+  assert.equal(request.isM3U8, false); assert.equal(request.url, 'https://www.bilibili.com/video/BV13x41117TL/?p=3');
+  assert.equal('useSiteSession' in request, false); assert.equal('useYouTubeSession' in request, false);
+  assert.equal(ui.permissionCalls.length, 0, 'Existing cookie access never silently authenticates a fresh task');
+});
+
+test('task metrics show actual engine-supplied quality and never infer it from the website', async () => {
+  const job = { id: 'quality', engine: 'bilibili-native', site: 'bilibili', page: 1,
+    url: 'https://www.bilibili.com/video/BV13x41117TL/?p=1', state: 'downloading', bytesReceived: 1024, totalBytes: 2048, segmented: false };
+  const ui = await setup({ jobs: [job] }); const card = ui.elements.get('jobList').querySelector('.job-card');
+  assert.equal(card.querySelector('.job-metrics').textContent, '1.0 KB / 2.0 KB');
+  assert.equal(card.querySelector('.job-concurrency').hidden, true);
+  job.qualityLabel = '720p'; await ui.updateJobs();
+  assert.equal(card.querySelector('.job-metrics').textContent, '720p · 1.0 KB / 2.0 KB');
+  delete job.qualityLabel; await ui.updateJobs();
+  assert.doesNotMatch(card.querySelector('.job-metrics').textContent, /720p|1080p/);
+});
+
+test('Bilibili auth retry explains only its own site and requires an explicit permission gesture', async () => {
+  for (const permissionGranted of [false, true]) {
+    const ui = await setup({ permissionGranted, jobs: [{ id: 'bili-auth', runId: 'attempt-1', engine: 'bilibili-native', site: 'bilibili',
+      state: 'interrupted', authRequired: true, page: 2, url: 'https://www.bilibili.com/video/av1074402/?p=2', filename: '第二部分.mp4' }] });
+    const card = ui.elements.get('jobList').querySelector('.job-card');
+    assert.equal(card.querySelectorAll('.job-button')[1].textContent, '使用 B站 登录状态重试');
+    assert.match(card.querySelector('.job-auth-status').textContent, /仅将 B站 登录状态.*向 B站 请求/);
+    assert.doesNotMatch(card.querySelector('.job-auth-status').textContent, /YouTube/);
+    assert.equal(ui.permissionCalls.length, 0);
+    await ui.click(card.querySelectorAll('.job-button')[1]);
+    assert.deepEqual(ui.permissionCalls, [{ permissions: ['cookies'] }]);
+    const request = ui.messages.find(message => message.action === 'startDownload');
+    if (permissionGranted) {
+      assert.equal(request.useSiteSession, true); assert.equal(request.site, 'bilibili'); assert.equal(request.page, 2);
+      assert.equal(request.engine, 'bilibili-native'); assert.equal('useYouTubeSession' in request, false); assert.equal('cookies' in request, false);
+    } else {
+      assert.equal(request, undefined); assert.match(ui.elements.get('toast').textContent, /未授权使用 B站.*下载未开始/);
+    }
+  }
+});
+
+test('mismatched native site identities cannot request account permission or start a download', async () => {
+  const ui = await setup({ jobs: [{ id: 'mismatch', engine: 'youtube-native', site: 'bilibili', authRequired: true,
+    state: 'interrupted', url: 'https://www.bilibili.com/video/BV13x41117TL/?p=1', filename: '视频.mp4' }] });
+  const card = ui.elements.get('jobList').querySelector('.job-card');
+  assert.equal(card.querySelector('.job-auth-status').hidden, true);
+  await ui.click(card.querySelectorAll('.job-button')[1]);
+  assert.equal(ui.permissionCalls.length, 0); assert.equal(ui.messages.some(message => message.action === 'startDownload'), false);
+  assert.match(ui.elements.get('toast').textContent, /来源站点.*不一致/);
+});
+
+test('permission result cannot authorize a different site or Bilibili part after the prompt opens', async () => {
+  for (const replacement of [
+    { engine: 'youtube-native', site: 'youtube', url: 'https://www.youtube.com/watch?v=BaW_jenozKc' },
+    { engine: 'bilibili-native', site: 'bilibili', url: 'https://www.bilibili.com/video/BV13x41117TL/?p=2', page: 2 }
+  ]) {
+    const job = { id: 'auth', runId: 'attempt-1', engine: 'bilibili-native', site: 'bilibili', state: 'interrupted',
+      authRequired: true, page: 1, url: 'https://www.bilibili.com/video/BV13x41117TL/?p=1', filename: '视频.mp4' };
+    const ui = await setup({ jobs: [job], permissionGranted: true, deferPermission: true });
+    const pending = ui.click(ui.elements.get('jobList').querySelectorAll('.job-button')[1]);
+    Object.assign(job, replacement); await ui.updateJobs();
+    await ui.finishAction('permission'); await pending;
+    assert.equal(ui.messages.some(message => message.action === 'startDownload'), false);
+    assert.match(ui.elements.get('toast').textContent, /任务已变化/);
   }
 });
 
@@ -694,7 +864,7 @@ test('missing or invalid stored concurrency uses 64 without overwriting saved pr
 });
 
 test('active tasks offer cancellation and every terminal state offers explicit deletion', async () => {
-  for (const state of ['queued', 'parsing', 'downloading', 'saving', 'complete', 'interrupted', 'cancelled']) {
+  for (const state of ['queued', 'parsing', 'downloading', 'muxing', 'saving', 'complete', 'interrupted', 'cancelled']) {
     const ui = await setup({ jobs: [{ id: state, state, isM3U8: true }] });
     const card = ui.elements.get('jobList').querySelector('.job-card');
     const terminal = ['complete', 'interrupted', 'cancelled'].includes(state);
@@ -859,13 +1029,13 @@ test('unknown totals keep the mascot at the origin without fabricating a percent
   assert.equal(runner.style.left, '25%'); assert.equal(bar.dataset.indeterminate, 'false');
 });
 
-test('only parsing, downloading and saving animate and cancellation stops motion immediately', async () => {
+test('only running phases animate and cancellation stops motion immediately', async () => {
   const job = { id: 'motion', state: 'queued', isM3U8: true, totalSegments: 10, completedSegments: 3 };
   const ui = await setup({ cancelPending: true, deferredActions: ['cancelJob'], jobs: [job] });
   const card = ui.elements.get('jobList').querySelector('.job-card');
-  for (const state of ['queued', 'parsing', 'downloading', 'saving', 'complete', 'interrupted', 'cancelled']) {
+  for (const state of ['queued', 'parsing', 'downloading', 'muxing', 'saving', 'complete', 'interrupted', 'cancelled']) {
     job.state = state; await ui.updateJobs();
-    assert.equal(card.dataset.animating, String(['parsing', 'downloading', 'saving'].includes(state)), state);
+    assert.equal(card.dataset.animating, String(['parsing', 'downloading', 'muxing', 'saving'].includes(state)), state);
   }
   job.state = 'downloading'; await ui.updateJobs();
   const pending = ui.click(card.querySelector('.job-button')); await tick();

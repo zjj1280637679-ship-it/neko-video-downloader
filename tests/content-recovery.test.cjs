@@ -172,7 +172,7 @@ test('lost ACKs have one finite deadline, and a later manual recovery can resend
 
 test('an incompatible owned scanner is disposed and replaced without retaining old video or window listeners', async () => {
   const h = harness(); await h.run(); const previous = h.context.__yangmoContentScanner;
-  const result = await h.run(source.replace('version = 1', 'version = 2'));
+  const result = await h.run(source.replace('version = 2', 'version = 3'));
   assert.equal(result.success, true); assert.notEqual(h.context.__yangmoContentScanner, previous);
   assert.equal((await previous.forceRescan()).success, false);
   assert.equal(h.observers.filter(observer => observer.connected).length, 1);
@@ -183,11 +183,24 @@ test('an incompatible owned scanner is disposed and replaced without retaining o
 test('an invalidated same-version closure is replaced once and removed videos release their event listeners', async () => {
   const h = harness(); let disposed = 0;
   Object.defineProperty(h.context, '__yangmoContentScanner', { configurable: true, value: {
-    owner: 'yangmo-content', version: 1, document: h.document,
+    owner: 'yangmo-content', version: 2, document: h.document,
     forceRescan: async () => ({ success: false, invalidated: true }), dispose() { disposed++; }
   } });
   assert.equal((await h.run()).success, true); assert.equal(disposed, 1);
   const video = h.videos.pop(); await h.run();
   assert.ok([...video.listeners.values()].every(listeners => listeners.size === 0));
   const count = h.sent.length; video.emit('playing'); await tick(); assert.equal(h.sent.length, count);
+});
+
+test('YouTube SPA navigation wakes the scanner and increments identity even when the blob source is unchanged', async () => {
+  const h = harness({ routes: [] });
+  h.document.URL = h.document.baseURI = 'https://www.youtube.com/watch?v=BaW_jenozKc';
+  await h.run(); const first = h.sent.find(message => message.action === 'reportPlaybackState');
+  h.document.URL = 'https://www.youtube.com/watch?v=aqz-KE-bpKQ';
+  h.window.emit('yt-navigate-finish'); await h.fireTimers(200);
+  const next = h.sent.filter(message => message.action === 'reportPlaybackState').at(-1);
+  assert.equal(next.documentToken, first.documentToken); assert.ok(next.generation > first.generation);
+  h.document.URL = 'https://www.youtube.com/watch?v=BaW_jenozKc';
+  h.window.emit('popstate'); await h.fireTimers(200);
+  assert.ok(h.sent.filter(message => message.action === 'reportPlaybackState').at(-1).generation > next.generation);
 });

@@ -20,7 +20,40 @@ function setup(options = {}) {
   const items = new Map((options.items || []).map(item => [item.id, item]));
   const session = { neko_jobs_v1: options.jobs || [] };
   const local = { neko_settings_v1: options.settings || {}, neko_concurrency_revision_v1: options.concurrencyRevision || 0, ...(options.localJobs ? { neko_jobs_v1: options.localJobs } : {}) };
-  const calls = { nativeDownloads: [], cancel: [], offscreen: [], create: [], tabs: [], shown: [], notifications: [], erased: [], removedFiles: [] };
+  const calls = { nativeDownloads: [], cancel: [], offscreen: [], create: [], tabs: [], shown: [], notifications: [], erased: [], removedFiles: [], native: [], nativeCloses: 0, cookieReads: [], permissions: [] };
+  const nativeJobs = new Map(), nativeEvents = event(), nativeDisconnects = event();
+  let nativeConnected = false;
+  const native = {
+    connected: () => nativeConnected,
+    onJob: listener => nativeEvents.addListener(listener),
+    onDisconnect: listener => nativeDisconnects.addListener(listener),
+    close() { nativeConnected = false; calls.nativeCloses++; },
+    async request(action, payload) {
+      nativeConnected = true; calls.native.push({ action, payload: structuredClone(payload) });
+      if (options.nativeRequest) {
+        const reply = await options.nativeRequest(action, payload, nativeJobs, native);
+        if (reply !== undefined) return reply;
+      }
+      if (action === 'ping') return { success: true, version: 'test', capabilities: { youtube: true, bilibili: true } };
+      if (action === 'start') {
+        const job = { ...payload.job, state: 'queued', revision: 1, segmented: false };
+        nativeJobs.set(job.id, job); return { success: true, job: structuredClone(job) };
+      }
+      if (action === 'setConcurrency') return { success: true, ...payload };
+      if (action === 'status') return { success: true, jobs: [...nativeJobs.values()].map(item => structuredClone(item)) };
+      if (action === 'cancel') {
+        const previous = nativeJobs.get(payload.jobId);
+        if (!previous) return { success: true };
+        const job = { ...previous, state: 'cancelled', revision: previous.revision + 1 };
+        nativeJobs.set(job.id, job); return { success: true, job: structuredClone(job) };
+      }
+      if (['release', 'remove'].includes(action)) { nativeJobs.delete(payload.jobId); return { success: true }; }
+      throw new Error(`Unexpected native action: ${action}`);
+    },
+    emit(value) { nativeJobs.set(value.id, structuredClone(value)); nativeEvents.emit(value); },
+    disconnect(reason = 'test native disconnect') { nativeConnected = false; nativeDisconnects.emit(reason); },
+    jobs: nativeJobs
+  };
   const chrome = {
     runtime: {
       id: extensionId, getURL: extensionUrl, onMessage: event(),
@@ -39,6 +72,8 @@ function setup(options = {}) {
       local: { async get(key) { await options.localGet?.(key); if (key === 'neko_settings_v1' || Array.isArray(key) && key.includes('neko_settings_v1')) await options.settingsRead?.(); return local; }, async set(value) { await options.localSet?.(value); Object.assign(local, structuredClone(value)); } }
     },
     offscreen: { async createDocument(value) { calls.create.push(value); contexts = [{ documentUrl: extensionUrl('offscreen.html') }]; } },
+    permissions: { async contains(value) { calls.permissions.push(structuredClone(value)); return options.cookiePermission === true; } },
+    cookies: { async getAll(value) { calls.cookieReads.push(structuredClone(value)); return options.cookies || []; } },
     tabs: { async create(value) { calls.tabs.push(value); } },
     downloads: {
       onChanged: event(),
@@ -50,12 +85,14 @@ function setup(options = {}) {
         return id;
       },
       async search({ id }) { if (options.search) return options.search(id, items); return items.has(id) ? [{ ...items.get(id) }] : []; },
-      async cancel(id) { calls.cancel.push(id); const item = items.get(id); if (item) Object.assign(item, { state: 'interrupted', error: 'USER_CANCELED' }); },
+      async cancel(id) { calls.cancel.push(id); if (options.cancel) return options.cancel(id, items); const item = items.get(id); if (item) Object.assign(item, { state: 'interrupted', error: 'USER_CANCELED' }); },
       async show(id) { calls.shown.push(id); },
       async erase(query) { calls.erased.push(query); }, async removeFile(id) { calls.removedFiles.push(id); }
     }
   };
-  const context = vm.createContext({ chrome, crypto: webcrypto, URL, console, structuredClone, NekoJobState: require('../engine/job-state.js') });
+  const context = vm.createContext({ chrome, crypto: webcrypto, URL, console, structuredClone,
+    NekoJobState: require('../engine/job-state.js'), NekoYouTube: require('../domain/youtube.js'), NekoSites: require('../domain/sites.js'),
+    ...(options.native ? { NekoNative: { createClient: () => native } } : {}) });
   vm.runInContext(source, context);
   function message(value, sender = uiSender) {
     return new Promise(resolve => {
@@ -69,7 +106,7 @@ function setup(options = {}) {
     return message({ target: 'neko-background', runId: stored?.runId, ...value,
       ...(value.job ? { job: { runId: stored?.runId, revision: ++revision, ...value.job } } : {}) }, engineSender);
   };
-  return { chrome, message, engine, items, calls, session, local };
+  return { chrome, message, engine, native, items, calls, session, local };
 }
 const hlsRequest = { action: 'startDownload', url: 'https://cdn.test/list.m3u8', filename: 'movie.m3u8', title: 'Movie', isM3U8: true, tabId: 8 };
 const restoredJob = changes => ({ id: 'restored', url: 'https://cdn.test/list.m3u8', title: 'Movie', filename: 'movie.ts', subfolder: '', saveAs: false, isM3U8: true, state: 'saving', createdAt: 1, updatedAt: 1, ...changes });
@@ -185,6 +222,337 @@ test('a transient offscreen snapshot error does not permanently discard recovery
   assert.equal(retry.success, true);
   assert.equal(retry.jobs[0].state, 'interrupted');
   assert.equal(attempts, 2);
+});
+
+const youtubeRequest = { action: 'startDownload', engine: 'youtube-native', url: 'https://www.youtube.com/watch?v=BaW_jenozKc', filename: 'sample.mp4', title: 'Sample' };
+const bilibiliRequest = { action: 'startDownload', engine: 'bilibili-native', site: 'bilibili',
+  url: 'https://www.bilibili.com/video/BV1xx411c7mD/?p=2', filename: 'sample-P2.mp4', title: 'Sample P2' };
+const nativeArtifact = changes => ({ url: `http://127.0.0.1:39876/artifact/${'a'.repeat(43)}`, filename: 'sample.mp4', size: 100, ...changes });
+function nativeProgress(h, job, changes) {
+  const previous = h.native.jobs.get(job.id) || job;
+  h.native.emit({ ...previous, revision: (previous.revision || 1) + 1, ...changes });
+}
+const nativeCurrent = async (h, job) => (await h.message({ action: 'getJobs' })).jobs.find(item => item.id === job.id);
+
+test('YouTube uses native parsing and muxing but only Chrome can confirm completion', async () => {
+  const h = setup({ native: true });
+  const { job } = await h.message(youtubeRequest);
+  assert.equal(job.engine, 'youtube-native'); assert.equal(job.state, 'queued');
+  assert.equal(h.calls.nativeDownloads.length, 0); assert.equal(h.calls.cookieReads.length, 0);
+  nativeProgress(h, job, { state: 'downloading', segmented: true, totalSegments: 2, completedSegments: 1 }); await tick();
+  nativeProgress(h, job, { state: 'muxing', completedSegments: 2 }); await tick();
+  assert.equal((await nativeCurrent(h, job)).state, 'muxing');
+  nativeProgress(h, job, { state: 'complete' }); await tick();
+  assert.equal((await nativeCurrent(h, job)).state, 'muxing');
+  nativeProgress(h, job, { state: 'saving', artifact: nativeArtifact() }); await tick();
+  const saving = await nativeCurrent(h, job);
+  assert.equal(saving.state, 'saving'); assert.equal(h.calls.nativeDownloads.length, 1);
+  assert.equal(h.calls.nativeDownloads[0].saveAs, false); assert.equal(h.calls.nativeDownloads[0].filename, 'sample.mp4');
+  Object.assign(h.items.get(saving.downloadId), { state: 'complete', bytesReceived: 100 });
+  h.chrome.downloads.onChanged.emit({ id: saving.downloadId }); await tick();
+  assert.equal((await nativeCurrent(h, job)).state, 'complete');
+  assert.equal(h.calls.native.filter(call => call.action === 'release').length, 1);
+  assert.equal((await h.message({ action: 'removeJob', jobId: job.id })).success, true);
+  assert.equal(h.calls.removedFiles.length, 0); assert.equal(h.calls.erased.length, 0);
+});
+
+test('native stale attempts and revisions cannot replace current progress', async () => {
+  const h = setup({ native: true }); const { job } = await h.message(youtubeRequest);
+  nativeProgress(h, job, { state: 'downloading', bytesReceived: 40, revision: 5 }); await tick();
+  nativeProgress(h, job, { state: 'saving', artifact: nativeArtifact(), revision: 4 }); await tick();
+  nativeProgress(h, job, { state: 'cancelled', runId: 'obsolete', revision: 999 }); await tick();
+  const stored = h.local.neko_jobs_v1.find(item => item.id === job.id);
+  assert.equal(stored.state, 'downloading'); assert.equal(stored.progressRevision, 5); assert.equal(stored.bytesReceived, 40);
+  assert.equal(h.calls.nativeDownloads.length, 0);
+});
+
+test('native artifact rejects foreign hosts, arbitrary loopback routes and unsafe names', async () => {
+  for (const artifact of [nativeArtifact({ url: 'https://evil.test/file.mp4' }), nativeArtifact({ url: 'http://127.0.0.1:9000/private' }),
+    nativeArtifact({ url: `http://127.0.0.1:39876/artifact/${'a'.repeat(43)}?path=secret` }), nativeArtifact({ filename: '../sample.mp4' })]) {
+    const h = setup({ native: true }); const { job } = await h.message(youtubeRequest);
+    nativeProgress(h, job, { state: 'saving', artifact }); await tick();
+    assert.equal((await nativeCurrent(h, job)).state, 'interrupted');
+    assert.equal(h.calls.nativeDownloads.length, 0);
+  }
+});
+
+test('cancel while native artifact creation is pending waits for Chrome before releasing bytes', async () => {
+  const gate = deferred();
+  const h = setup({ native: true, download: async (_request, items) => { await gate.promise; items.set(71, { id: 71, state: 'in_progress', filename: 'C:/Downloads/sample.mp4' }); return 71; },
+    nativeRequest: async (action) => { if (action === 'release') assert.notEqual(h.items.get(71)?.state, 'in_progress'); } });
+  const { job } = await h.message(youtubeRequest);
+  nativeProgress(h, job, { state: 'saving', artifact: nativeArtifact() }); await tick();
+  assert.equal((await h.message({ action: 'cancelJob', jobId: job.id })).success, true);
+  assert.equal(h.calls.native.filter(call => ['cancel', 'release'].includes(call.action)).length, 0);
+  assert.equal((await nativeCurrent(h, job)).state, 'saving');
+  gate.resolve(); await tick();
+  assert.equal((await nativeCurrent(h, job)).state, 'cancelled'); assert.deepEqual(h.calls.cancel, [71]);
+});
+
+test('Chrome completion wins when cancel races a fast native artifact save', async () => {
+  const gate = deferred();
+  const h = setup({ native: true, download: async (_request, items) => { await gate.promise; items.set(72, { id: 72, state: 'complete', filename: 'C:/Downloads/sample.mp4' }); return 72; } });
+  const { job } = await h.message(youtubeRequest);
+  nativeProgress(h, job, { state: 'saving', artifact: nativeArtifact() }); await tick();
+  await h.message({ action: 'cancelJob', jobId: job.id }); gate.resolve(); await tick();
+  assert.equal((await nativeCurrent(h, job)).state, 'complete'); assert.equal(h.calls.cancel.length, 0);
+});
+
+test('already-completed cancel API error is reconciled instead of reporting a false native failure', async () => {
+  const h = setup({ native: true, cancel: async (id, items) => { items.get(id).state = 'complete'; throw new Error('already complete'); } });
+  const { job } = await h.message(youtubeRequest);
+  nativeProgress(h, job, { state: 'saving', artifact: nativeArtifact() }); await tick();
+  assert.equal((await h.message({ action: 'cancelJob', jobId: job.id })).success, true);
+  assert.equal((await nativeCurrent(h, job)).state, 'complete');
+});
+
+test('failed persistence after a Chrome ID exists does not revoke an active native artifact', async () => {
+  let failed = false;
+  const h = setup({ native: true, localSet: async value => {
+    if (!failed && value.neko_jobs_v1?.some(job => Number.isInteger(job.downloadId))) { failed = true; throw new Error('temporary storage failure'); }
+  } });
+  const { job } = await h.message(youtubeRequest);
+  nativeProgress(h, job, { state: 'saving', artifact: nativeArtifact() }); await tick();
+  assert.equal(failed, true); assert.equal((await nativeCurrent(h, job)).state, 'saving');
+  assert.equal(h.calls.native.filter(call => call.action === 'release').length, 0);
+  assert.equal(h.calls.nativeDownloads.length, 1);
+});
+
+test('a delayed Chrome in-progress lookup cannot regress a confirmed native completion', async () => {
+  const gate = deferred(); let delayNext = false;
+  const h = setup({ native: true, search: async (id, items) => {
+    const snapshot = { ...items.get(id) };
+    if (delayNext) { delayNext = false; await gate.promise; }
+    return [snapshot];
+  } });
+  const { job } = await h.message(youtubeRequest);
+  nativeProgress(h, job, { state: 'saving', artifact: nativeArtifact() }); await tick();
+  const saving = await nativeCurrent(h, job);
+  delayNext = true; h.chrome.downloads.onChanged.emit({ id: saving.downloadId }); await tick();
+  Object.assign(h.items.get(saving.downloadId), { state: 'complete', bytesReceived: 100 });
+  h.chrome.downloads.onChanged.emit({ id: saving.downloadId }); await tick();
+  assert.equal((await nativeCurrent(h, job)).state, 'complete');
+  gate.resolve(); await tick();
+  const final = await nativeCurrent(h, job);
+  assert.equal(final.state, 'complete'); assert.equal(final.bytesReceived, 100);
+});
+
+test('persistent native metadata failures remain visible while Chrome continues saving', async () => {
+  const h = setup({ native: true, localSet: async value => {
+    if (value.neko_jobs_v1?.some(job => Number.isInteger(job.downloadId))) throw new Error('persistent storage failure');
+  } });
+  const { job } = await h.message(youtubeRequest);
+  nativeProgress(h, job, { state: 'saving', artifact: nativeArtifact() }); await tick();
+  const current = await nativeCurrent(h, job); await tick();
+  assert.equal(current.state, 'saving'); assert.match(current.error, /任务记录保存失败.*persistent storage failure/);
+  h.chrome.downloads.onChanged.emit({ id: current.downloadId }); await tick();
+  assert.match((await nativeCurrent(h, job)).error, /任务记录保存失败.*persistent storage failure/);
+  assert.equal(h.calls.native.filter(call => call.action === 'release').length, 0);
+  assert.equal(h.calls.nativeDownloads.length, 1);
+});
+
+test('the same native artifact snapshot can retry a failed metadata commit without duplicate saves', async () => {
+  let failed = false;
+  const h = setup({ native: true, localSet: async value => {
+    if (!failed && value.neko_jobs_v1?.some(job => job.state === 'saving' && !Number.isInteger(job.downloadId))) { failed = true; throw new Error('temporary artifact write failure'); }
+  } });
+  const { job } = await h.message(youtubeRequest);
+  nativeProgress(h, job, { state: 'saving', artifact: nativeArtifact() }); await tick();
+  assert.equal(h.calls.nativeDownloads.length, 0);
+  assert.equal((await nativeCurrent(h, job)).state, 'saving');
+  assert.equal(h.calls.nativeDownloads.length, 1);
+  await nativeCurrent(h, job); assert.equal(h.calls.nativeDownloads.length, 1);
+});
+
+test('terminal native event does not close the port before an outstanding cancel reply', async () => {
+  const gate = deferred();
+  const h = setup({ native: true, nativeRequest: async (action, payload, records, client) => {
+    if (action !== 'cancel') return;
+    const job = { ...records.get(payload.jobId), state: 'cancelled', revision: 2 };
+    client.emit(job); await gate.promise; return { success: true, job };
+  } });
+  const { job } = await h.message(youtubeRequest);
+  const cancelling = h.message({ action: 'cancelJob', jobId: job.id }); await tick();
+  assert.equal(h.calls.nativeCloses, 0); gate.resolve();
+  assert.equal((await cancelling).success, true); await tick(); assert.ok(h.calls.nativeCloses > 0);
+});
+
+test('a lost start acknowledgement recovers the already-accepted native task', async () => {
+  const h = setup({ native: true, nativeRequest: async (action, payload, records) => {
+    if (action === 'start') { records.set(payload.job.id, { ...payload.job, state: 'downloading', revision: 2 }); throw new Error('reply timeout'); }
+  } });
+  const started = await h.message(youtubeRequest);
+  assert.equal(started.success, true); assert.equal(started.job.state, 'downloading');
+  assert.equal(h.calls.native.filter(call => call.action === 'start').length, 1);
+  assert.equal((await h.message({ action: 'cancelJob', jobId: started.job.id })).success, true);
+});
+
+test('uncertain start remains visible until a later status confirms it', async () => {
+  let statuses = 0;
+  const h = setup({ native: true, nativeRequest: async (action, payload, records) => {
+    if (action === 'start') { records.set(payload.job.id, { ...payload.job, state: 'downloading', revision: 2 }); throw new Error('reply timeout'); }
+    if (action === 'status' && ++statuses === 1) throw new Error('status timeout');
+  } });
+  const started = await h.message(youtubeRequest);
+  assert.equal(started.success, true); assert.equal(started.job.nativeStartUnconfirmed, true);
+  assert.equal(started.job.state, 'queued'); assert.equal((await nativeCurrent(h, started.job)).state, 'downloading');
+});
+
+test('a delayed empty native status cannot overwrite a confirmed cancellation', async () => {
+  const gate = deferred(); let block = false;
+  const h = setup({ native: true, nativeRequest: async action => { if (action === 'status' && block) { await gate.promise; return { success: true, jobs: [] }; } } });
+  const { job } = await h.message(youtubeRequest); block = true;
+  const polling = h.message({ action: 'getJobs' }); await tick();
+  await h.message({ action: 'cancelJob', jobId: job.id }); gate.resolve();
+  assert.equal((await polling).jobs.find(item => item.id === job.id).state, 'cancelled');
+});
+
+test('native disconnect is interrupted without automatic restart and missing-helper tasks are deletable', async () => {
+  const h = setup({ native: true }); const { job } = await h.message(youtubeRequest);
+  h.native.disconnect(); await tick(); assert.equal((await nativeCurrent(h, job)).state, 'interrupted');
+  assert.equal(h.calls.native.filter(call => call.action === 'start').length, 1);
+  const missing = setup({ native: true, nativeRequest: async () => { throw new Error('native host not found'); } });
+  assert.equal((await missing.message(youtubeRequest)).success, false);
+  const [record] = (await missing.message({ action: 'getJobs' })).jobs;
+  assert.equal(record.state, 'interrupted'); assert.equal((await missing.message({ action: 'removeJob', jobId: record.id })).success, true);
+});
+
+test('native fragmented jobs use acknowledged live concurrency while ordinary tasks stay unsegmented', async () => {
+  let invalidAck = false;
+  const h = setup({ native: true, nativeRequest: async (action, payload) => action === 'setConcurrency' && invalidAck ? { success: true, ...payload, concurrency: 900 } : undefined });
+  const { job } = await h.message(youtubeRequest);
+  nativeProgress(h, job, { state: 'downloading', segmented: true, targetConcurrency: 64, concurrencyRevision: 0 }); await tick();
+  const saved = await h.message({ action: 'saveSettings', settings: { concurrency: 125 } });
+  assert.equal(saved.liveApplied, true); assert.equal((await nativeCurrent(h, job)).targetConcurrency, 125);
+  invalidAck = true;
+  assert.equal((await h.message({ action: 'saveSettings', settings: { concurrency: 20 } })).liveApplied, false);
+  const h2 = setup({ native: true }); const { job: direct } = await h2.message(youtubeRequest);
+  nativeProgress(h2, direct, { state: 'downloading', segmented: false }); await tick();
+  await h2.message({ action: 'saveSettings', settings: { concurrency: 375 } });
+  assert.equal((await nativeCurrent(h2, direct)).targetConcurrency, 0); assert.equal(h2.calls.cancel.length, 0);
+});
+
+test('YouTube session retry needs permission and sends only exact-domain cookies in memory', async () => {
+  const denied = setup({ native: true });
+  assert.equal((await denied.message({ ...youtubeRequest, useYouTubeSession: true })).success, false);
+  assert.equal(denied.calls.cookieReads.length, 0);
+  const cookies = [
+    { domain: '.youtube.com', name: 'SID', value: 'private-session-value', path: '/', secure: true, expirationDate: 9999, httpOnly: true, extra: 'discard' },
+    { domain: 'youtube.com', name: 'PREF', value: 'preference-value', path: '/', secure: false },
+    { domain: 'accounts.youtube.com', name: 'SUB', value: 'skip-subdomain' },
+    { domain: '.google.com', name: 'GOOGLE', value: 'skip-other-site' }
+  ];
+  const h = setup({ native: true, cookiePermission: true, cookies });
+  const { job } = await h.message({ ...youtubeRequest, useYouTubeSession: true });
+  assert.deepEqual(h.calls.cookieReads, [{ domain: 'youtube.com' }]);
+  const sent = h.calls.native.find(call => call.action === 'start').payload;
+  assert.equal(sent.cookies.length, 2); assert.equal(sent.cookies[0].httpOnly, undefined); assert.equal(sent.cookies[0].extra, undefined);
+  const durable = JSON.stringify([h.local, h.session, job]);
+  assert.equal(durable.includes('private-session-value'), false); assert.equal(durable.includes('preference-value'), false);
+  nativeProgress(h, job, { state: 'interrupted', authRequired: true, errorCode: 'AUTH_REQUIRED', error: 'YouTube needs a session' }); await tick();
+  assert.equal((await nativeCurrent(h, job)).authRequired, true);
+  const ordinary = setup({ native: true, cookiePermission: true, cookies });
+  await ordinary.message(youtubeRequest); assert.equal(ordinary.calls.cookieReads.length, 0);
+});
+
+test('Bilibili keeps the selected part, deduplicates canonical P1 and routes without a supplied engine', async () => {
+  const h = setup({ native: true });
+  const first = await h.message({ ...bilibiliRequest, engine: undefined, url: 'https://m.bilibili.com/video/BV1xx411c7mD?tracking=ignored' });
+  assert.equal(first.success, true); assert.equal(first.job.engine, 'bilibili-native');
+  assert.equal(first.job.site, 'bilibili'); assert.equal(first.job.page, 1);
+  assert.equal(first.job.url, 'https://www.bilibili.com/video/BV1xx411c7mD/?p=1');
+  const duplicate = await h.message({ ...bilibiliRequest, url: 'https://www.bilibili.com/video/BV1xx411c7mD/?p=1&tracking=second' });
+  assert.equal(duplicate.job.id, first.job.id);
+  const second = await h.message(bilibiliRequest);
+  assert.notEqual(second.job.id, first.job.id); assert.equal(second.job.page, 2);
+  const starts = h.calls.native.filter(call => call.action === 'start');
+  assert.equal(starts.length, 2); assert.equal(starts[1].payload.job.page, 2);
+  assert.equal(starts[1].payload.job.url, bilibiliRequest.url);
+  assert.equal(h.calls.cookieReads.length, 0); assert.equal(h.calls.nativeDownloads.length, 0);
+});
+
+test('native adapter, site and legacy consent cannot be spoofed across video addresses', async () => {
+  const h = setup({ native: true, cookiePermission: true });
+  await h.message(youtubeRequest); // Even an active duplicate must validate labels first.
+  for (const message of [
+    { ...youtubeRequest, site: 'bilibili', useSiteSession: true },
+    { ...youtubeRequest, engine: 'bilibili-native' },
+    { ...bilibiliRequest, engine: 'youtube-native' },
+    { ...bilibiliRequest, site: 'youtube' },
+    { ...bilibiliRequest, useYouTubeSession: true },
+    { ...bilibiliRequest, url: 'https://www.bilibili.com/video/BV1xx411c7mD/?p=1&p=2' },
+    { ...bilibiliRequest, url: 'https://evil.test/video/BV1xx411c7mD/' },
+    { action: 'startDownload', url: 'https://cdn.test/movie.mp4', useSiteSession: true }
+  ]) assert.equal((await h.message(message)).success, false, JSON.stringify(message));
+  assert.equal(h.calls.cookieReads.length, 0);
+  assert.equal(h.calls.native.filter(call => call.action === 'start').length, 1);
+});
+
+test('Bilibili explicit retry reads only its own root domains and never persists credentials', async () => {
+  const cookies = [
+    { domain: '.bilibili.com', name: 'SESSDATA', value: 'bili-secret-fixture', path: '/', secure: true },
+    { domain: 'bilibili.com', name: 'buvid3', value: 'bili-visit-fixture', path: '/', secure: false },
+    { domain: 'api.bilibili.com', name: 'SUB', value: 'skip-subdomain' },
+    { domain: '.youtube.com', name: 'SID', value: 'skip-youtube' },
+    { domain: '.bilibili.com.evil.test', name: 'SPOOF', value: 'skip-spoof' }
+  ];
+  const h = setup({ native: true, cookiePermission: true, cookies });
+  const { job } = await h.message({ ...bilibiliRequest, useSiteSession: true });
+  assert.deepEqual(h.calls.cookieReads, [{ domain: 'bilibili.com' }]);
+  const sent = h.calls.native.find(call => call.action === 'start').payload;
+  assert.equal(sent.job.site, 'bilibili'); assert.equal(sent.cookies.length, 2);
+  assert.equal(sent.cookies.some(cookie => cookie.value.startsWith('skip')), false);
+  const durable = JSON.stringify([h.local, h.session, job]);
+  assert.equal(durable.includes('bili-secret-fixture'), false); assert.equal(durable.includes('bili-visit-fixture'), false);
+  const ordinary = setup({ native: true, cookiePermission: true, cookies });
+  await ordinary.message(bilibiliRequest); assert.equal(ordinary.calls.cookieReads.length, 0);
+  const denied = setup({ native: true, cookies });
+  assert.equal((await denied.message({ ...bilibiliRequest, useSiteSession: true })).success, false);
+  assert.equal(denied.calls.cookieReads.length, 0);
+});
+
+test('old YouTube-only native host is rejected before reading a Bilibili session', async () => {
+  const h = setup({ native: true, cookiePermission: true,
+    nativeRequest: async action => action === 'ping' ? { success: true, capabilities: { youtube: true } } : undefined });
+  const result = await h.message({ ...bilibiliRequest, useSiteSession: true });
+  assert.equal(result.success, false); assert.match(result.error, /更新配套内核/);
+  assert.equal(h.calls.cookieReads.length, 0);
+  assert.equal(h.calls.native.some(call => call.action === 'start'), false);
+});
+
+test('Bilibili HTTP tracks keep zero fragment target and complete only after Chrome saves', async () => {
+  const h = setup({ native: true }); const { job } = await h.message(bilibiliRequest);
+  nativeProgress(h, job, { state: 'downloading', segmented: false, qualityLabel: '720p', bytesReceived: 40 }); await tick();
+  await h.message({ action: 'saveSettings', settings: { concurrency: 375 } });
+  const current = await nativeCurrent(h, job);
+  assert.equal(current.targetConcurrency, 0); assert.equal(current.segmented, false); assert.equal(current.qualityLabel, '720p');
+  nativeProgress(h, job, { state: 'muxing', bytesReceived: 100, title: 'Actual title · P2 分P名称' }); await tick();
+  const muxing = await nativeCurrent(h, job);
+  assert.equal(muxing.state, 'muxing'); assert.equal(muxing.title, 'Actual title · P2 分P名称');
+  nativeProgress(h, job, { site: 'youtube', state: 'interrupted' }); await tick();
+  assert.equal((await nativeCurrent(h, job)).state, 'muxing');
+  // The rejected fake event must not poison the real host's site identity.
+  h.native.jobs.set(job.id, { ...h.native.jobs.get(job.id), site: 'bilibili' });
+  nativeProgress(h, job, { state: 'saving', artifact: nativeArtifact({ filename: 'sample-P2.mp4' }) }); await tick();
+  const saving = await nativeCurrent(h, job);
+  assert.equal(saving.state, 'saving'); assert.equal(h.calls.nativeDownloads[0].saveAs, false);
+  Object.assign(h.items.get(saving.downloadId), { state: 'complete', bytesReceived: 100 });
+  h.chrome.downloads.onChanged.emit({ id: saving.downloadId }); await tick();
+  assert.equal((await nativeCurrent(h, job)).state, 'complete');
+});
+
+test('cancelling a Bilibili job leaves the YouTube job and its live fragment policy intact', async () => {
+  const h = setup({ native: true }); const { job: youtube } = await h.message(youtubeRequest);
+  const { job: bilibili } = await h.message(bilibiliRequest);
+  nativeProgress(h, youtube, { state: 'downloading', segmented: true }); await tick();
+  await h.message({ action: 'saveSettings', settings: { concurrency: 123 } });
+  await h.message({ action: 'cancelJob', jobId: bilibili.id });
+  assert.equal((await nativeCurrent(h, bilibili)).state, 'cancelled');
+  const remaining = await nativeCurrent(h, youtube);
+  assert.equal(remaining.state, 'downloading'); assert.equal(remaining.targetConcurrency, 123);
+  assert.equal(h.calls.native.filter(call => call.action === 'cancel').length, 1);
+  assert.equal(h.calls.native.find(call => call.action === 'cancel').payload.jobId, bilibili.id);
+  assert.equal(h.native.connected(), true);
 });
 
 test('Chrome completion is recoverable if offscreen disappears during current session', async () => {

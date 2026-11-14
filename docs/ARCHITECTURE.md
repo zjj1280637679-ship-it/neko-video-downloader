@@ -6,6 +6,8 @@
 |---|---|---|
 | `content.js` | 播放器/当前线路 DOM → 观察消息 | 发现、播放状态；不采集视频画面，不创建下载 |
 | `domain/media.js` | URL + 多次观察 → 类型、后缀、判据 | 纯函数；不访问 Chrome、DOM、网络 |
+| `domain/youtube.js` | 视频页面 URL → 规范视频地址 | 精确站点/视频 ID 校验；过滤传输分段，避免当成完整视频 |
+| `domain/bilibili.js`、`domain/sites.js` | 投稿 URL/分P → 站点身份及固定配置 | BV/av 当前P规范化、跨站凭据域隔离、原生任务识别 |
 | `background.js` | DOM/网络事件 → 当前页候选 | 恢复后串行合并，隔离旧文档，session 持久化 |
 | `engine/job-state.js` | 状态、runId、revision → 是否接纳/阶段说明 | 纯协议与资源上限 |
 | `download-manager.js` | 可信弹窗命令、执行器消息、Chrome 事件 → 任务记录 | 创建去重、下载 API、持久化、恢复对账；唯一任务元数据写入者 |
@@ -17,6 +19,10 @@
 | `segment-cache.js` | 分片身份/字节 → OPFS 缓存 | 哈希校验、计划指纹、续传与清理 |
 | `ui/format.js`、`ui/capture.js`、`ui/explain.js` | 事实 → 展示文案 | 纯显示规则、状态解释、脱敏路径 |
 | `popup.js` | UI 事件/任务快照 → 控件更新 | 不执行 HLS，不因关闭弹窗取消任务 |
+| `engine/native-client.js` | 带请求 ID 的消息 ↔ 本机主机 | 相关性、超时、断连和重连；不传视频字节 |
+| `native/host.py` | 下载命令/子进程事件 → 原生任务快照 | 队列、版本化并发、取消进程树、临时成品交付 |
+| `native/worker.py`、`native/scheduler.py` | YouTube 视频 → 校验后的音视频文件 | 固定版本 yt-dlp 解析与 IO，动态分片准入，FFmpeg 合并及 ffprobe 校验 |
+| `native/artifacts.py` | 任务专属临时文件 → Chrome 下载响应 | 仅本机随机端口、随机令牌、只读 Range；无任意路径/命令接口 |
 
 经典本地 scripts 负责加载，避免为小扩展引入构建框架；纯模块同时导出 CommonJS，Node 测试执行生产代码。Chrome API 与文件 IO 保留在边界模块。
 
@@ -75,21 +81,37 @@ flowchart LR
 
 ## 状态与恢复
 
+### YouTube 本机执行链
+
+2.4.0 同一条本机执行链增加 B站适配。页面身份由站点注册表识别，B站 `p` 是身份的一部分，缺省规范为 `?p=1`。切P后旧任务继续代表原P，新来源代表新P；注册表按URL决定执行器和凭据域，消息中的站点标签不能改变这一决定。旧无site的YouTube记录保持兼容，旧内核在B站Cookie读取前通过能力检查明确拒绝。
+
+来源页直接从 Chrome 提供的当前 tab 地址识别 YouTube 视频；不等待播放器媒体请求，不把 `googlevideo` 的局部传输 URL 当成完整文件。普通 HLS、直链与本机队列各走独立执行器，由同一个任务协调器对账。
+
+本机按“解析 → 下载 → 合并/校验 → Chrome 保存”串行推进，因为每一步依赖上一步的产物；一个原生视频任务的音视频轨顺序下载，共享同一分片额度。一个任务内部的 HLS/DASH 分片并行获取、落到临时文件，然后按索引顺序读取、解密和追加。最多前瞻 512 片，单片上限 128MiB，在正文进度和整片读取前分别校验；超限明确失败，不截断成品。降低并发不取消在途请求，提高并发在下一次约 50ms 调度检查时补位。文件读取及追加本身仍可能延长响应时间。这些边界不等于应用总内存或磁盘配额；原有浏览器 HLS 的字节预算不套用到本机执行器。普通 HTTP 下载仍使用 yt-dlp 原下载器。
+
+本机只报告 `saving` 就绪，不报告成功。Chrome 的 downloadId 只是接单；确认 `complete` 后才标记已保存并释放临时文件。若取消恰好发生在 Chrome 接单期间，先记住取消意图，再根据实际 downloadId 取消/对账，避免删除 Chrome 仍在读取的文件。主机断开后不假装后台仍运行；下一次打开将未完成原生任务标为中断。
+
+Cookie 权限是可选的：用户主动授权重试才读取 YouTube 本站登录状态，只经原生消息和 worker 标准输入传递；任务记录和请求文件不包含它。下载地址必须通过固定 YouTube 站点/视频 ID 校验，网页不能传任意命令或本地路径。
+
 ```mermaid
 stateDiagram-v2
   [*] --> queued
   queued --> parsing: HLS
   queued --> downloading: 直链
   parsing --> downloading
+  downloading --> muxing: YouTube 下载完成
+  muxing --> saving: 合并和成品校验通过
   downloading --> saving: HLS 合并就绪
   saving --> complete: Chrome 确认
   downloading --> complete: Chrome 直链确认
   queued --> cancelled
   parsing --> cancelled
   downloading --> cancelled
+  muxing --> cancelled
   saving --> cancelled
   parsing --> interrupted
   downloading --> interrupted
+  muxing --> interrupted
   saving --> interrupted
   interrupted --> queued: 用户重试 / 新 runId
   complete --> [*]: 删除任务记录

@@ -1,11 +1,12 @@
 /* Pure job protocol: one attempt, monotonic snapshots, explicit terminal states. */
 (function (root, factory) {
-  const api = factory();
+  const sites = typeof module === 'object' && module.exports ? require('../domain/sites.js') : root.NekoSites;
+  const api = factory(sites);
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.NekoJobState = api;
-})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (sites) {
   'use strict';
-  const ACTIVE = Object.freeze(['queued', 'parsing', 'downloading', 'saving']);
+  const ACTIVE = Object.freeze(['queued', 'parsing', 'downloading', 'muxing', 'saving']);
   const TERMINAL = Object.freeze(['complete', 'interrupted', 'cancelled']);
   const STATES = Object.freeze([...ACTIVE, ...TERMINAL]);
   const LIMITS = Object.freeze({ jobs: 10, hlsJobs: 1, segments: 375, history: 20 });
@@ -24,10 +25,13 @@
     return !Number.isSafeInteger(incoming.revision) || incoming.revision > (job.progressRevision || 0);
   }
   function describe(job) {
+    const site = sites?.forJob(job);
+    const native = Boolean(site);
     const descriptions = {
-      queued: job.isM3U8 ? '等待前一个 HLS 任务释放写盘与保存资源' : '正在交给 Chrome 创建下载',
-      parsing: '读取播放清单，确认分片、加密方式与输出格式',
-      downloading: job.isM3U8 ? '分片并行获取，按照播放顺序逐个写入' : 'Chrome 正在下载原始文件',
+      queued: native ? '等待本机下载内核启动任务' : job.isM3U8 ? '等待前一个 HLS 任务释放写盘与保存资源' : '正在交给 Chrome 创建下载',
+      parsing: native ? `读取 ${site.label} 视频信息，选择画面与音轨` : '读取播放清单，确认分片、加密方式与输出格式',
+      downloading: native ? job.segmented === true ? '本机内核按实时并发获取分片，按序写入各轨道' : '本机内核正在下载音视频，当前传输不使用分片并发' : job.isM3U8 ? '分片并行获取，按照播放顺序逐个写入' : 'Chrome 正在下载原始文件',
+      muxing: '正在合并音视频并检查成品，尚未保存完成',
       saving: '正在保存文件，等待 Chrome 确认完成',
       complete: 'Chrome 已确认文件保存完成',
       interrupted: job.resumable ? '下载中断，已校验的分片可继续使用' : '下载中断，请查看错误原因',

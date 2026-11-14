@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "羊魔 · 视频收藏",
-  "version": "2.2.1",
+  "version": "2.4.0",
   "minimum_chrome_version": "116",
-  "description": "简洁的网页视频收藏助手。识别当前线路，下载直链与 AES-128 HLS 点播；解释来源、并发策略和保存结果。",
+  "description": "简洁的网页视频收藏助手。下载直链、HLS 点播、YouTube 和哔哩哔哩投稿视频；支持当前分P、音视频合并和实时分片并发。",
   "icons": {
     "16": "icons/yangmo-mascot.png",
     "48": "icons/yangmo-mascot.png",
@@ -15,8 +15,10 @@
     "storage",
     "activeTab",
     "scripting",
-    "offscreen"
+    "offscreen",
+    "nativeMessaging"
   ],
+  "optional_permissions": ["cookies"],
   "host_permissions": [
     "http://*/*",
     "https://*/*"

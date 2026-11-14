@@ -2,7 +2,7 @@
 document.addEventListener("DOMContentLoaded", async () => {
   const $ = id => document.getElementById(id);
   const cards = new Map(), jobCards = new Map(), removedJobs = new Set();
-  const activeStates = new Set(["queued", "parsing", "downloading", "saving"]);
+  const activeStates = new Set(["queued", "parsing", "downloading", "muxing", "saving"]);
   const { formatSize, safeFilename, mediaUrl, formatRemaining } = NekoFormat;
   const { stateLabels, concurrencyReason, jobConcurrency, jobExplanation } = NekoExplain;
   let currentTab = null, currentMedia = [], currentJobs = [];
@@ -98,14 +98,20 @@ document.addEventListener("DOMContentLoaded", async () => {
     const feedback = captureFeedback(); setStatus(feedback.status, feedback.state); renderMedia();
   }
 
-  async function startDownload(item, button) {
+  async function startDownload(item, button, options = {}) {
     if (!mediaUrl(item.url)) return showToast("该来源不是可下载的 HTTP 视频地址");
+    const site = NekoSites.forJob(item);
+    if (['youtube-native', 'bilibili-native'].includes(item.engine) && !site) return showToast('来源站点与下载任务不一致，请重新读取视频来源。');
+    const identity = site ? NekoSites.parse(item.url) : null;
     button.disabled = true;
     try {
       await savePreferences();
       const filename = String(item.suggestedFilename || item.filename || "视频").split(/[\\/]/).pop();
       const title = item.title || filename.replace(/\.(m3u8|mp4|ts|webm|mov|mkv|m4a|mp3)$/i, "");
-      const response = await sendMessage({ action: "startDownload", url: item.url, title, filename: safeFilename(filename), isM3U8: Boolean(item.isM3U8 || /\.m3u8(?:[?#]|$)/i.test(item.url) || item.totalSegments > 0), tabId: item.tabId ?? currentTab?.id });
+      const response = await sendMessage({ action: "startDownload", url: item.url, title, filename: safeFilename(filename),
+        ...(site ? { engine: site.engine, site: site.id, ...(identity.page ? { page: identity.page } : {}) } : {}),
+        ...(site && options.useSiteSession === true ? { useSiteSession: true } : {}),
+        isM3U8: !site && Boolean(item.isM3U8 || /\.m3u8(?:[?#]|$)/i.test(item.url) || item.totalSegments > 0), tabId: item.tabId ?? currentTab?.id });
       if (response.job) currentJobs = [response.job, ...currentJobs.filter(job => job.id !== response.job.id)];
       renderJobs(); showPane("jobs");
       showToast("任务已开始，关闭弹窗也会继续下载");
@@ -151,10 +157,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       cards.set(item.url, entry); entry.item = item; entry.card.hidden = false;
       const url = mediaUrl(item.url);
       entry.badge.className = `badge-tag ${item.isM3U8 ? "badge-m3u8" : "badge-mp4"}`;
-      setText(entry.badge, item.isM3U8 ? "HLS · M3U8" : String(item.ext || "VIDEO").toUpperCase());
+      const site = NekoSites.forJob(item);
+      setText(entry.badge, site ? `${site.label}${site.id === 'bilibili' ? ` · P${item.page || 1}` : ''}` : item.isM3U8 ? "HLS · M3U8" : String(item.ext || "VIDEO").toUpperCase());
       setText(entry.number, item.active ? capture.playback.playing ? "当前播放" : "当前线路" : `来源 ${currentMedia.indexOf(item) + 1}`);
       entry.card.dataset.active = String(Boolean(item.active));
-      setText(entry.size, item.isM3U8 ? "自动合并" : item.size > 0 ? formatSize(item.size) : "大小待确认");
+      setText(entry.size, site || item.isM3U8 ? "自动合并" : item.size > 0 ? formatSize(item.size) : "大小待确认");
       setText(entry.title, item.suggestedFilename || "未命名视频"); entry.title.title = entry.title.textContent;
       setText(entry.host, `${url?.hostname || "未知来源"}${item.name ? ` · ${item.name}` : ""}`);
       const previous = index ? cards.get(currentMedia[index - 1].url).card : null;
@@ -178,7 +185,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     const telemetry = node("div", "job-telemetry"), speed = node("span", "job-speed"), concurrency = node("span", "job-concurrency");
     speed.title = "当前所有网络分片的合计下载速度，缓存读取不计入"; telemetry.append(speed, concurrency);
     const eta = node("p", "job-eta"); eta.title = "根据近期速度估算，实际时间会随来源响应变化；不代表文件已经保存。";
-    const retryStatus = node("p", "job-retry-status"), cacheStatus = node("p", "job-cache-status");
+    const retryStatus = node("p", "job-retry-status"), cacheStatus = node("p", "job-cache-status"), authNotice = node("p", "job-cache-status job-auth-status");
     retryStatus.setAttribute("role", "status"); retryStatus.setAttribute("aria-live", "polite");
     const error = node("p", "job-error"), actions = node("div", "job-actions"), cancel = node("button", "job-button", "取消任务"), retry = node("button", "job-button", "重新下载"), reveal = node("button", "job-button", "在文件夹中显示"), discard = node("button", "job-button job-discard", "清除缓存"), remove = node("button", "job-button job-remove", "删除任务");
     remove.title = "删除任务记录及临时缓存，不删除已保存的文件";
@@ -189,14 +196,17 @@ document.addEventListener("DOMContentLoaded", async () => {
       explanationBody.append(term, value);
     }
     explanation.append(summary, explanationBody);
-    actions.append(cancel, retry, reveal, discard, remove); card.append(header, progressScene, details, telemetry, eta, retryStatus, error, cacheStatus, actions, explanation);
-    const entry = { card, title, label, progress, fill, mascotRunner, metrics, percent, telemetry, speed, concurrency, eta, retryStatus, cacheStatus, error, cancel, retry, reveal, discard, remove, explainFields, explainLabels, job, pendingAction: null, actionError: "", cancelAcknowledged: false, restoreCancelFocus: false };
+    actions.append(cancel, retry, reveal, discard, remove); card.append(header, progressScene, details, telemetry, eta, retryStatus, error, cacheStatus, authNotice, actions, explanation);
+    const entry = { card, title, label, progress, fill, mascotRunner, metrics, percent, telemetry, speed, concurrency, eta, retryStatus, cacheStatus, authNotice, error, cancel, retry, reveal, discard, remove, explainFields, explainLabels, job, pendingAction: null, actionError: "", cancelAcknowledged: false, restoreCancelFocus: false };
     cancel.addEventListener("click", () => jobAction("cancelJob", entry, cancel));
     reveal.addEventListener("click", () => jobAction("showJob", entry, reveal));
-    retry.addEventListener("click", () => jobAction(entry.job.state === "interrupted" && entry.job.resumable ? "retryJob" : "freshStart", entry, retry));
+    retry.addEventListener("click", () => jobAction(needsSiteSession(entry.job) ? "sessionRetry" : entry.job.state === "interrupted" && entry.job.resumable ? "retryJob" : "freshStart", entry, retry));
     discard.addEventListener("click", () => jobAction("discardJob", entry, discard));
     remove.addEventListener("click", () => jobAction("removeJob", entry, remove));
     return entry;
+  }
+  function needsSiteSession(job) {
+    return NekoSites.isNativeJob(job) && job.authRequired === true && job.state === 'interrupted';
   }
   function setJobControls(entry) {
     for (const button of [entry.cancel, entry.retry, entry.reveal, entry.discard, entry.remove]) button.disabled = Boolean(entry.pendingAction);
@@ -204,6 +214,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
   async function jobAction(action, entry, button) {
     if (entry.pendingAction) return;
+    if (action === 'sessionRetry' && !needsSiteSession(entry.job)) return;
     if (action === "cancelJob" && (entry.job.cancelRequested || entry.cancelAcknowledged)) return;
     if (action === "removeJob" && !["complete", "interrupted", "cancelled"].includes(entry.job.state)) return;
     const hadActionFocus = document.activeElement === button;
@@ -212,7 +223,22 @@ document.addEventListener("DOMContentLoaded", async () => {
     entry.pendingAction = action; entry.actionError = ""; setJobControls(entry);
     if (action === "cancelJob" || action === "removeJob") renderJobs();
     try {
-      if (action === "freshStart") await startDownload(entry.job, button);
+      if (action === 'sessionRetry') {
+        const intended = { ...entry.job };
+        const site = NekoSites.forJob(intended);
+        // Keep the request in this click's synchronous call chain. Awaiting
+        // preferences/messages first would lose the permission user gesture.
+        const granted = await chrome.permissions.request({ permissions: ['cookies'] });
+        if (!granted) throw new Error(`未授权使用 ${site.label} 登录状态，下载未开始。`);
+        const current = currentJobs.find(job => job.id === intended.id);
+        if (!current || !needsSiteSession(current) || current.runId !== intended.runId || current.url !== intended.url || NekoSites.forJob(current)?.id !== site.id) {
+          throw new Error('任务已变化，请重新点击重试。');
+        }
+        // Consent is for this explicit retry only. Never inherit an old job's
+        // flag into normal starts/retries and never read cookies in the popup.
+        await startDownload(intended, button, { useSiteSession: true });
+      }
+      else if (action === "freshStart") await startDownload(entry.job, button);
       else {
         if (action === "retryJob") await savePreferences();
         const response = await sendMessage({ action, jobId: entry.job.id });
@@ -230,6 +256,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
     catch (error) {
       if (action === "removeJob") { entry.actionError = `删除失败：${error.message}`; renderJobs(); }
+      if (action === 'sessionRetry') { entry.actionError = error.message; renderJobs(); }
       showToast(error.message);
     }
     finally {
@@ -274,7 +301,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!activeStates.has(job.state)) entry.cancelAcknowledged = false;
       const cancelling = activeStates.has(job.state) && (job.cancelRequested || entry.cancelAcknowledged || entry.pendingAction === "cancelJob");
       entry.card.dataset.state = job.state;
-      entry.card.dataset.animating = String(["parsing", "downloading", "saving"].includes(job.state) && !cancelling);
+      entry.card.dataset.animating = String(["parsing", "downloading", "muxing", "saving"].includes(job.state) && !cancelling);
       setText(entry.title, String(job.filename || job.title || "视频").split(/[\\/]/).pop()); entry.title.title = job.filename || job.title || "视频";
       setText(entry.label, stateLabels[job.state] || "处理中");
       const hasTotal = job.totalSegments > 0 || job.totalBytes > 0;
@@ -289,10 +316,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (hasTotal || job.state === "complete") entry.progress.setAttribute("aria-valuenow", value); else entry.progress.removeAttribute("aria-valuenow");
       entry.progress.setAttribute("aria-valuetext", `${stateLabels[job.state] || "处理中"}${hasTotal ? ` ${value}%` : ""}`);
       const segments = job.totalSegments > 0 ? `${job.completedSegments || 0} / ${job.totalSegments} 片 · ` : "";
-      setText(entry.metrics, `${segments}${formatSize(job.bytesReceived || 0)}${!job.totalSegments && job.totalBytes > 0 ? ` / ${formatSize(job.totalBytes)}` : ""}`);
+      const quality = typeof job.qualityLabel === 'string' ? job.qualityLabel.trim().slice(0, 100) : '';
+      setText(entry.metrics, `${quality ? `${quality} · ` : ''}${segments}${formatSize(job.bytesReceived || 0)}${!job.totalSegments && job.totalBytes > 0 ? ` / ${formatSize(job.totalBytes)}` : ""}`);
       setText(entry.percent, hasTotal || job.state === "complete" ? `${value}%` : "");
       const hasSpeed = Number.isFinite(job.bytesPerSecond) && job.bytesPerSecond >= 0;
-      const targetConcurrency = job.isM3U8 || job.totalSegments > 0 ? jobConcurrency(job) : null;
+      const targetConcurrency = (NekoSites.isNativeJob(job) ? job.segmented === true : job.isM3U8 || job.totalSegments > 0) ? jobConcurrency(job) : null;
       const hasConcurrency = targetConcurrency !== null;
       const showSpeed = job.state === "downloading";
       entry.telemetry.hidden = !(showSpeed && (hasSpeed || hasConcurrency) || job.state === "queued" && hasConcurrency);
@@ -318,10 +346,13 @@ document.addEventListener("DOMContentLoaded", async () => {
       const cached = Number.isFinite(job.cachedSegments) ? Math.max(0, Math.floor(job.cachedSegments)) : 0;
       entry.cacheStatus.hidden = !canResume;
       setText(entry.cacheStatus, canResume ? `已保留 ${cached} 个分片，可继续下载。继续时会校验缓存，链接过期时可能需要重新识别。` : "");
+      const site = NekoSites.forJob(job), sessionRetry = needsSiteSession(job);
+      entry.authNotice.hidden = !sessionRetry;
+      setText(entry.authNotice, sessionRetry ? `仅将 ${site.label} 登录状态交给本机下载内核，用于向 ${site.label} 请求此视频。` : '');
       entry.cancel.hidden = !activeStates.has(job.state);
       setText(entry.cancel, cancelling ? "正在取消…" : "取消任务");
       entry.retry.hidden = !["interrupted", "cancelled"].includes(job.state);
-      setText(entry.retry, canResume ? "继续下载" : "重新下载");
+      setText(entry.retry, sessionRetry ? `使用 ${site.label} 登录状态重试` : canResume ? "继续下载" : "重新下载");
       entry.reveal.hidden = job.state !== "complete";
       entry.discard.hidden = !canResume;
       entry.remove.hidden = !["complete", "interrupted", "cancelled"].includes(job.state);

@@ -1,11 +1,12 @@
 // 喵喵视频下载姬 — MV3 media capture. Downloads belong to the trusted manager.
-if (typeof importScripts === 'function') importScripts('domain/media.js', 'download-manager.js');
+if (typeof importScripts === 'function') importScripts('domain/media.js', 'domain/youtube.js', 'domain/bilibili.js', 'domain/sites.js', 'download-manager.js');
 const mediaRules = globalThis.NekoMedia;
+const siteRules = globalThis.NekoSites;
 const SESSION_KEYS = {
   media: "neko_tabMedia", titles: "neko_tabTitles",
   chunks: "neko_tabChunks", playback: "neko_tabPlayback", documents: "neko_tabDocuments",
   retired: "neko_retiredDocuments", networkRetired: "neko_retiredNetworkDocuments", parents: "neko_frameParents",
-  fragments: "neko_fragments"
+  fragments: "neko_fragments", nativeTitles: "neko_nativeTitles"
 };
 let tabMediaMap = new Map();
 let tabTitleMap = new Map();
@@ -16,6 +17,8 @@ let frameParents = new Map();
 let tabDocuments = new Map();
 let retiredNetworkDocuments = new Map();
 let fragmentMediaMap = new Map();
+let nativeTitleState = new Map();
+const nativeTitleRevisions = new Map();
 const MAX_MEDIA = 60;
 const mediaRefreshes = new Map();
 let saveTimer;
@@ -35,6 +38,7 @@ const restorePromise = chrome.storage.session.get(Object.values(SESSION_KEYS)).t
   retiredDocuments = new Map([...restore(SESSION_KEYS.retired)].map(([key, values]) => [key, new Set(values)]));
   retiredNetworkDocuments = new Map([...restore(SESSION_KEYS.networkRetired)].map(([key, values]) => [key, new Set(values)]));
   fragmentMediaMap = new Map([...restore(SESSION_KEYS.fragments)].map(([key, values]) => [key, new Map(values)]));
+  nativeTitleState = restore(SESSION_KEYS.nativeTitles);
   // Older versions saved screenshots in both places. Remove those image bytes
   // without discarding media evidence or titles still used for filenames.
   const cleanup = await Promise.allSettled([
@@ -55,6 +59,7 @@ function scheduleSave() {
     const snapshot = {
       [SESSION_KEYS.media]: [...tabMediaMap],
       [SESSION_KEYS.titles]: [...tabTitleMap],
+      [SESSION_KEYS.nativeTitles]: [...nativeTitleState],
       [SESSION_KEYS.chunks]: [...tabChunkCountMap], [SESSION_KEYS.playback]: [...tabPlaybackMap],
       [SESSION_KEYS.documents]: [...tabDocuments], [SESSION_KEYS.parents]: [...frameParents],
       [SESSION_KEYS.retired]: [...retiredDocuments].map(([key, values]) => [key, [...values]]),
@@ -142,8 +147,20 @@ function refreshMedia(tabId) {
     // itself must run OUTSIDE eventQueue: it awaits reports handled by that queue.
     await enqueue(() => {});
     for (const documentId of Object.values(tabDocuments.get(tabId) || {})) refresh.documents.add(documentId);
+    // Tab metadata is an asynchronous sample. A later title event outranks it.
+    const titleRevision = nativeTitleRevisions.get(tabId) || 0;
     const initial = await refreshableTab(tabId);
     checkNavigation();
+    if (siteRules.parse(initial.url)) {
+      // A supported video page identifies a download before playback. Browser
+      // tab metadata avoids a cold-start dependency on missed media requests.
+      return enqueue(() => {
+        checkNavigation();
+        syncNativePage(tabId, initial, { sampleRevision: titleRevision });
+        return { success: true, ...mediaSnapshot(tabId) };
+      });
+    }
+    await enqueue(() => { checkNavigation(); syncNativePage(tabId, initial, { sampleRevision: titleRevision }); });
     let timer;
     try {
       const scanning = (async () => {
@@ -287,10 +304,58 @@ function updateBadge(tabId) {
   chrome.action.setBadgeText({ tabId, text: String(tabMediaMap.get(tabId)?.length || "") }).catch(() => {});
   chrome.action.setBadgeBackgroundColor({ tabId, color: "#DC7091" }).catch(() => {});
 }
+function syncNativePage(tabId, tab, options = {}) {
+  if (!validTab(tabId)) return;
+  const identity = siteRules.parse(tab?.url);
+  const previous = tabMediaMap.get(tabId) || [];
+  if (!identity) {
+    nativeTitleState.delete(tabId);
+    if (!previous.some(item => siteRules.isNativeJob(item))) return;
+    tabMediaMap.set(tabId, previous.filter(item => !siteRules.isNativeJob(item)));
+  } else {
+    const existing = previous.find(item => siteRules.isNativeJob(item) && item.url === identity.url);
+    const previousNative = previous.find(item => siteRules.isNativeJob(item));
+    const remembered = nativeTitleState.get(tabId);
+    const sameIdentity = remembered?.url === identity.url;
+    const fallback = siteRules.cleanTitle('', identity.site);
+    const sampledTitle = tab.title ? siteRules.cleanTitle(tab.title, identity.site) : '';
+    const staleSample = options.sampleRevision !== undefined && options.sampleRevision !== (nativeTitleRevisions.get(tabId) || 0);
+    let pending = sameIdentity && remembered.pending === true;
+    let staleTitle = sameIdentity ? remembered.staleTitle || '' : '';
+    let title = existing?.title || fallback;
+    if (!existing && !sameIdentity) {
+      const previousTitle = previousNative?.title || options.navigationTitle || '';
+      staleTitle = previousTitle ? siteRules.cleanTitle(previousTitle, identity.site) : '';
+      pending = options.navigation === true || Boolean(previousNative && sampledTitle === staleTitle);
+    }
+    if (options.titleChanged === true) {
+      title = sampledTitle || fallback; pending = false; staleTitle = '';
+    } else if (!staleSample && sampledTitle && (!pending || sampledTitle !== staleTitle)) {
+      // After URL-only navigation Chrome can still report the old P's title.
+      // Wait for a title event, or a genuinely changed later sample.
+      title = sampledTitle; pending = false; staleTitle = '';
+    }
+    nativeTitleState.set(tabId, { url: identity.url, pending, staleTitle });
+    const candidate = { id: existing?.id || `${tabId}_${identity.site}_${identity.videoId}_${identity.page || 1}`,
+      ...identity, kind: identity.site, isM3U8: false, isFragment: false,
+      ext: 'mp4', mime: '', title, baseName: mediaRules.sanitizeFilename(title),
+      suggestedFilename: `${mediaRules.sanitizeFilename(title)}.mp4`, size: 0,
+      active: true, source: `${identity.site}-page`, evidence: ['browser-tab'],
+      tabId, frameId: 0, pageUrl: identity.url,
+      timestamp: existing?.timestamp || Date.now(), contexts: [{ frameId: 0, documentId: '' }] };
+    if (previous.length === 1 && JSON.stringify(existing) === JSON.stringify(candidate)) { scheduleSave(); return; }
+    // Browser page identity replaces signed/ranged URLs and ad/preload tracks.
+    tabMediaMap.set(tabId, [candidate]);
+    fragmentMediaMap.delete(tabId); tabChunkCountMap.set(tabId, 0);
+    tabTitleMap.set(tabId, title);
+  }
+  updateBadge(tabId); scheduleSave(); notify({ action: 'mediaListUpdated', tabId });
+}
 function clearTab(tabId) {
   for (const [frameId, state] of Object.entries(tabPlaybackMap.get(tabId) || {})) retireDocument(tabId, frameId, state);
   for (const documentId of Object.values(tabDocuments.get(tabId) || {})) retireNetworkDocument(tabId, documentId);
   tabMediaMap.delete(tabId); tabTitleMap.delete(tabId);
+  nativeTitleState.delete(tabId);
   tabChunkCountMap.delete(tabId); fragmentMediaMap.delete(tabId);
   tabPlaybackMap.delete(tabId); frameParents.delete(tabId); tabDocuments.delete(tabId);
   updateBadge(tabId); scheduleSave(); notify({ action: "mediaListUpdated", tabId });
@@ -331,6 +396,9 @@ function clearFrame(tabId, frameId) {
 function addMediaItem(tabId, item) {
   const url = mediaRules.normalizeUrl(item.url);
   if (!validTab(tabId) || !url) return;
+  // These URLs may be single tracks, byte ranges or UMP sessions. The native
+  // adapter owns their resolution; offering them as direct MP4s is misleading.
+  if (siteRules.isTransport(url) || siteRules.parse(url) || (tabMediaMap.get(tabId) || []).some(entry => siteRules.isNativeJob(entry))) return;
   let list = tabMediaMap.get(tabId);
   if (!list) tabMediaMap.set(tabId, list = []);
   let fragments = fragmentMediaMap.get(tabId);
@@ -444,7 +512,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return { status: "ok" };
     }
     if (message.action === "reportPageTitle" && validTab(tabId)) {
-      if (!sender.frameId && message.title) tabTitleMap.set(tabId, String(message.title).slice(0, 300));
+      // Site SPA messages may still carry the previous video/part title. Its
+      // candidate title comes exclusively from current browser tab metadata.
+      if (!sender.frameId && message.title && !(tabMediaMap.get(tabId) || []).some(item => siteRules.isNativeJob(item))) tabTitleMap.set(tabId, String(message.title).slice(0, 300));
       scheduleSave(); return { status: "ok" };
     }
     if (message.action === "getMedia") {
@@ -455,13 +525,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     .catch(error => sendResponse({ success: false, error: error.message }));
   return true;
 });
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.title) enqueue(() => { tabTitleMap.set(tabId, changeInfo.title); scheduleSave(); });
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.url) invalidateRefresh(tabId);
+  if (changeInfo.url || changeInfo.title) enqueue(() => {
+    nativeTitleRevisions.set(tabId, (nativeTitleRevisions.get(tabId) || 0) + 1);
+    const existing = (tabMediaMap.get(tabId) || []).find(item => siteRules.isNativeJob(item));
+    const url = changeInfo.url || tab?.url || existing?.url;
+    if (url) syncNativePage(tabId, { url, title: changeInfo.title || '' }, {
+      titleChanged: typeof changeInfo.title === 'string', navigation: Boolean(changeInfo.url), navigationTitle: tab?.title
+    });
+    if (changeInfo.title && !siteRules.parse(url)) { tabTitleMap.set(tabId, changeInfo.title); scheduleSave(); }
+  });
 });
 chrome.tabs.onRemoved.addListener(tabId => {
   invalidateRefresh(tabId);
   enqueue(() => {
     clearTab(tabId);
+    nativeTitleRevisions.delete(tabId);
     retiredNetworkDocuments.delete(tabId);
     for (const key of retiredDocuments.keys()) if (key.startsWith(`${tabId}:`)) retiredDocuments.delete(key);
   });

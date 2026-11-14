@@ -17,16 +17,18 @@ const confirmed = (documentId = 'current', frameId = 0) => ({ frameId, documentI
   result: { success: true, documentToken: `token-${documentId}`, generation: 1, reports: 2, failedReports: 0 } });
 const event = () => ({ listeners: [], addListener(fn) { this.listeners.push(fn); }, emit(...args) { for (const fn of this.listeners) fn(...args); } });
 
-function fixture({ restore = Promise.resolve({}), execute, tab = { id: 7, url: 'https://page.test/watch' } } = {}) {
+function fixture({ restore = Promise.resolve({}), execute, getTab, tab = { id: 7, url: 'https://page.test/watch' } } = {}) {
   const calls = [], timers = [], notifications = [];
   let currentTab = tab;
   const chrome = {
     runtime: { id: extensionId, getURL: extensionUrl, onMessage: event(), sendMessage: async message => { notifications.push(message); } },
-    storage: { session: { get: () => restore, set: async () => {}, remove: async () => {} } },
+    storage: { session: { get: () => restore, set: async value => { chrome.saved = value; }, remove: async () => {} } },
     action: { setBadgeText: async () => {}, setBadgeBackgroundColor: async () => {} },
     webRequest: { onBeforeRequest: event(), onHeadersReceived: event() },
     tabs: { onUpdated: event(), onRemoved: event(), async get(id) {
-      if (!currentTab || currentTab.id !== id) throw new Error('No tab'); return { ...currentTab };
+      if (!currentTab || currentTab.id !== id) throw new Error('No tab');
+      const snapshot = { ...currentTab };
+      return getTab ? getTab(snapshot) : snapshot;
     } },
     scripting: { async executeScript(options) {
       calls.push(options);
@@ -36,7 +38,7 @@ function fixture({ restore = Promise.resolve({}), execute, tab = { id: 7, url: '
       return [confirmed()];
     } }
   };
-  vm.runInContext(source, vm.createContext({ chrome, NekoMedia: require('../domain/media.js'), crypto: webcrypto, URL, console,
+  vm.runInContext(source, vm.createContext({ chrome, NekoMedia: require('../domain/media.js'), NekoSites: require('../domain/sites.js'), crypto: webcrypto, URL, console,
     setTimeout(fn, ms) { const timer = { fn, ms, active: true }; timers.push(timer); return timer; },
     clearTimeout(timer) { if (timer) timer.active = false; }
   }));
@@ -50,6 +52,121 @@ function fixture({ restore = Promise.resolve({}), execute, tab = { id: 7, url: '
   };
   return h;
 }
+
+test('YouTube cold refresh uses browser page identity without media requests or injected scripts', async () => {
+  const h = fixture({ tab: { id: 7, url: 'https://www.youtube.com/watch?v=BaW_jenozKc&list=ignored', title: '中文视频 - YouTube' },
+    execute: async () => { throw new Error('YouTube discovery does not depend on player injection'); } });
+  const result = await h.refresh();
+  assert.equal(result.success, true); assert.equal(result.media.length, 1);
+  assert.equal(result.media[0].url, 'https://www.youtube.com/watch?v=BaW_jenozKc');
+  assert.equal(result.media[0].engine, 'youtube-native'); assert.equal(result.media[0].kind, 'youtube');
+  assert.equal(result.media[0].isM3U8, false); assert.equal(result.media[0].suggestedFilename, '中文视频.mp4');
+  assert.equal(result.capturePhase, 'found'); assert.equal(h.calls.length, 0);
+});
+
+test('YouTube SPA updates replace identity and stale content titles or ranged requests cannot pollute it', async () => {
+  const first = { id: 7, url: 'https://www.youtube.com/watch?v=BaW_jenozKc', title: '第一集 - YouTube' };
+  const next = { id: 7, url: 'https://www.youtube.com/shorts/aqz-KE-bpKQ', title: '第二集 - YouTube' };
+  const h = fixture({ tab: first }); await h.refresh();
+  h.setTab(next); h.chrome.tabs.onUpdated.emit(7, { url: next.url, title: next.title }, next);
+  await h.message(report({ action: 'reportPageTitle', title: '旧的视频标题' }), { ...frame(), url: first.url, tab: first });
+  for (const range of ['0-99', '100-199']) h.chrome.webRequest.onHeadersReceived.emit({ tabId: 7, statusCode: 206,
+    frameId: 0, url: `https://rr1.googlevideo.com/videoplayback?itag=137&range=${range}`,
+    responseHeaders: [{ name: 'content-type', value: 'video/mp4' }] });
+  await h.message(report({ action: 'reportDOMVideo', url: 'https://cdn.test/advert.mp4' }), frame());
+  const current = await h.snapshot();
+  assert.equal(current.media.length, 1); assert.equal(current.media[0].url, 'https://www.youtube.com/watch?v=aqz-KE-bpKQ');
+  assert.equal(current.media[0].title, '第二集'); assert.equal(current.media[0].suggestedFilename, '第二集.mp4');
+  h.chrome.tabs.onUpdated.emit(7, { url: 'https://www.youtube.com/feed/subscriptions' }, { id: 7, url: 'https://www.youtube.com/feed/subscriptions' });
+  assert.equal((await h.snapshot()).media.length, 0, 'Leaving the video cannot retain its download candidate');
+});
+
+test('cold recovery on a different ordinary page clears a restored YouTube candidate before accepting media', async () => {
+  const h = fixture({ restore: Promise.resolve({ neko_tabMedia: [[7, [{ url: 'https://www.youtube.com/watch?v=BaW_jenozKc', engine: 'youtube-native' }]]] }) });
+  const result = await h.refresh();
+  assert.equal(result.media.length, 1); assert.equal(result.media[0].url, 'https://cdn.test/current.mp4');
+});
+
+test('Bilibili cold recovery discovers the current part without playback, navigation or content injection', async () => {
+  const h = fixture({ tab: { id: 7, url: 'https://www.bilibili.com/video/BV13x41117TL/?p=2&spm_id_from=share', title: '第二部分_哔哩哔哩_bilibili' },
+    restore: Promise.resolve({ neko_tabMedia: [[7, [{ url: 'https://www.bilibili.com/video/BV13x41117TL/?p=1', site: 'bilibili', engine: 'bilibili-native', title: '旧P1' }]]] }),
+    execute: async () => { throw new Error('Bilibili discovery does not require a page refresh or player script'); } });
+  const result = await h.refresh();
+  assert.equal(result.success, true); assert.equal(result.media.length, 1); assert.equal(h.calls.length, 0);
+  assert.equal(result.media[0].url, 'https://www.bilibili.com/video/BV13x41117TL/?p=2');
+  assert.equal(result.media[0].site, 'bilibili'); assert.equal(result.media[0].engine, 'bilibili-native');
+  assert.equal(result.media[0].page, 2); assert.equal(result.media[0].title, '第二部分');
+  assert.equal(result.capturePhase, 'found');
+});
+
+test('Bilibili SPA part navigation replaces the old identity and rejects old titles and track noise', async () => {
+  const first = { id: 7, url: 'https://www.bilibili.com/video/BV13x41117TL/?p=1', title: '第一部分_哔哩哔哩_bilibili' };
+  const next = { id: 7, url: 'https://www.bilibili.com/video/BV13x41117TL/?p=3', title: '第三部分_哔哩哔哩_bilibili' };
+  const h = fixture({ tab: first }); const initial = await h.refresh();
+  h.setTab(next); h.chrome.tabs.onUpdated.emit(7, { url: next.url }, { ...next, title: first.title });
+  await h.message(report({ action: 'reportPageTitle', title: first.title }), { ...frame(), url: first.url, tab: first });
+  let current = await h.snapshot();
+  assert.equal(current.media[0].page, 3); assert.notEqual(current.media[0].id, initial.media[0].id);
+  assert.equal(current.media[0].title, 'B站视频', 'A P navigation does not inherit the old page title');
+  h.chrome.tabs.onUpdated.emit(7, { title: next.title }, next);
+  for (const code of ['30080', '30280']) h.chrome.webRequest.onHeadersReceived.emit({ tabId: 7, frameId: 0, statusCode: 206,
+    url: `https://xy.bilivideo.com/upgcxcode/123/123-1-${code}.m4s?range=0-99`,
+    responseHeaders: [{ name: 'content-type', value: 'video/mp4' }] });
+  await h.message(report({ action: 'reportDOMVideo', url: 'https://xy.bilivideo.com/advert.mp4' }), frame());
+  current = await h.snapshot();
+  assert.equal(current.media.length, 1); assert.equal(current.media[0].title, '第三部分'); assert.equal(current.chunkCount, 0);
+  h.chrome.tabs.onUpdated.emit(7, { url: 'https://www.bilibili.com/bangumi/play/ep123' }, { id: 7, url: 'https://www.bilibili.com/bangumi/play/ep123' });
+  assert.equal((await h.snapshot()).media.length, 0, 'Unsupported page cannot keep the previous ordinary upload');
+});
+
+test('a delayed tab-title sample cannot overwrite a newer authoritative title event', async () => {
+  const sampled = deferred(); let hold = false;
+  const tab = { id: 7, url: 'https://www.bilibili.com/video/BV13x41117TL/?p=2', title: '旧标题_哔哩哔哩_bilibili' };
+  const h = fixture({ tab, getTab: snapshot => hold ? sampled.promise.then(() => snapshot) : snapshot });
+  await h.refresh(); hold = true;
+  const pending = h.refresh(); await tick();
+  const newer = { ...tab, title: '更新后的P2标题_哔哩哔哩_bilibili' };
+  h.setTab(newer); h.chrome.tabs.onUpdated.emit(7, { title: newer.title }, newer);
+  assert.equal((await h.snapshot()).media[0].title, '更新后的P2标题');
+  sampled.resolve();
+  assert.equal((await pending).media[0].title, '更新后的P2标题');
+  assert.equal((await h.snapshot()).media[0].suggestedFilename, '更新后的P2标题.mp4');
+});
+
+test('a refresh cannot reintroduce the previous P title while Chrome metadata is catching up', async () => {
+  const first = { id: 7, url: 'https://www.bilibili.com/video/BV13x41117TL/?p=1', title: '第一部分_哔哩哔哩_bilibili' };
+  const second = { ...first, url: 'https://www.bilibili.com/zh-Hans/video/BV13x41117TL/?p=2' };
+  const h = fixture({ tab: first }); await h.refresh();
+  h.setTab(second); h.chrome.tabs.onUpdated.emit(7, { url: second.url }, second);
+  assert.equal((await h.snapshot()).media[0].title, 'B站视频');
+  const refreshed = await h.refresh();
+  assert.equal(refreshed.media[0].page, 2); assert.equal(refreshed.media[0].title, 'B站视频');
+  // Persist the uncertainty so suspending the service worker cannot reintroduce P1.
+  h.timers.filter(timer => timer.active && timer.ms === 150).at(-1).fn(); await tick();
+  const recovered = fixture({ tab: second, restore: Promise.resolve(h.chrome.saved) });
+  assert.equal((await recovered.refresh()).media[0].title, 'B站视频');
+  recovered.setTab({ ...second, title: '第二部分_哔哩哔哩_bilibili' });
+  assert.equal((await recovered.refresh()).media[0].title, '第二部分', 'A changed fresh sample can recover a missed title event');
+});
+
+test('a true cold Bilibili P2 page still receives its sampled title without navigation events', async () => {
+  const h = fixture({ tab: { id: 7, url: 'https://www.bilibili.com/zh-Hans/video/BV1bK411W797/?p=2', title: '第2部分_哔哩哔哩_bilibili' } });
+  const result = await h.refresh();
+  assert.equal(result.media[0].title, '第2部分'); assert.equal(result.media[0].page, 2);
+  assert.equal(result.media[0].url, 'https://www.bilibili.com/video/BV1bK411W797/?p=2');
+  assert.equal(h.calls.length, 0);
+});
+
+test('only trusted tab navigation can establish a Bilibili identity and independent CDN MP4s survive', async () => {
+  const h = fixture();
+  await h.message(report({ action: 'reportDOMVideo', url: 'https://www.bilibili.com/video/BV13x41117TL/?p=8' }), frame());
+  assert.equal((await h.snapshot()).media.length, 0, 'Content-reported page URLs do not authorize a native site job');
+  h.chrome.webRequest.onHeadersReceived.emit({ tabId: 7, frameId: 0, statusCode: 200, url: 'https://xy.bilivideo.com/ordinary.mp4',
+    responseHeaders: [{ name: 'content-type', value: 'video/mp4' }] });
+  const current = await h.snapshot();
+  assert.equal(current.media.length, 1); assert.equal(current.media[0].url, 'https://xy.bilivideo.com/ordinary.mp4');
+  assert.equal(current.media[0].engine, undefined);
+});
 
 test('cold refresh waits for hydration, then accepts content ACKs without holding the capture queue', { timeout: 1500 }, async () => {
   const restored = deferred();

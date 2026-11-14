@@ -2,7 +2,11 @@
 (() => {
   'use strict';
   if (!globalThis.NekoJobState && typeof importScripts === 'function') importScripts('engine/job-state.js');
+  if (!globalThis.NekoNative && typeof importScripts === 'function') importScripts('engine/native-client.js');
   const jobState = globalThis.NekoJobState;
+  const sites = globalThis.NekoSites;
+  const native = globalThis.NekoNative?.createClient(chrome.runtime);
+  const isNative = job => sites?.isNativeJob(job) === true;
   const JOBS_KEY = 'neko_jobs_v1';
   const SETTINGS_KEY = 'neko_settings_v1';
   const CONCURRENCY_REVISION_KEY = 'neko_concurrency_revision_v1';
@@ -13,8 +17,9 @@
   const retrying = new Map();
   const discarding = new Map();
   const removing = new Map();
+  const nativeReleases = new Map();
   const pendingWrites = new WeakMap();
-  let creating, reconciling, saveChain = Promise.resolve(), settingsChain = Promise.resolve();
+  let creating, reconciling, nativeRequests = 0, nativeUpdates = 0, saveChain = Promise.resolve(), settingsChain = Promise.resolve();
   // Local metadata outlives the browser session; OPFS holds verified media bytes.
   // Session is retained as a compatibility mirror for the 1.x upgrade.
   const ready = Promise.all([chrome.storage.session.get(JOBS_KEY), chrome.storage.local.get(JOBS_KEY)]).then(([session, local]) => {
@@ -29,6 +34,17 @@
     }
   });
   void ready.catch(error => console.warn('Neko jobs restore:', error));
+  native?.onJob(incoming => { void ready.then(() => acceptNativeProgress(incoming)).catch(error => console.warn('Yangmo native progress:', error.message)); });
+  native?.onDisconnect(reason => { void ready.then(async () => {
+    for (const job of jobs.values()) {
+      if (!isNative(job) || terminal.has(job.state)) continue;
+      if (Number.isInteger(job.downloadId) || saving.has(job.id)) {
+        update(job, { error: `${reason}；正在核对 Chrome 保存结果` }); continue;
+      }
+      update(job, { state: 'interrupted', error: reason, resumable: false });
+    }
+    await persist();
+  }).catch(error => console.warn('Yangmo native disconnect:', error.message)); });
   const notify = () => chrome.runtime.sendMessage({ action: 'jobsUpdated' }).catch(() => {});
   function snapshotJobs() {
     const completed = [...jobs.values()].filter(job => terminal.has(job.state) && !removing.has(job.id) && !job.cleanupError && !(job.state === 'interrupted' && (job.resumable || job.cachedSegments > 0))).sort((a, b) => b.createdAt - a.createdAt);
@@ -90,10 +106,10 @@
   async function applyConcurrencyToJobs(policy) {
     let changed = false;
     for (const job of jobs.values()) {
-      if (!job.isM3U8 || terminal.has(job.state) || removing.has(job.id) || (job.concurrencyRevision || 0) > policy.concurrencyRevision) continue;
+      if ((!job.isM3U8 && !isNative(job)) || terminal.has(job.state) || removing.has(job.id) || (job.concurrencyRevision || 0) > policy.concurrencyRevision) continue;
       const patch = { ...policy, concurrencyMode: 'manual', concurrencyReason: 'manual',
-        targetConcurrency: job.state === 'downloading' ? policy.concurrency : 0 };
-      if (job.state === 'downloading') patch.activeConcurrency = policy.concurrency;
+        targetConcurrency: job.state === 'downloading' && (!isNative(job) || job.segmented) ? policy.concurrency : 0 };
+      if (job.state === 'downloading' && (!isNative(job) || job.segmented)) patch.activeConcurrency = policy.concurrency;
       if (Object.entries(patch).every(([key, value]) => job[key] === value)) continue;
       Object.assign(job, patch, { updatedAt: Date.now() }); changed = true;
     }
@@ -109,6 +125,14 @@
       }
       // A newer control message may have overtaken this reconciliation request.
       policy = { concurrency: reply.concurrency, concurrencyRevision: reply.concurrencyRevision };
+    }
+    if (native?.connected() && [...jobs.values()].some(job => isNative(job) && !terminal.has(job.state))) {
+      const reply = await nativeRequest('setConcurrency', policy);
+      if (!Number.isSafeInteger(reply.concurrencyRevision) || reply.concurrencyRevision < policy.concurrencyRevision ||
+          !Number.isInteger(reply.concurrency) || reply.concurrency < 1 || reply.concurrency > jobState.LIMITS.segments ||
+          reply.concurrency !== policy.concurrency && reply.concurrencyRevision === policy.concurrencyRevision) {
+        throw new Error('本机内核尚未确认新的分片并发');
+      }
     }
     await applyConcurrencyToJobs(policy);
   }
@@ -154,14 +178,136 @@
   }
   function applyChrome(job, item) {
     const state = item.state === 'complete' ? 'complete' : item.state === 'interrupted' ? (item.error === 'USER_CANCELED' ? 'cancelled' : 'interrupted') : 'downloading';
+    // Two search() calls can resolve in reverse order. A confirmed final save
+    // must not return to saving when an older in-progress snapshot arrives.
+    if (isNative(job) && terminal.has(job.state) && state === 'downloading') return;
     // HLS completion is acknowledged by the offscreen writer after cleanup.
     const patch = { bytesReceived: item.bytesReceived || 0, totalBytes: Math.max(0, item.totalBytes || 0), savedPath: item.filename || job.savedPath || '' };
-    if (!job.isM3U8) {
+    if (isNative(job)) {
+      Object.assign(patch, { state: state === 'downloading' ? 'saving' : state, error: item.error || '', etaSeconds: null, etaBasis: 'unknown' });
+      if (state === 'complete') Object.assign(patch, { bytesPerSecond: 0, targetConcurrency: 0, inFlightRequests: 0 });
+    } else if (!job.isM3U8) {
       const seconds = (Date.parse(item.estimatedEndTime) - Date.now()) / 1000;
       const etaSeconds = state === 'downloading' && item.paused !== true && Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds) : null;
       Object.assign(patch, { state, error: item.error || '', etaSeconds, etaBasis: etaSeconds === null ? 'unknown' : 'chrome' });
     }
     update(job, patch);
+    if (isNative(job) && terminal.has(job.state)) void releaseNative(job);
+  }
+  function nativeRequest(action, payload) {
+    if (!native) return Promise.reject(new Error('请先安装羊魔本机下载内核，并重新加载扩展'));
+    nativeRequests++;
+    return Promise.resolve().then(() => native.request(action, payload)).finally(() => {
+      nativeRequests--; closeNativeIfIdle();
+    });
+  }
+  function closeNativeIfIdle() {
+    if (!nativeRequests && !nativeUpdates && !nativeReleases.size && ![...jobs.values()].some(job => isNative(job) && (!terminal.has(job.state) || dispatching.has(job.id) || saving.has(job.id) || removing.has(job.id)))) native?.close();
+  }
+  function releaseNative(job) {
+    if (nativeReleases.has(job.id)) return nativeReleases.get(job.id);
+    const pending = (async () => {
+      try {
+        // Commit the Chrome ID/final state before dropping recovery material.
+        await pendingWrites.get(job);
+        if (Number.isInteger(job.downloadId)) {
+          const item = await chromeItem(job.downloadId);
+          if (item.state === 'in_progress') throw new Error('Chrome 仍在保存文件');
+        }
+        if (native?.connected()) await nativeRequest('release', { jobId: job.id, runId: job.runId });
+      } catch (error) { update(job, { cleanupError: `临时文件清理未完成：${error.message}` }); }
+    })().finally(() => { nativeReleases.delete(job.id); closeNativeIfIdle(); });
+    nativeReleases.set(job.id, pending); return pending;
+  }
+  async function reconcileNativeChrome(job, cancel = false) {
+    let item = await chromeItem(job.downloadId);
+    if (cancel && item.state === 'in_progress') {
+      try { await chrome.downloads.cancel(job.downloadId); }
+      catch (error) {
+        // A fast save can complete after search() but before cancel().
+        item = await chromeItem(job.downloadId);
+        if (item.state === 'in_progress') throw error;
+      }
+      item = await chromeItem(job.downloadId);
+    }
+    applyChrome(job, item);
+    await commitNativeRecord(job);
+  }
+  async function commitNativeRecord(job) {
+    try { await pendingWrites.get(job); }
+    catch (error) {
+      const message = `任务记录保存失败：${error.message}`;
+      Object.assign(job, { error: message }); notify();
+      throw new Error(message);
+    }
+  }
+  async function saveNativeArtifact(job, artifact) {
+    if (saving.has(job.id)) return saving.get(job.id);
+    if (Number.isInteger(job.downloadId) || terminal.has(job.state) || job.cancelRequested) return;
+    const url = new URL(artifact?.url);
+    const filename = safeName(artifact?.filename || '视频.mp4');
+    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.hash || url.search ||
+        !/^\/artifact\/[A-Za-z0-9_-]{43}$/.test(url.pathname) ||
+        filename !== artifact.filename || !/\.(mp4|mkv|webm)$/i.test(filename)) throw new Error('本机内核返回的成品地址或文件名无效');
+    const pending = (async () => {
+      if (job.cancelRequested || terminal.has(job.state)) return;
+      const id = await chrome.downloads.download({ url: url.href, filename, saveAs: false, conflictAction: 'uniquify' });
+      update(job, { downloadId: id, filename, state: 'saving', etaSeconds: null, etaBasis: 'unknown' });
+      try { await pendingWrites.get(job); }
+      catch (error) {
+        // Chrome already owns the transfer. Storage failure must not revoke it.
+        Object.assign(job, { error: `任务记录保存失败：${error.message}` }); notify();
+      }
+      await reconcileNativeChrome(job, job.cancelRequested);
+    })().finally(() => { saving.delete(job.id); closeNativeIfIdle(); });
+    saving.set(job.id, pending);
+    return pending;
+  }
+  async function acceptNativeProgress(incoming) {
+    nativeUpdates++;
+    try { return await acceptNativeSnapshot(incoming); }
+    finally { nativeUpdates--; closeNativeIfIdle(); }
+  }
+  async function acceptNativeSnapshot(incoming) {
+    const job = jobs.get(incoming?.id);
+    if (!isNative(job) || removing.has(job.id) || incoming.state === 'complete') return;
+    if (incoming.site !== undefined && incoming.site !== sites.forJob(job).id) return;
+    // Retry an idempotent handoff when its first metadata write failed.
+    const replayArtifact = incoming.runId === job.runId && incoming.revision === job.progressRevision &&
+      incoming.state === 'saving' && job.state === 'saving' && incoming.artifact;
+    if (!jobState.accepts(job, incoming) && !replayArtifact) return;
+    // Once handed to Chrome, its final result is authoritative, including a
+    // cancellation racing a late native artifact acknowledgement.
+    if (Number.isInteger(job.downloadId) || saving.has(job.id)) return;
+    const patch = { state: incoming.state, progressRevision: incoming.revision, resumable: false, nativeStarted: true, nativeStartUnconfirmed: false,
+      error: String(incoming.error || '').slice(0, 500), phase: String(incoming.phase || incoming.state).slice(0, 80) };
+    for (const key of ['bytesReceived', 'totalBytes', 'totalSegments', 'completedSegments', 'bytesPerSecond', 'inFlightRequests']) {
+      if (Number.isFinite(incoming[key]) && incoming[key] >= 0) patch[key] = incoming[key];
+    }
+    if (typeof incoming.segmented === 'boolean') patch.segmented = incoming.segmented;
+    if (typeof incoming.authRequired === 'boolean') patch.authRequired = incoming.authRequired;
+    if (typeof incoming.errorCode === 'string') patch.errorCode = incoming.errorCode.slice(0, 80);
+    if (Number.isSafeInteger(incoming.concurrencyRevision) && incoming.concurrencyRevision >= (job.concurrencyRevision || 0)) {
+      patch.concurrencyRevision = incoming.concurrencyRevision;
+      if (Number.isInteger(incoming.concurrency) && incoming.concurrency >= 1 && incoming.concurrency <= 375) patch.concurrency = incoming.concurrency;
+      if (Number.isInteger(incoming.targetConcurrency) && incoming.targetConcurrency >= 0 && incoming.targetConcurrency <= 375) patch.targetConcurrency = incoming.targetConcurrency;
+    }
+    if (typeof incoming.qualityLabel === 'string') patch.qualityLabel = incoming.qualityLabel.slice(0, 100);
+    if (typeof incoming.title === 'string' && incoming.title.trim()) patch.title = incoming.title.trim().slice(0, 300);
+    patch.etaSeconds = incoming.state === 'downloading' && Number.isFinite(incoming.etaSeconds) && incoming.etaSeconds > 0 ? Math.ceil(incoming.etaSeconds) : null;
+    patch.etaBasis = patch.etaSeconds === null ? 'unknown' : 'native';
+    update(job, patch);
+    try { await (replayArtifact ? persist() : pendingWrites.get(job)); }
+    catch (error) {
+      Object.assign(job, { error: `任务记录保存失败：${error.message}` }); notify(); throw error;
+    }
+    if (incoming.state === 'saving' && incoming.artifact) {
+      try { await saveNativeArtifact(job, incoming.artifact); }
+      catch (error) {
+        if (Number.isInteger(job.downloadId)) update(job, { error: `正在核对 Chrome 保存结果：${error.message}` });
+        else { update(job, { state: 'interrupted', error: `保存未完成：${error.message}` }); await releaseNative(job); }
+      }
+    } else if (terminal.has(job.state)) await releaseNative(job);
   }
   async function reconcile() {
     await ready;
@@ -191,8 +337,29 @@
             error: job.cachedSegments > 0 ? '浏览器或扩展已重新启动，可继续已缓存分片' : '浏览器或扩展已重新启动，请重试' });
         }
       }
+      const nativeJobs = [...jobs.values()].filter(job => isNative(job) && !terminal.has(job.state) && !dispatching.has(job.id));
+      let nativeLive = [];
+      if (nativeJobs.some(job => !Number.isInteger(job.downloadId)) && native?.connected()) {
+        const reply = await nativeRequest('status', {});
+        if (!Array.isArray(reply.jobs)) throw new Error('本机内核任务状态无效');
+        nativeLive = reply.jobs;
+      }
+      for (const job of nativeJobs) {
+        if (terminal.has(job.state) || dispatching.has(job.id) || removing.has(job.id)) continue;
+        if (Number.isInteger(job.downloadId)) {
+          try { await reconcileNativeChrome(job, job.cancelRequested); }
+          catch (error) { update(job, { error: `正在核对 Chrome 保存结果：${error.message}` }); }
+        } else if (saving.has(job.id)) {
+          // Chrome is opening the artifact and has not returned its ID yet.
+          continue;
+        } else {
+          const current = nativeLive.find(item => item.id === job.id && item.runId === job.runId);
+          if (current) await acceptNativeProgress(current);
+          else update(job, { state: 'interrupted', resumable: false, error: '本机下载任务已停止，请重新下载' });
+        }
+      }
       for (const job of jobs.values()) {
-        if (!job.isM3U8 && !terminal.has(job.state) && !dispatching.has(job.id)) {
+        if (!job.isM3U8 && !isNative(job) && !terminal.has(job.state) && !dispatching.has(job.id)) {
           if (!Number.isInteger(job.downloadId)) update(job, { state: 'interrupted', error: '下载创建过程已中断，请重试' });
           else {
             try { applyChrome(job, await chromeItem(job.downloadId)); }
@@ -261,23 +428,97 @@
     // final state after the reply, including the first reusable checkpoint.
     await pendingWrites.get(job);
   }
+  async function readSiteSession(site) {
+    if (!site?.cookieQueryDomain || !Array.isArray(site.cookieDomains)) throw new Error('该站点尚未配置登录状态读取');
+    if (!chrome.permissions?.contains || !(await chrome.permissions.contains({ permissions: ['cookies'] }))) {
+      throw new Error(`尚未授权读取${site.label}登录状态，请通过授权重试按钮授予权限`);
+    }
+    if (!chrome.cookies?.getAll) throw new Error('浏览器未提供本站登录状态读取接口');
+    const source = await chrome.cookies.getAll({ domain: site.cookieQueryDomain });
+    return source.filter(cookie => site.cookieDomains.includes(cookie.domain) &&
+      typeof cookie.name === 'string' && typeof cookie.value === 'string').map(cookie => ({
+      name: cookie.name, value: cookie.value, domain: cookie.domain,
+      path: typeof cookie.path === 'string' && cookie.path.startsWith('/') ? cookie.path : '/', secure: cookie.secure === true,
+      ...(Number.isFinite(cookie.expirationDate) ? { expirationDate: cookie.expirationDate } : {})
+    }));
+  }
+  async function launchNative(job, policy, cookies) {
+    const payload = { job: { id: job.id, runId: job.runId, url: job.url, title: job.title,
+      site: job.site, ...(job.site === 'bilibili' ? { page: job.page } : {}),
+      concurrency: policy.concurrency, concurrencyRevision: policy.concurrencyRevision } };
+    if (cookies !== undefined) payload.cookies = cookies; // Ephemeral: never added to a job or storage.
+    let response;
+    try { response = await nativeRequest('start', payload); }
+    catch (error) {
+      if (!native?.connected()) throw error;
+      let snapshot;
+      try {
+        const reply = await nativeRequest('status', {});
+        if (!Array.isArray(reply.jobs)) throw new Error('本机内核任务状态无效');
+        snapshot = reply.jobs;
+      } catch {
+        // The host may have accepted start before its reply was lost. Keep a
+        // visible cancellable task until status or disconnect settles it.
+        update(job, { nativeStarted: true, nativeStartUnconfirmed: true,
+          error: `启动回执未确认，正在等待本机任务状态：${error.message}` });
+        return;
+      }
+      const current = snapshot.find(item => item.id === job.id && item.runId === job.runId);
+      if (!current) throw error;
+      response = { job: current };
+    }
+    update(job, { nativeStarted: true, nativeStartUnconfirmed: false });
+    if (response.job) await acceptNativeProgress(response.job);
+  }
+  async function cancelNative(job) {
+    if (saving.has(job.id) && !Number.isInteger(job.downloadId)) return;
+    if (Number.isInteger(job.downloadId)) await reconcileNativeChrome(job, true);
+    else {
+      const reply = await nativeRequest('cancel', { jobId: job.id, runId: job.runId });
+      if (reply.job) await acceptNativeProgress(reply.job);
+    }
+  }
   async function startDownload(message) {
     await ready;
-    const url = new URL(message.url);
+    let url = new URL(message.url);
     if (!/^https?:$/.test(url.protocol)) throw new Error('只支持 HTTP / HTTPS 视频地址');
+    // URL identity owns the adapter and credential scope, never message labels.
+    const identity = sites?.parse(url.href);
+    const site = identity ? sites.get(identity.site) : null;
+    if (message.engine && (!identity || message.engine !== identity.engine)) throw new Error('下载执行器与视频站点不匹配，或视频地址尚未支持');
+    if (message.site !== undefined && (!identity || message.site !== identity.site)) throw new Error('视频站点与地址不匹配');
+    if (message.useYouTubeSession === true && identity?.site !== 'youtube') throw new Error('YouTube 登录授权仅用于 YouTube 视频任务');
+    if (message.useSiteSession === true && !identity) throw new Error('登录授权仅用于已适配站点的视频任务');
+    const useNative = Boolean(identity);
+    const useSession = message.useSiteSession === true || message.useYouTubeSession === true;
+    if (identity) url = new URL(identity.url);
     const pref = await settings();
     const duplicate = activeJobForUrl(url.href);
     if (duplicate) return { success: true, job: duplicate };
     if ([...jobs.values()].filter(job => !terminal.has(job.state) || dispatching.has(job.id)).length >= jobState.LIMITS.jobs) throw new Error('最多同时安排 10 个任务，请等待或取消部分下载');
-    const isM3U8 = Boolean(message.isM3U8) || /\.m3u8(?:$|\?)/i.test(url.href);
+    const isM3U8 = !useNative && (Boolean(message.isM3U8) || /\.m3u8(?:$|\?)/i.test(url.href));
     let basename = safeName(message.filename || message.title || '视频.mp4');
     if (isM3U8) basename = basename.replace(/\.(?:m3u8|mp4|ts)$/i, '') + '.ts';
     const job = { id: crypto.randomUUID(), url: url.href, title: String(message.title || basename).slice(0, 300), filename: basename, subfolder: '', saveAs: false, concurrency: pref.concurrency, concurrencyMode: 'manual', isM3U8, tabId: Number.isInteger(message.tabId) ? message.tabId : null, state: 'queued', bytesReceived: 0, totalBytes: 0, completedSegments: 0, totalSegments: 0, error: '', createdAt: Date.now(), updatedAt: Date.now() };
+    if (useNative) Object.assign(job, { engine: identity.engine, site: identity.site,
+      ...(identity.site === 'bilibili' ? { page: identity.page } : {}), segmented: false, targetConcurrency: 0, authRequired: false });
     Object.assign(job, { runId: crypto.randomUUID(), progressRevision: 0, concurrencyRevision: pref.concurrencyRevision });
     jobs.set(job.id, job); dispatching.add(job.id);
+    let nativeDispatched = false;
     try {
       await persist(); notify();
-      if (isM3U8) {
+      if (useNative) {
+        const capabilities = await nativeRequest('ping', {});
+        if (site.id === 'bilibili' && capabilities.capabilities?.bilibili !== true) throw new Error('本机内核尚未支持哔哩哔哩，请更新配套内核后重试');
+        if (job.cancelRequested) { update(job, { state: 'cancelled' }); return { success: true, job: { ...job } }; }
+        const latest = await settings();
+        update(job, { ...latest }); await pendingWrites.get(job);
+        const cookies = useSession ? await readSiteSession(site) : undefined;
+        if (job.cancelRequested) { update(job, { state: 'cancelled' }); return { success: true, job: { ...job } }; }
+        nativeDispatched = true;
+        await launchNative(job, latest, cookies);
+        if (job.cancelRequested && !terminal.has(job.state)) await cancelNative(job);
+      } else if (isM3U8) {
         await ensureOffscreen();
         if (job.cancelRequested) { update(job, { state: 'cancelled' }); return { success: true, job: { ...job } }; }
         const latest = await settings();
@@ -292,8 +533,17 @@
         if (job.cancelRequested) await chrome.downloads.cancel(id);
         applyChrome(job, await chromeItem(id));
       }
-    } catch (error) { update(job, { state: job.cancelRequested ? 'cancelled' : 'interrupted', error: error.message }); throw error; }
-    finally { dispatching.delete(job.id); }
+    } catch (error) {
+      if (useNative && job.nativeStarted) {
+        // Losing an acknowledgement/storage write does not prove an accepted
+        // native task stopped. Keep its actual state visible and cancellable.
+        if (!terminal.has(job.state)) update(job, { error: error.message,
+          ...(!native?.connected() && !Number.isInteger(job.downloadId) && !saving.has(job.id) ? { state: 'interrupted' } : {}) });
+        return { success: true, job: { ...job } };
+      }
+      update(job, { state: job.cancelRequested && !nativeDispatched ? 'cancelled' : 'interrupted', error: error.message }); throw error;
+    }
+    finally { dispatching.delete(job.id); if (useNative) closeNativeIfIdle(); }
     return { success: true, job: { ...job } };
   }
   function activeJobForUrl(url, exceptId) {
@@ -382,7 +632,11 @@
           if (item?.state === 'in_progress') throw new Error('文件仍在保存，请等待结束或取消后再移除');
           if (item && ['complete', 'interrupted'].includes(item.state)) verifiedDownloadId = job.downloadId;
         }
-        if (job.isM3U8) {
+        if (isNative(job) && job.nativeStarted) {
+          if (nativeReleases.has(job.id)) await nativeReleases.get(job.id);
+          await nativeRequest('remove', { jobId: job.id, runId: job.runId });
+          Object.assign(job, { resumable: false, cleanupError: '', updatedAt: Date.now() });
+        } else if (job.isM3U8) {
           await ensureOffscreen();
           const reply = await offscreen('removeJob', { jobId: job.id, runId: job.runId, chromeIdle: true, verifiedDownloadId });
           if (!reply?.success) throw new Error(reply?.error || '临时缓存未能清理，请重试');
@@ -402,7 +656,7 @@
           notify();
         }
         throw error;
-      } finally { removing.delete(job.id); }
+      } finally { removing.delete(job.id); if (isNative(job)) closeNativeIfIdle(); }
     })();
     removing.set(job.id, pending);
     return pending;
@@ -460,7 +714,9 @@
         if (terminal.has(job.state)) return { success: true };
         update(job, { cancelRequested: true });
         if (dispatching.has(job.id)) return { success: true };
-        try { if (job.isM3U8) {
+        try { if (isNative(job)) {
+          await cancelNative(job);
+        } else if (job.isM3U8) {
           if (!(await getContexts()).length) update(job, { state: 'interrupted', error: '后台任务已停止' });
           else { const reply = await offscreen('cancelJob', { jobId: job.id }); if (!reply?.success) throw new Error(reply?.error || '取消请求未送达'); }
         } else if (Number.isInteger(job.downloadId)) {
@@ -491,7 +747,10 @@
     void ready.then(async () => {
       const job = [...jobs.values()].find(entry => entry.downloadId === delta.id);
       if (!job || terminal.has(job.state)) return;
-      try { applyChrome(job, await chromeItem(delta.id)); } catch (error) { console.warn('Neko download state:', error); }
+      try {
+        applyChrome(job, await chromeItem(delta.id));
+        if (isNative(job)) await commitNativeRecord(job);
+      } catch (error) { console.warn('Neko download state:', error); }
     }).catch(error => console.warn('Neko download state:', error));
   });
 })();

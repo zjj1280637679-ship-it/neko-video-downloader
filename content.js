@@ -3,7 +3,7 @@
 (function installScanner() {
   // This global belongs to Chrome's isolated extension world, not the page.
   // Install synchronously so simultaneous static/manual injections share it.
-  const singletonKey = "__yangmoContentScanner", owner = "yangmo-content", version = 1;
+  const singletonKey = "__yangmoContentScanner", owner = "yangmo-content", version = 2;
   const previous = globalThis[singletonKey];
   if (previous?.owner === owner && previous.document === document && previous.version === version && typeof previous.forceRescan === "function") {
     return previous.forceRescan().then(result => {
@@ -222,10 +222,12 @@
     for (const cancel of [...pendingReports]) cancel();
     for (const video of videoHooks.keys()) unhookVideo(video);
     window.removeEventListener("pagehide", pageHide); window.removeEventListener("pageshow", pageShow);
+    window.removeEventListener("popstate", scheduleScan); window.removeEventListener("yt-navigate-finish", scheduleScan);
     memo.clear();
   }
   Object.defineProperty(globalThis, singletonKey, { configurable: true, value: Object.freeze({ owner, version, document, forceRescan: () => scan(true), dispose }) });
   window.addEventListener("pagehide", pageHide); window.addEventListener("pageshow", pageShow);
+  window.addEventListener("popstate", scheduleScan); window.addEventListener("yt-navigate-finish", scheduleScan);
   observeDocument();
   return scan();
 })();
