@@ -399,7 +399,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       // A getJobs started before removal may finish later. This popup never
       // restores an ID after the worker has confirmed its deletion.
       currentJobs = Array.isArray(response.jobs) ? response.jobs.filter(job => !removedJobs.has(job.id)) : [];
-      $("jobsStatus").hidden = true; renderJobs();
+      $("jobsStatus").hidden = !response.warning; setText($("jobsStatus"), response.warning || ""); renderJobs();
     } catch (error) {
       $("jobsStatus").hidden = false; setText($("jobsStatus"), `暂时无法读取任务：${error.message}`);
     } finally {

@@ -111,6 +111,64 @@ function setup(options = {}) {
 const hlsRequest = { action: 'startDownload', url: 'https://cdn.test/list.m3u8', filename: 'movie.m3u8', title: 'Movie', isM3U8: true, tabId: 8 };
 const restoredJob = changes => ({ id: 'restored', url: 'https://cdn.test/list.m3u8', title: 'Movie', filename: 'movie.ts', subfolder: '', saveAs: false, isM3U8: true, state: 'saving', createdAt: 1, updatedAt: 1, ...changes });
 
+test('Chrome downloads reconcile independently while an HLS status read stalls or fails', async () => {
+  const blockedHls = deferred(), blockedFirst = deferred(), searched = [];
+  const jobs = [restoredJob({state: 'downloading'}), ...[1, 2].map(id =>
+    restoredJob({id: 'direct-' + id, isM3U8: false, downloadId: id, state: 'downloading'}))];
+  const h = setup({jobs, contexts: [{}],
+    offscreen: async msg => msg.action === 'getOffscreenJobs' ? blockedHls.promise : {...msg, success: true},
+    search: async id => { searched.push(id); if (id === 1) await blockedFirst.promise; return [{id, state: 'complete'}]; }
+  });
+  const reading = h.message({action: 'getJobs'}); await tick();
+  const started = [...searched];
+  blockedFirst.resolve(); blockedHls.reject(new Error('engine offline'));
+  const result = await reading;
+  assert.deepEqual(started, [1, 2]);
+  assert.equal(result.success, true);
+  assert.match(result.warning, /HLS/);
+  assert.equal(result.jobs.filter(j => j.state === 'complete').length, 2);
+  assert.equal(result.jobs.find(j => j.isM3U8).state, 'downloading');
+});
+
+test('an older direct lookup cannot undo a Chrome completion, including when the lookup fails', async () => {
+  for (const fail of [false, true]) {
+    const stale = deferred(); let n = 0;
+    const h = setup({jobs: [restoredJob({isM3U8: false, downloadId: 8, state: 'downloading'})],
+      search: async () => ++n === 1 ? stale.promise : [{id: 8, state: 'complete', bytesReceived: 100}]});
+    const reading = h.message({action: 'getJobs'}); await tick();
+    h.chrome.downloads.onChanged.emit({id: 8}); await tick();
+    if (fail) stale.reject(new Error('stale read')); else stale.resolve([{id: 8, state: 'in_progress'}]);
+    const job = (await reading).jobs[0];
+    assert.equal(job.state, 'complete'); assert.equal(job.bytesReceived, 100);
+  }
+});
+
+test('progress bursts share one waiting durable snapshot after an in-flight write', async () => {
+  const gate = deferred(); let writes = 0, bytes = 0;
+  const h = setup({jobs: [restoredJob({isM3U8: false, downloadId: 9, state: 'downloading'})],
+    search: async () => [{id: 9, state: 'in_progress', bytesReceived: ++bytes, totalBytes: 100}],
+    localSet: async () => { if (++writes === 1) await gate.promise; }});
+  h.chrome.downloads.onChanged.emit({id: 9}); await tick();
+  for (let i = 0; i < 20; i++) h.chrome.downloads.onChanged.emit({id: 9});
+  await tick(); gate.resolve(); await tick();
+  assert.equal(h.local.neko_jobs_v1[0].bytesReceived, 21);
+  assert.equal(writes, 2);
+});
+
+test('newer direct progress wins over stale reads, including absent items or rejected lookups', async () => {
+  for (const staleReply of ['old', 'missing', 'failed']) {
+    const stale = deferred(); let count = 0;
+    const h = setup({jobs: [restoredJob({isM3U8: false, downloadId: 8, state: 'downloading'})],
+      search: async () => ++count === 1 ? stale.promise : [{id: 8, state: 'in_progress', bytesReceived: 80}]});
+    const reading = h.message({action: 'getJobs'}); await tick();
+    h.chrome.downloads.onChanged.emit({id: 8}); await tick();
+    if (staleReply === 'failed') stale.reject(new Error('stale read'));
+    else stale.resolve(staleReply === 'old' ? [{id: 8, state: 'in_progress', bytesReceived: 30}] : []);
+    const job = (await reading).jobs[0];
+    assert.equal(job.state, 'downloading'); assert.equal(job.bytesReceived, 80);
+  }
+});
+
 test('content scripts and other extension pages cannot start jobs, save blobs or change settings', async () => {
   const h = setup();
   const contentSender = { id: extensionId, url: 'https://page.test/watch', tab: { id: 8 } };

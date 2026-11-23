@@ -17,7 +17,8 @@ const confirmed = (documentId = 'current', frameId = 0) => ({ frameId, documentI
   result: { success: true, documentToken: `token-${documentId}`, generation: 1, reports: 2, failedReports: 0 } });
 const event = () => ({ listeners: [], addListener(fn) { this.listeners.push(fn); }, emit(...args) { for (const fn of this.listeners) fn(...args); } });
 
-function fixture({ restore = Promise.resolve({}), execute, getTab, tab = { id: 7, url: 'https://page.test/watch' } } = {}) {
+function fixture({ restore = Promise.resolve({}), execute, getTab, clock = Date,
+  tab = { id: 7, url: 'https://page.test/watch' } } = {}) {
   const calls = [], timers = [], notifications = [];
   let currentTab = tab;
   const chrome = {
@@ -38,8 +39,8 @@ function fixture({ restore = Promise.resolve({}), execute, getTab, tab = { id: 7
       return [confirmed()];
     } }
   };
-  vm.runInContext(source, vm.createContext({ chrome, NekoMedia: require('../domain/media.js'), NekoSites: require('../domain/sites.js'), crypto: webcrypto, URL, console,
-    setTimeout(fn, ms) { const timer = { fn, ms, active: true }; timers.push(timer); return timer; },
+  vm.runInContext(source, vm.createContext({ chrome, NekoMedia: require('../domain/media.js'), NekoSites: require('../domain/sites.js'), crypto: webcrypto, URL, console, Date: clock,
+    setTimeout(fn, ms) { const timer = { fn, ms, due: clock.now() + ms, active: true }; timers.push(timer); return timer; },
     clearTimeout(timer) { if (timer) timer.active = false; }
   }));
   const h = { chrome, calls, timers, notifications,
@@ -52,6 +53,69 @@ function fixture({ restore = Promise.resolve({}), execute, getTab, tab = { id: 7
   };
   return h;
 }
+
+function emitSegment(h, index) {
+  h.chrome.webRequest.onHeadersReceived.emit({ tabId: 7, frameId: 0, statusCode: 200, documentId: 'current',
+    url: `https://cdn.test/${index}.ts`, responseHeaders: [{ name: 'Content-Type', value: 'video/mp2t' }] });
+}
+async function runTimers(h, until = Infinity) {
+  for (const timer of h.timers.filter(timer => timer.active && timer.due <= until)) {
+    timer.active = false; timer.fn();
+  }
+  await tick();
+}
+
+test('fragment bursts retain all observations and wake the popup only when visible evidence changes', async () => {
+  const h = fixture();
+  const badgeCounts = [];
+  h.chrome.action.setBadgeText = async ({ text }) => { badgeCounts.push(text); };
+  for (let index = 0; index < 500; index++) emitSegment(h, index);
+  assert.equal((await h.snapshot()).chunkCount, 500);
+  assert.equal(h.notifications.length, 1, 'one transition to observed fragments');
+  assert.deepEqual(badgeCounts, [], 'hidden fragments are not downloadable sources');
+  await h.message(report({ action: 'reportDOMVideo', url: 'https://cdn.test/23.ts' }), frame());
+  const promoted = await h.snapshot();
+  assert.equal(promoted.chunkCount, 499);
+  assert.equal(promoted.media[0].url, 'https://cdn.test/23.ts');
+  assert.deepEqual(badgeCounts, ['1']); assert.equal(h.notifications.length, 2);
+});
+
+test('repeated reads of an unchanged native page and ignored content titles leave session storage idle', async () => {
+  const tab = { id: 7, url: 'https://www.bilibili.com/video/BV13x41117TL/?p=2', title: '第二部分_哔哩哔哩_bilibili' };
+  const h = fixture({ tab });
+  let writes = 0;
+  h.chrome.storage.session.set = async () => { writes++; };
+  for (let round = 0; round < 20; round++) {
+    assert.equal((await h.refresh()).media[0].page, 2);
+    await h.message(report({ action: 'reportPageTitle', title: '播放器的旧标题' }), frame());
+    await runTimers(h);
+  }
+  assert.equal(writes, 1, 'only the initial discovery changes session data');
+});
+
+test('continuous capture reaches a checkpoint and slow storage coalesces later changes into a fresh snapshot', async () => {
+  let now = 0;
+  const clock = class extends Date { static now() { return now; } };
+  const h = fixture({ clock });
+  const blocked = deferred(), savedCounts = [];
+  h.chrome.storage.session.set = async snapshot => {
+    savedCounts.push(snapshot.neko_tabChunks[0][1]);
+    if (savedCounts.length === 1) await blocked.promise;
+  };
+  // A response every 100 ms never gives a trailing-only 150 ms debounce a gap.
+  for (let index = 0; index <= 20; index++) {
+    now = index * 100;
+    emitSegment(h, index); await h.snapshot(); await runTimers(h, now);
+  }
+  assert.equal(savedCounts.length, 1);
+  for (let index = 21; index <= 26; index++) {
+    now += 200;
+    emitSegment(h, index); await h.snapshot(); await runTimers(h);
+  }
+  blocked.resolve(); await tick(); await runTimers(h);
+  assert.deepEqual(savedCounts, [21, 27]);
+  assert.equal((await h.snapshot()).chunkCount, 27);
+});
 
 test('YouTube cold refresh uses browser page identity without media requests or injected scripts', async () => {
   const h = fixture({ tab: { id: 7, url: 'https://www.youtube.com/watch?v=BaW_jenozKc&list=ignored', title: '中文视频 - YouTube' },

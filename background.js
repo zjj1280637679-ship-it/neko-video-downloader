@@ -21,8 +21,10 @@ let nativeTitleState = new Map();
 const nativeTitleRevisions = new Map();
 const MAX_MEDIA = 60;
 const mediaRefreshes = new Map();
-let saveTimer;
-let saveChain = Promise.resolve();
+const SAVE_QUIET_MS = 150;
+const SAVE_MAX_WAIT_MS = 2000;
+let saveTimer, saveDeadline;
+let saving = false, saveDirty = false;
 
 // Mutations wait for hydration so a cold worker cannot overwrite new captures.
 const restorePromise = chrome.storage.session.get(Object.values(SESSION_KEYS)).then(async data => {
@@ -54,9 +56,21 @@ function enqueue(action) {
   return result;
 }
 function scheduleSave() {
+  saveDirty = true;
+  if (saving) return;
+  const now = Date.now();
+  if (saveTimer === undefined) saveDeadline = now + SAVE_MAX_WAIT_MS;
+  // Keep the quiet-period debounce, but let a busy tab checkpoint too.
+  else if (now >= saveDeadline) return;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    const snapshot = {
+  saveTimer = setTimeout(flushSave, Math.min(SAVE_QUIET_MS, saveDeadline - now));
+}
+async function flushSave() {
+  saveTimer = undefined;
+  saveDirty = false;
+  saving = true;
+  try {
+    await chrome.storage.session.set({
       [SESSION_KEYS.media]: [...tabMediaMap],
       [SESSION_KEYS.titles]: [...tabTitleMap],
       [SESSION_KEYS.nativeTitles]: [...nativeTitleState],
@@ -65,10 +79,14 @@ function scheduleSave() {
       [SESSION_KEYS.retired]: [...retiredDocuments].map(([key, values]) => [key, [...values]]),
       [SESSION_KEYS.networkRetired]: [...retiredNetworkDocuments].map(([key, values]) => [key, [...values]]),
       [SESSION_KEYS.fragments]: [...fragmentMediaMap].map(([key, values]) => [key, [...values]])
-    };
-    saveChain = saveChain.then(() => chrome.storage.session.set(snapshot))
-      .catch(error => console.warn("Neko session save:", error.message));
-  }, 150);
+    });
+  } catch (error) {
+    console.warn("Neko session save:", error.message);
+  } finally {
+    saving = false;
+    // Mutations that arrived during storage I/O need only the latest snapshot.
+    if (saveDirty) scheduleSave();
+  }
 }
 function notify(message) { chrome.runtime.sendMessage(message).catch(() => {}); }
 function validTab(tabId) { return Number.isInteger(tabId) && tabId >= 0; }
@@ -335,7 +353,8 @@ function syncNativePage(tabId, tab, options = {}) {
       // Wait for a title event, or a genuinely changed later sample.
       title = sampledTitle; pending = false; staleTitle = '';
     }
-    nativeTitleState.set(tabId, { url: identity.url, pending, staleTitle });
+    const titleStateChanged = !sameIdentity || remembered.pending !== pending || remembered.staleTitle !== staleTitle;
+    if (titleStateChanged) nativeTitleState.set(tabId, { url: identity.url, pending, staleTitle });
     const candidate = { id: existing?.id || `${tabId}_${identity.site}_${identity.videoId}_${identity.page || 1}`,
       ...identity, kind: identity.site, isM3U8: false, isFragment: false,
       ext: 'mp4', mime: '', title, baseName: mediaRules.sanitizeFilename(title),
@@ -343,7 +362,10 @@ function syncNativePage(tabId, tab, options = {}) {
       active: true, source: `${identity.site}-page`, evidence: ['browser-tab'],
       tabId, frameId: 0, pageUrl: identity.url,
       timestamp: existing?.timestamp || Date.now(), contexts: [{ frameId: 0, documentId: '' }] };
-    if (previous.length === 1 && JSON.stringify(existing) === JSON.stringify(candidate)) { scheduleSave(); return; }
+    if (previous.length === 1 && JSON.stringify(existing) === JSON.stringify(candidate)) {
+      if (titleStateChanged) scheduleSave();
+      return;
+    }
     // Browser page identity replaces signed/ranged URLs and ad/preload tracks.
     tabMediaMap.set(tabId, [candidate]);
     fragmentMediaMap.delete(tabId); tabChunkCountMap.set(tabId, 0);
@@ -422,6 +444,8 @@ function addMediaItem(tabId, item) {
   };
   if (existing && JSON.stringify(existing) === JSON.stringify(media)) return;
   const index = list.indexOf(existing);
+  const previousMediaCount = list.length;
+  const hadFragments = fragments.size > 0;
   if (index >= 0) list.splice(index, 1);
   fragments.delete(url);
   if (classification.isFragment) {
@@ -436,7 +460,11 @@ function addMediaItem(tabId, item) {
     if (list.length > MAX_MEDIA) list.length = MAX_MEDIA;
   }
   tabChunkCountMap.set(tabId, fragments.size);
-  updateBadge(tabId); scheduleSave(); notify({ action: 'mediaListUpdated', tabId });
+  scheduleSave();
+  if (list.length !== previousMediaCount) updateBadge(tabId);
+  // The popup shows whether fragments exist. Keep counting all of them, but
+  // only wake the UI for new visible evidence or a change to a media card.
+  if (!classification.isFragment || index >= 0 || !hadFragments) notify({ action: 'mediaListUpdated', tabId });
 }
 chrome.webRequest.onBeforeRequest.addListener(details => {
   if (!validTab(details.tabId)) return;
@@ -514,8 +542,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "reportPageTitle" && validTab(tabId)) {
       // Site SPA messages may still carry the previous video/part title. Its
       // candidate title comes exclusively from current browser tab metadata.
-      if (!sender.frameId && message.title && !(tabMediaMap.get(tabId) || []).some(item => siteRules.isNativeJob(item))) tabTitleMap.set(tabId, String(message.title).slice(0, 300));
-      scheduleSave(); return { status: "ok" };
+      if (!sender.frameId && message.title && !(tabMediaMap.get(tabId) || []).some(item => siteRules.isNativeJob(item))) {
+        const title = String(message.title).slice(0, 300);
+        if (tabTitleMap.get(tabId) !== title) { tabTitleMap.set(tabId, title); scheduleSave(); }
+      }
+      return { status: "ok" };
     }
     if (message.action === "getMedia") {
       return mediaSnapshot(tabId);
@@ -534,7 +565,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (url) syncNativePage(tabId, { url, title: changeInfo.title || '' }, {
       titleChanged: typeof changeInfo.title === 'string', navigation: Boolean(changeInfo.url), navigationTitle: tab?.title
     });
-    if (changeInfo.title && !siteRules.parse(url)) { tabTitleMap.set(tabId, changeInfo.title); scheduleSave(); }
+    if (changeInfo.title && !siteRules.parse(url) && tabTitleMap.get(tabId) !== changeInfo.title) {
+      tabTitleMap.set(tabId, changeInfo.title); scheduleSave();
+    }
   });
 });
 chrome.tabs.onRemoved.addListener(tabId => {

@@ -83,6 +83,24 @@ class NativeTests(unittest.TestCase):
                 self.assertTrue(progress.control()['cancelled'])
                 self.assertEqual(read.call_count, 3)
 
+    def test_progress_burst_shares_control_checks_and_detects_cancellation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory) / 'control.json'
+            pref = {'concurrency': 8, 'concurrencyRevision': 2}
+            atomic_json(control, pref)
+            progress = Progress(control)
+            event = {'status': 'downloading', 'filename': 'one-track'}
+            with patch('worker.time.monotonic', return_value=1) as clock, patch('builtins.print'):
+                with patch.object(Path, 'stat', autospec=True, side_effect=Path.stat) as stat:
+                    for index in range(1000):
+                        progress.download_hook({**event, 'downloaded_bytes': index})
+                    self.assertEqual(stat.call_count, 1)
+                self.assertEqual(progress.current['bytesReceived'], 999)
+                atomic_json(control, {**pref, 'cancelled': True})
+                clock.return_value = 1.051
+                with self.assertRaises(Cancelled):
+                    progress.download_hook(event)
+
     def test_cookies_domain_and_non_persistence(self):
         cookie = {'name': 'SESSION_TEST', 'value': 'SECRET_NOT_FOR_DISK', 'domain': '.youtube.com', 'path': '/', 'secure': True}
         self.assertEqual(len(youtube_cookies([cookie])), 1)
@@ -245,6 +263,32 @@ class NativeTests(unittest.TestCase):
             return index
         with self.assertRaisesRegex(ValueError, 'bad fragment'):
             list(ordered_dynamic_map(work, range(8), lambda: {'concurrency': 3}))
+
+    def test_ordered_writer_can_overlap_next_request_with_bounded_lookahead(self):
+        second_finished = threading.Event()
+        started = []
+        observed = []
+
+        def work(index):
+            started.append(index)
+            if index == 1:
+                second_finished.set()
+            return index
+
+        def observe(active, submitted, consumed, _):
+            observed.append((active, submitted - consumed))
+
+        stream = ordered_dynamic_map(work, range(5), lambda: {'concurrency': 1}, observe, max_ahead=2)
+        try:
+            self.assertEqual(next(stream), 0)
+            # Leave the first result with the writer. Exactly one more fetch fits.
+            self.assertTrue(second_finished.wait(2))
+            self.assertEqual(started, [0, 1])
+            self.assertEqual(list(stream), [1, 2, 3, 4])
+            self.assertTrue(all(active <= 1 and ahead <= 2 for active, ahead in observed))
+            self.assertEqual(observed[-1], (0, 0))
+        finally:
+            stream.close()
 
     def test_windows_process_tree_cancel(self):
         if os.name != 'nt': self.skipTest('Windows process ownership check')

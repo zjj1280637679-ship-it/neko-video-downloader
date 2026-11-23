@@ -36,11 +36,8 @@ def ordered_dynamic_map(operation, items, control, observe=None, max_ahead=512):
                     index = futures.pop(future)
                     # Raise failed fragments before issuing more work. Never skip.
                     ready[index] = future.result()
-            while consumed in ready:
-                yield ready.pop(consumed)
-                consumed += 1
-            if observe:
-                observe(len(futures), submitted, consumed, state)
+            # Fill free network slots before the caller decrypts/writes the next
+            # ordered result. That result still counts toward the lookahead cap.
             while not exhausted and len(futures) < target and submitted - consumed < max_ahead:
                 try:
                     item = next(iterator)
@@ -51,6 +48,17 @@ def ordered_dynamic_map(operation, items, control, observe=None, max_ahead=512):
                 submitted += 1
             if observe:
                 observe(len(futures), submitted, consumed, state)
+            if consumed in ready:
+                while consumed in ready:
+                    yield ready.pop(consumed)
+                    consumed += 1
+                    if not exhausted and not futures:
+                        # A full lookahead window prevented any new admission.
+                        # The acknowledged write just freed a slot.
+                        break
+                if observe:
+                    observe(len(futures), submitted, consumed, state)
+                continue  # Re-read control after returning from the consumer.
             if futures:
                 concurrent.futures.wait(futures, timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED)
             elif not exhausted and not ready:

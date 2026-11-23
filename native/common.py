@@ -8,7 +8,7 @@ import unicodedata
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = '2.4.1'
+VERSION = '2.4.3'
 YTDLP_VERSION = '2026.10.26'
 MAX_CONCURRENCY = 375
 IDENTIFIER = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
@@ -183,6 +183,10 @@ def readable_error(error, site='youtube'):
     text = str(error).lower()
     label = 'B站' if site == 'bilibili' else 'YouTube'
     if site == 'bilibili':
+        if re.search(r'\bhttp(?: error)?\s+567\b', text):
+            return 'B站媒体服务器拒绝了音视频传输（HTTP 567）。请稍后重新下载。'
+        if 'bilibili incomplete http track' in text:
+            return 'B站媒体服务器返回的音轨或画面轨不完整，已停止保存。请重新下载。'
         if 'preview' in text or 'supporter-only' in text or 'premium members' in text:
             return 'B站仅提供试看或受限内容，未将其保存为完整视频；请确认账号有观看权限后授权重试。'
         if any(marker in text for marker in ('412', '-352', '-401', 'riskdata', 'rate limit', 'session required')):

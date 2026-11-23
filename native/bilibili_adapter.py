@@ -6,8 +6,11 @@ guards run before YoutubeDL can expand a playlist/redirect or download media.
 from __future__ import annotations
 
 import math
+import re
+from pathlib import Path
 
 from yt_dlp.extractor.bilibili import BiliBiliIE
+from yt_dlp.utils.networking import HTTPHeaderDict
 from common import site_video
 
 
@@ -15,6 +18,48 @@ def extraction_url(identity):
     # One observed official locale route, not an alternating retry/evade loop.
     # Persisted identity remains the locale-independent canonical video URL.
     return f'https://www.bilibili.com/zh-Hans/video/{identity["videoId"]}/?p={identity["page"]}'
+
+
+def with_bilibili_tracks(base):
+    """Keep whole-track byte ranges out of the fragment scheduler."""
+    class BilibiliDownloader(base):
+        _track_url = None
+
+        def dl(self, name, info, subtitle=False, test=False):
+            if test or subtitle or not info.get('yangmo_bilibili_track'):
+                return super().dl(name, info, subtitle=subtitle, test=test)
+            headers = HTTPHeaderDict(info['http_headers'] if info.get('http_headers') is not None else self._calc_headers(info))
+            if 'Range' in headers and headers['Range'] != 'bytes=0-':
+                return super().dl(name, info, subtitle=subtitle, test=test)
+            headers['Range'] = 'bytes=0-'
+            self._track_url = info['url']
+            self._track_size = info.get('filesize')
+            try:
+                result = super().dl(name, {**info, 'http_headers': headers}, subtitle=subtitle, test=test)
+                if result[0] and self._track_size and Path(name).stat().st_size != self._track_size:
+                    raise ValueError('Bilibili incomplete HTTP track')
+                return result
+            finally:
+                self._track_url = None
+
+        def urlopen(self, request):
+            response = super().urlopen(request)
+            if self._track_url and getattr(request, 'url', None) == self._track_url and response.status == 206:
+                requested = re.fullmatch(r'bytes=(\d+)-', request.headers.get('Range', ''), re.I)
+                received = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', response.headers.get('Content-Range', ''), re.I)
+                if requested and received:
+                    start, end, total = map(int, received.groups())
+                    length = response.headers.get('Content-Length')
+                    if (start == int(requested[1]) and start <= end == total - 1
+                            and (length is None or length == str(total - start))
+                            and (not self._track_size or self._track_size == total)):
+                        self._track_size = total
+                        return response
+                response.close()
+                raise ValueError('Bilibili incomplete HTTP track')
+            return response
+
+    return BilibiliDownloader
 
 
 class CurrentBilibiliIE(BiliBiliIE):
@@ -85,6 +130,10 @@ class CurrentBilibiliIE(BiliBiliIE):
                 raise ValueError('Bilibili preview or incomplete duration')
         formats = super().extract_formats(play_info)
         dash = play_info.get('dash')
+        if isinstance(dash, dict):
+            for fmt in formats:
+                if not fmt.get('fragments') and str(fmt.get('url', '')).startswith(('https://', 'http://')):
+                    fmt['yangmo_bilibili_track'] = True
         # Only the source's explicit empty audio list permits a genuinely silent
         # output. Missing/ambiguous codec metadata still requires an audio track.
         if isinstance(dash, dict) and 'audio' in dash and dash['audio'] in (None, []):

@@ -14,7 +14,7 @@ from unittest.mock import patch
 from yt_dlp import YoutubeDL
 from yt_dlp.extractor.bilibili import BiliBiliIE
 
-from bilibili_adapter import CurrentBilibiliIE, extraction_url
+from bilibili_adapter import CurrentBilibiliIE, extraction_url, with_bilibili_tracks
 from common import atomic_json, auth_required, job_video, readable_error, site_cookies, site_video
 from test_native import QuietHost
 from worker import Progress, QuietLogger, make_downloader, verify_media
@@ -111,6 +111,7 @@ class BilibiliTests(unittest.TestCase):
         self.assertTrue(extractor.source['expected_audio'])
         for fmt in info['requested_formats']:
             self.assertEqual(fmt['protocol'], 'https')
+            self.assertTrue(fmt['yangmo_bilibili_track'])
             self.assertNotIn('fragments', fmt)
         _, av_info = extract_fixture(url='https://www.bilibili.com/video/av498159642/?p=2')
         self.assertEqual(av_info['id'], info['id'])
@@ -171,14 +172,30 @@ class BilibiliTests(unittest.TestCase):
             self.assertIn('B站', readable_error(text, 'bilibili'))
             self.assertNotIn('YouTube', readable_error(text, 'bilibili'))
         self.assertFalse(auth_required('HTTP Error 403', 'bilibili'))
+        self.assertIn('HTTP 567', readable_error('HTTP Error 567: Unknown Status', 'bilibili'))
+        self.assertFalse(auth_required('HTTP Error 567', 'bilibili'))
         self.assertFalse(auth_required('HTTP Error 412', 'youtube'))
 
     def test_direct_http_tracks_never_become_fragments(self):
+        seen = []
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args): pass
             def do_GET(self):
                 body = self.path.encode() * 32
-                self.send_response(200)
+                seen.append((self.path, self.headers.get('Range')))
+                if self.path == '/ordinary':
+                    self.send_response(200)
+                elif self.headers.get('Range') != 'bytes=0-':
+                    self.send_error(567)
+                    return
+                else:
+                    self.send_response(206)
+                    if self.path == '/truncated':
+                        self.send_header('Content-Range', f'bytes 0-{len(body)-1}/{len(body)+42}')
+                    elif self.path == '/wrong-start':
+                        self.send_header('Content-Range', f'bytes 2-{len(body)+1}/{len(body)+2}')
+                    else:
+                        self.send_header('Content-Range', f'bytes 0-{len(body)-1}/{len(body)}')
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -190,16 +207,24 @@ class BilibiliTests(unittest.TestCase):
                 atomic_json(control, {'concurrency': 375, 'concurrencyRevision': 1})
                 progress = Progress(control)
                 progress.emit = lambda **kw: progress.current.update({k: v for k, v in kw.items() if k != 'force'})
-                with make_downloader(progress)({'quiet': True, 'noprogress': True, 'progress_hooks': [progress.download_hook]}) as ydl:
-                    for track in ('video', 'audio'):
+                with with_bilibili_tracks(make_downloader(progress))({'quiet': True, 'noprogress': True, 'progress_hooks': [progress.download_hook]}) as ydl:
+                    for track in ('video', 'audio', 'ordinary', 'truncated', 'wrong-start'):
                         path = Path(directory) / f'{track}.mp4'
-                        ok, _ = ydl.dl(str(path), {'url': f'http://127.0.0.1:{server.server_port}/{track}',
-                                                'ext': 'mp4', 'protocol': 'http', 'http_headers': {}})
+                        item = {'url': f'http://127.0.0.1:{server.server_port}/{track}', 'ext': 'mp4',
+                                'protocol': 'http', 'http_headers': {}, 'yangmo_bilibili_track': track != 'ordinary'}
+                        if track in ('truncated', 'wrong-start'):
+                            with self.assertRaisesRegex(ValueError, 'incomplete HTTP track'):
+                                ydl.dl(str(path), item)
+                            self.assertFalse(path.exists())
+                            continue
+                        ok, _ = ydl.dl(str(path), item)
                         self.assertTrue(ok)
                         self.assertEqual(path.read_bytes(), f'/{track}'.encode() * 32)
                 self.assertFalse(progress.current['segmented'])
                 self.assertEqual(progress.current['targetConcurrency'], 0)
                 self.assertEqual(progress.current['totalSegments'], 0)
+                self.assertEqual(seen, [(f'/{track}', None if track == 'ordinary' else 'bytes=0-')
+                                        for track in ('video', 'audio', 'ordinary', 'truncated', 'wrong-start')])
         finally:
             server.shutdown()
             server.server_close()

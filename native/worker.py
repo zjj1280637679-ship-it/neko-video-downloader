@@ -21,6 +21,7 @@ from common import YTDLP_VERSION, auth_required, job_video, policy, readable_err
 from scheduler import Cancelled, ordered_dynamic_map
 
 MAX_FRAGMENT_BYTES = 128 * 1024 * 1024
+PROGRESS_CONTROL_INTERVAL = 0.05
 
 
 class Progress:
@@ -36,9 +37,14 @@ class Progress:
                         'targetConcurrency': 0, 'inFlightRequests': 0}
         self.last_control = {'concurrency': 64, 'concurrencyRevision': 0}
         self.control_stamp = None
+        self.checked_control_at = -math.inf
 
-    def control(self):
+    def control(self, *, max_age=0):
         with self.lock:
+            now = time.monotonic()
+            if max_age and now - self.checked_control_at < max_age:
+                return dict(self.last_control)
+            self.checked_control_at = now
             try:
                 metadata = self.control_path.stat()
                 stamp = (metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
@@ -60,7 +66,7 @@ class Progress:
             if not force and now - self.last_emit < 0.25:
                 return
             self.last_emit = now
-            snapshot = {**self.current, **self.control()}
+            snapshot = {**self.current, **self.control(max_age=PROGRESS_CONTROL_INTERVAL)}
             snapshot.pop('cancelled', None)
             if snapshot['state'] != 'downloading':
                 snapshot['etaSeconds'] = None
@@ -68,7 +74,7 @@ class Progress:
             print(json.dumps({'event': 'progress', 'job': snapshot}, ensure_ascii=False), flush=True)
 
     def download_hook(self, event):
-        if self.control().get('cancelled'):
+        if self.control(max_age=PROGRESS_CONTROL_INTERVAL).get('cancelled'):
             raise Cancelled()
         status = event.get('status')
         if status not in ('downloading', 'finished'):
@@ -118,7 +124,7 @@ def make_downloader(progress):
             def enforce_fragment_limit(event):
                 if max(event.get('downloaded_bytes') or 0, event.get('total_bytes') or 0) > MAX_FRAGMENT_BYTES:
                     raise DownloadError('Fragment exceeds byte limit')
-                if progress.control().get('cancelled'):
+                if progress.control(max_age=PROGRESS_CONTROL_INTERVAL).get('cancelled'):
                     raise Cancelled()
             ctx['dl'].add_progress_hook(enforce_fragment_limit)
 
@@ -311,14 +317,16 @@ def run(config, request, control_path, cookies=None):
     if isinstance(config.get('extractor_args'), dict):
         params['extractor_args'] = config['extractor_args']
     bili_extractor = None
+    downloader = make_downloader(progress)
     if site == 'bilibili':
-        from bilibili_adapter import CurrentBilibiliIE, extraction_url
+        from bilibili_adapter import CurrentBilibiliIE, extraction_url, with_bilibili_tracks
         bili_extractor = CurrentBilibiliIE(identity)
+        downloader = with_bilibili_tracks(downloader)
         url = extraction_url(identity)
         # Explicitly silent source formats need the video-only fallback. Output
         # audio remains mandatory unless raw source metadata proves it is absent.
         params['format'] += '/bv'
-    with make_downloader(progress)(params) as ydl:
+    with downloader(params) as ydl:
         if bili_extractor:
             ydl.add_info_extractor(bili_extractor)
         if cookies:
