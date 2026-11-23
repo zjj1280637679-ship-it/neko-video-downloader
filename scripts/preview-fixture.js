@@ -51,6 +51,11 @@
       let response = { success: true };
       switch (message.action) {
         case 'getMedia': case 'refreshMedia': response = { media, capturePhase: media.length ? 'found' : 'waiting', playback: { hasVideo: true, observed: media.length > 0 } }; break;
+        case 'probeSource':
+          response = message.url === platformMedia[0].url && nativePreview
+            ? { success: true, state: 'ready', checkedAt: Date.now(), ttlMs: 60000, qualityLabel: '1080p' }
+            : { success: true, state: 'unknown' };
+          break;
         case 'getJobs': response.jobs = jobs; break;
         case 'getSettings': response.settings = settings; break;
         case 'saveSettings': {

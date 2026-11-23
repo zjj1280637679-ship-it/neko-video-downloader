@@ -3,6 +3,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   const $ = id => document.getElementById(id);
   const cards = new Map(), jobCards = new Map(), removedJobs = new Set();
   const activeStates = new Set(["queued", "parsing", "downloading", "muxing", "saving"]);
+  const sourceLabels = { detected: "已发现来源 · 下载时检查可用性", checking: "已发现来源 · 正在验证能否下载…",
+    ready: "已就绪 · 当前分 P 可以下载", unavailable: "当前分 P 未就绪", unknown: "暂时无法验证", expired: "上次验证已过期",
+    recheck: "再次下载前需要重新验证" };
   const { formatSize, safeFilename, mediaUrl, formatRemaining } = NekoFormat;
   const { stateLabels, concurrencyReason, jobConcurrency, jobExplanation } = NekoExplain;
   let currentTab = null, currentMedia = [], currentJobs = [];
@@ -31,13 +34,17 @@ document.addEventListener("DOMContentLoaded", async () => {
     clearTimeout(toastTimer); setText($("toast"), message); $("toast").classList.add("show");
     toastTimer = setTimeout(() => $("toast").classList.remove("show"), 3500);
   }
-  function setStatus(message, state = "ready") { setText($("statusText"), message); $("statusBar").dataset.state = state; }
+  function setStatus(message, state) { setText($("statusText"), message); $("statusBar").dataset.state = state; }
   function sendMessage(message) {
     return new Promise((resolve, reject) => chrome.runtime.sendMessage(message, response => {
       const error = chrome.runtime.lastError;
       if (error) reject(new Error(error.message));
       else if (!response) reject(new Error("扩展后台未响应"));
-      else if (response.success === false) reject(new Error(response.error || "操作未完成，请重试"));
+      else if (response.success === false) {
+        const failure = new Error(response.error || "操作未完成，请重试");
+        failure.readinessExpired = response.readinessExpired === true;
+        reject(failure);
+      }
       else resolve(response);
     }));
   }
@@ -51,13 +58,14 @@ document.addEventListener("DOMContentLoaded", async () => {
       $(`${pane}Tab`).tabIndex = selected ? 0 : -1;
     }
     syncArtMotion();
+    if (name === "source") syncSourceJobs();
     if (focus) $(`${name}Tab`).focus();
   }
   function syncArtMotion() {
     $("appContent").dataset.artPaused = String(document.hidden || $("sourcePanel").hidden);
     $("appContent").dataset.jobArtPaused = String(document.hidden || $("jobsPanel").hidden);
   }
-  document.addEventListener("visibilitychange", syncArtMotion);
+  document.addEventListener("visibilitychange", () => { syncArtMotion(); syncSourceJobs(); });
   syncArtMotion();
   for (const name of ["source", "jobs"]) {
     $(`${name}Tab`).addEventListener("click", () => showPane(name));
@@ -101,7 +109,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
   function captureFeedback() { return NekoCapture.captureFeedback(capture, currentMedia.length, checkingStartedAt); }
   function renderCapture() {
-    const feedback = captureFeedback(); setStatus(feedback.status, feedback.state); renderMedia(feedback);
+    const feedback = captureFeedback();
+    if (feedback.state !== "found") setStatus(feedback.status, feedback.state);
+    renderMedia(feedback);
   }
 
   async function startDownload(item, button, options = {}) {
@@ -112,17 +122,24 @@ document.addEventListener("DOMContentLoaded", async () => {
     button.disabled = true;
     try {
       await savePreferences();
+      if (options.checkSource && !options.checkSource()) throw new Error("来源或验证状态已变化，请重新确认。");
       const filename = String(item.suggestedFilename || item.filename || "视频").split(/[\\/]/).pop();
       const title = item.title || filename.replace(/\.(m3u8|mp4|ts|webm|mov|mkv|m4a|mp3)$/i, "");
       const response = await sendMessage({ action: "startDownload", url: item.url, title, filename: safeFilename(filename),
         ...(site ? { engine: site.engine, site: site.id, ...(identity.page ? { page: identity.page } : {}) } : {}),
         ...(site && options.useSiteSession === true ? { useSiteSession: true } : {}),
-        isM3U8: !site && Boolean(item.isM3U8 || /\.m3u8(?:[?#]|$)/i.test(item.url) || item.totalSegments > 0), tabId: item.tabId ?? currentTab?.id });
+        ...(options.requireReady === true ? { requireReady: true } : {}),
+        ...(options.requireCurrentSource === true ? { requireCurrentSource: true } : {}),
+        isM3U8: !site && Boolean(item.isM3U8 || /\.m3u8(?:[?#]|$)/i.test(item.url) || item.totalSegments > 0), tabId: options.sourceTabId ?? item.tabId ?? currentTab?.id });
       if (response.job) currentJobs = [response.job, ...currentJobs.filter(job => job.id !== response.job.id)];
       renderJobs(); showPane("jobs");
       showToast("任务已开始，关闭弹窗也会继续下载");
       await loadJobs();
-    } catch (error) { showToast(`下载未开始：${error.message}`); }
+    } catch (error) {
+      const entry = cards.get(item.url);
+      if (error.readinessExpired && entry?.download === button) entry.probe = { state: "expired" };
+      showToast(`下载未开始：${error.message}`);
+    }
     finally { button.disabled = false; syncSourceJobs(); }
   }
   async function copyUrl(url) {
@@ -135,29 +152,112 @@ document.addEventListener("DOMContentLoaded", async () => {
     identity.append(badge, number); header.append(identity, size);
     const title = node("h2", "file-name"), host = node("div", "source-host");
     const actions = node("div", "card-actions"), download = node("button", "btn btn-primary"), copy = node("button", "btn btn-secondary", "复制链接"), state = node("div", "card-state");
-    actions.append(download, copy); card.append(header, title, host, actions, state);
-    const entry = { card, badge, number, size, title, host, download, state, item };
-    download.addEventListener("click", () => startDownload(entry.item, download));
+    const retry = node("button", "btn btn-secondary source-retry", "重新验证");
+    const session = node("button", "btn btn-primary source-session", "使用 B站登录状态下载");
+    state.setAttribute("role", "status");
+    actions.append(download);
+    if (NekoSites.forJob(item)?.id === "bilibili") actions.append(session, retry);
+    actions.append(copy); card.append(header, title, host, state, actions);
+    const entry = { card, badge, number, size, title, host, download, retry, session, state, item, probe: null, starting: false };
+    download.addEventListener("click", () => startSource(entry, false));
+    session.addEventListener("click", () => startSource(entry, true));
+    retry.addEventListener("click", () => {
+      if (retry.disabled || retry.hidden || !currentSource(entry)) return;
+      probeSource(entry, true); syncSourceJobs();
+    });
     copy.addEventListener("click", () => copyUrl(entry.item.url));
     return entry;
   }
+  function currentSource(entry) { return !closing && cards.get(entry.item.url) === entry; }
+  function freshProbe(entry) { return entry.probe?.state === "ready" && Date.now() < entry.probe.expires; }
+  async function probeSource(entry, force = false) {
+    if (!currentSource(entry) || entry.probe?.state === "checking") return;
+    clearTimeout(entry.expiryTimer);
+    const checking = { state: "checking" };
+    entry.probe = checking;
+    try {
+      const result = await sendMessage({ action: "probeSource", tabId: currentTab.id, url: entry.item.url, ...(force ? { force: true } : {}) });
+      if (!currentSource(entry) || entry.probe !== checking) return;
+      const state = ["ready", "unavailable", "unknown"].includes(result.state) ? result.state : "unknown";
+      const now = Date.now();
+      const checkedAt = Math.min(Number.isFinite(result.checkedAt) ? result.checkedAt : now, now);
+      const expires = checkedAt + (Number.isFinite(result.ttlMs) ? Math.max(0, Math.min(result.ttlMs, 300000)) : 60000);
+      entry.probe = { state, checkedAt, expires, reason: typeof result.reason === "string" ? result.reason : "",
+        quality: typeof result.qualityLabel === "string" ? result.qualityLabel : "", authRequired: state === "unavailable" && result.authRequired === true };
+      if (freshProbe(entry)) entry.expiryTimer = setTimeout(syncSourceJobs, expires - now);
+    } catch (error) {
+      if (!currentSource(entry) || entry.probe !== checking) return;
+      entry.probe = { state: "unknown", reason: error.message };
+    }
+    syncSourceJobs();
+  }
+  async function startSource(entry, useSiteSession) {
+    const button = useSiteSession ? entry.session : entry.download;
+    if (entry.starting || button.disabled || button.hidden || !currentSource(entry)) return;
+    const bili = NekoSites.forJob(entry.item)?.id === "bilibili";
+    const checkSource = () => currentSource(entry) && !currentJobs.some(job => job.url === entry.item.url && activeStates.has(job.state)) &&
+      (useSiteSession ? bili && entry.probe?.authRequired === true : !bili || freshProbe(entry));
+    if (!checkSource()) { syncSourceJobs(); return; }
+    entry.starting = true; syncSourceJobs();
+    try {
+      if (useSiteSession) {
+        // Request only from this explicit click, and recheck the exact source after the prompt.
+        if (!await chrome.permissions.request({ permissions: ["cookies"] })) return showToast("未授权使用 B站登录状态，下载未开始。");
+        if (!checkSource()) return showToast("来源已变化，请重新确认。");
+      }
+      await startDownload(entry.item, button, { useSiteSession, checkSource, sourceTabId: currentTab.id,
+        requireReady: bili && !useSiteSession, requireCurrentSource: bili && useSiteSession });
+    } catch (error) { showToast(error.message); }
+    finally { entry.starting = false; syncSourceJobs(); }
+  }
   function syncSourceJobs() {
     if (!cards.size) return;
-    const activeByUrl = new Map();
+    const activeByUrl = new Map(), failedAtByUrl = new Map();
     for (const job of currentJobs) {
       if (activeStates.has(job.state) && !activeByUrl.has(job.url)) activeByUrl.set(job.url, job);
+      if (job.state === "interrupted" && Number.isFinite(job.updatedAt) && NekoSites.forJob(job)?.id === "bilibili") {
+        failedAtByUrl.set(job.url, Math.max(failedAtByUrl.get(job.url) || 0, job.updatedAt));
+      }
     }
+    let biliCount = 0, readyCount = 0;
     for (const entry of cards.values()) {
       const job = activeByUrl.get(entry.item.url);
-      if (entry.download.disabled !== Boolean(job)) entry.download.disabled = Boolean(job);
+      const bili = NekoSites.forJob(entry.item)?.id === "bilibili";
+      // A transfer consumes the check for this part. A failure can also arrive
+      // in a single jobs snapshot with no active state observed by this popup.
+      if (bili && job && entry.probe?.state !== "recheck") {
+        clearTimeout(entry.expiryTimer); entry.probe = { state: "recheck" };
+      } else if (entry.probe?.state === "ready" && failedAtByUrl.get(entry.item.url) > entry.probe.checkedAt) {
+        clearTimeout(entry.expiryTimer); entry.probe = { state: "recheck", reason: "上次下载未完成" };
+      }
+      if (bili && !job && !entry.probe && !document.hidden && !$("sourcePanel").hidden) void probeSource(entry);
+      if (entry.probe?.state === "ready" && !freshProbe(entry)) entry.probe = { state: "expired" };
+      const state = bili ? entry.probe?.state || "detected" : "detected";
+      if (bili) biliCount++;
+      if (bili && freshProbe(entry)) readyCount++;
+      const retryable = bili && !job && ["unknown", "unavailable", "expired", "recheck"].includes(state);
+      entry.card.dataset.readiness = state;
+      entry.download.disabled = Boolean(job || entry.starting || (bili && !freshProbe(entry)));
+      entry.download.hidden = retryable;
+      entry.retry.hidden = !retryable;
+      entry.session.hidden = !(retryable && entry.probe.authRequired);
+      entry.retry.disabled = entry.session.disabled = entry.starting;
       setText(entry.download, job ? stateLabels[job.state] : "↓ 下载视频");
-      setText(entry.state, job ? "任务已在后台运行，可切换到下载任务查看。" : "");
+      let status = sourceLabels[state];
+      if (state === "ready" && entry.probe.quality) status += " · " + entry.probe.quality;
+      if (retryable && entry.probe.reason) status += " · " + entry.probe.reason;
+      if (!entry.session.hidden) status += " 仅本次下载使用 B站登录状态。";
+      setText(entry.state, job ? "任务已在后台运行，可切换到下载任务查看。" : status);
+    }
+    if (capture.phase === "found") {
+      const summary = captureFeedback().status + (biliCount ? ` · 已验证可下载 ${readyCount} 个` : "");
+      setStatus(summary, "found");
     }
   }
   function renderMedia(feedback) {
     setText($("sourceTabCount"), currentMedia.length);
     const live = new Set(currentMedia.map(item => item.url));
-    for (const [url, entry] of cards) if (!live.has(url)) { entry.card.remove(); cards.delete(url); }
+    for (const [url, entry] of cards) if (!live.has(url)) { clearTimeout(entry.expiryTimer); entry.card.remove(); cards.delete(url); }
     if (!currentMedia.length) {
       emptyState($("mediaList"), feedback.title, feedback.description, feedback.hint, feedback.state);
       return;

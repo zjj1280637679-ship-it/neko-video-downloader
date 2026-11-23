@@ -74,7 +74,7 @@ function setup(options = {}) {
     offscreen: { async createDocument(value) { calls.create.push(value); contexts = [{ documentUrl: extensionUrl('offscreen.html') }]; } },
     permissions: { async contains(value) { calls.permissions.push(structuredClone(value)); return options.cookiePermission === true; } },
     cookies: { async getAll(value) { calls.cookieReads.push(structuredClone(value)); return options.cookies || []; } },
-    tabs: { async create(value) { calls.tabs.push(value); } },
+    tabs: { async create(value) { calls.tabs.push(value); }, async get(id) { return options.getTab?.(id); } },
     downloads: {
       onChanged: event(),
       async download(value) {
@@ -92,6 +92,7 @@ function setup(options = {}) {
   };
   const context = vm.createContext({ chrome, crypto: webcrypto, URL, console, structuredClone,
     NekoJobState: require('../engine/job-state.js'), NekoYouTube: require('../domain/youtube.js'), NekoSites: require('../domain/sites.js'),
+    NekoSourceReadiness: require('../engine/source-readiness.js'),
     ...(options.native ? { NekoNative: { createClient: () => native } } : {}) });
   vm.runInContext(source, context);
   function message(value, sender = uiSender) {
@@ -285,6 +286,23 @@ test('a transient offscreen snapshot error does not permanently discard recovery
 const youtubeRequest = { action: 'startDownload', engine: 'youtube-native', url: 'https://www.youtube.com/watch?v=BaW_jenozKc', filename: 'sample.mp4', title: 'Sample' };
 const bilibiliRequest = { action: 'startDownload', engine: 'bilibili-native', site: 'bilibili',
   url: 'https://www.bilibili.com/video/BV1xx411c7mD/?p=2', filename: 'sample-P2.mp4', title: 'Sample P2' };
+
+test('the Bilibili source card needs current-part evidence before creating a job and samples without cookies', async () => {
+  const identity = require('../domain/sites.js').parse(bilibiliRequest.url);
+  let pass = false;
+  const h = setup({ native: true, getTab: () => ({ url: identity.url }),
+    nativeRequest: action => action === 'probeBilibili' ? { ...identity, success: true, readiness: pass ? 'ready' : 'unavailable', reason: pass ? '' : '音轨无法读取' } : undefined });
+  const click = { ...bilibiliRequest, requireReady: true, tabId: 4 };
+  const check = { action: 'probeSource', url: identity.url, tabId: 4 };
+  assert.equal((await h.message(check, engineSender)).success, false);
+  assert.match((await h.message(click)).error, /音轨/);
+  assert.equal((await h.message({ action: 'getJobs' })).jobs.length, 0);
+  pass = true;
+  assert.equal((await h.message({ ...check, force: true })).state, 'ready');
+  assert.equal((await h.message(click)).job.page, 2);
+  assert.equal(h.calls.native.filter(call => call.action === 'probeBilibili').length, 2);
+  assert.deepEqual(h.calls.cookieReads, []);
+});
 const nativeArtifact = changes => ({ url: `http://127.0.0.1:39876/artifact/${'a'.repeat(43)}`, filename: 'sample.mp4', size: 100, ...changes });
 function nativeProgress(h, job, changes) {
   const previous = h.native.jobs.get(job.id) || job;

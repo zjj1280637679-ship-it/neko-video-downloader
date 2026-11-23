@@ -20,6 +20,7 @@ from common import VERSION, YTDLP_VERSION, TERMINAL, atomic_json, identifier, jo
 from process_tree import ProcessTree
 
 MAX_MESSAGE = 262144
+PROBE_TIMEOUT = 20
 ACTIVE = {'queued', 'parsing', 'downloading', 'muxing', 'saving'}
 PUBLIC = {'id', 'runId', 'url', 'title', 'filename', 'revision', 'state', 'phase', 'bytesReceived',
           'totalBytes', 'totalSegments', 'completedSegments', 'bytesPerSecond', 'etaSeconds',
@@ -63,6 +64,8 @@ class Host:
         self.condition = threading.Condition(self.lock)
         self.jobs = {}
         self.current = None
+        self.probe_thread = None
+        self.probe_tree = None
         self.closing = False
         self.preference = {'concurrency': 64, 'concurrencyRevision': 0}
         self.server = ArtifactServer()
@@ -229,13 +232,71 @@ class Host:
                 pass
         return {'success': True}
 
+    def probe_bilibili(self, request_id, payload):
+        if set(payload) - {'site', 'url', 'page', 'videoId'} or payload.get('site') != 'bilibili':
+            raise ValueError('仅支持匿名检查B站普通投稿')
+        identity = job_video(payload)
+        if payload.get('videoId', identity['videoId']) != identity['videoId']:
+            raise ValueError('视频编号与地址不一致')
+        with self.lock:
+            if self.closing or self.probe_thread:
+                return {'success': True, **identity, 'readiness': 'unknown', 'authRequired': False,
+                        'reason': '内核正在检查其他来源，请稍后重试。'}
+            self.probe_thread = threading.Thread(target=self.run_probe, args=(request_id, identity),
+                                                 name='source-check', daemon=True)
+            self.probe_thread.start()
+        # The reader can immediately handle cancel/status while this RPC is pending.
+        return None
+
+    def run_probe(self, request_id, identity):
+        result = {'readiness': 'unknown', 'authRequired': False, 'reason': '本地内核暂时无法完成来源检查。'}
+        tree = process = None
+        try:
+            with self.lock:
+                if self.closing:
+                    return
+                command = [self.config['python'], '-B', '-X', 'utf8', str(Path(__file__).with_name('probe.py')),
+                           self.config['_config_path'], identity['url']]
+                process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                           stderr=subprocess.DEVNULL, **ProcessTree.popen_options())
+                tree = self.probe_tree = ProcessTree(process)
+            data, _ = process.communicate(timeout=PROBE_TIMEOUT)
+            if process.returncode == 0 and len(data) < 4096:
+                checked = json.loads(data)
+                if (isinstance(checked, dict) and checked.get('readiness') in ('ready', 'unknown', 'unavailable')
+                        and isinstance(checked.get('reason'), str) and type(checked.get('authRequired')) is bool):
+                    result = {key: checked[key] for key in ('readiness', 'reason', 'authRequired')}
+                    if isinstance(checked.get('qualityLabel'), str):
+                        result['qualityLabel'] = checked['qualityLabel'][:40]
+        except subprocess.TimeoutExpired:
+            result['reason'] = '来源检查超时，请稍后重试。'
+        except (OSError, ValueError, KeyError):
+            pass
+        finally:
+            if tree:
+                if process.poll() is None:
+                    tree.terminate()
+                tree.close()
+            if process and process.stdout:
+                process.stdout.close()
+            with self.lock:
+                self.probe_tree = self.probe_thread = None
+                closing = self.closing
+            if not closing:
+                try:
+                    self.output({'requestId': request_id, 'success': True, **identity, **result})
+                except (OSError, BrokenPipeError):
+                    pass
+
     def dispatch(self, request):
         action, payload = request.get('action'), request.get('payload', {})
         if not isinstance(payload, dict):
             raise ValueError('请求参数无效')
         if action == 'ping':
             return {'success': True, 'version': VERSION, 'ytDlpVersion': YTDLP_VERSION,
-                    'capabilities': {'youtube': True, 'bilibili': True, 'liveFragmentConcurrency': True, 'browserSave': True}}
+                    'capabilities': {'youtube': True, 'bilibili': True, 'bilibiliProbe': True,
+                                     'liveFragmentConcurrency': True, 'browserSave': True}}
+        if action == 'probeBilibili': return self.probe_bilibili(request['requestId'], payload)
         if action == 'start': return self.start(payload)
         if action == 'setConcurrency': return self.set_concurrency(payload)
         if action == 'cancel': return self.cancel(payload)
@@ -369,8 +430,13 @@ class Host:
             self.closing = True
             self.condition.notify_all()
             trees = [job['_tree'] for job in self.jobs.values() if job.get('_tree')]
+            if self.probe_tree:
+                trees.append(self.probe_tree)
+            probe_thread = self.probe_thread
         for tree in trees:
             tree.terminate()
+        if probe_thread:
+            probe_thread.join(timeout=5)
         self.runner.join(timeout=15)
         with self.lock:
             for job in self.jobs.values():
@@ -433,7 +499,8 @@ def main():
             except (ValueError, OSError) as error:
                 # Boundary errors are our own messages, never upstream URLs.
                 response = {'success': False, 'error': str(error)[:500]}
-            output({'requestId': request_id, **response})
+            if response is not None:
+                output({'requestId': request_id, **response})
     finally:
         if host: host.close()
         if mutex: kernel.CloseHandle(mutex)

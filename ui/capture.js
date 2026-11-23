@@ -4,9 +4,9 @@
     const { phase, playback } = capture;
     if (phase === "found") {
       const playbackLabel = playback.playing ? "正在播放" : playback.observed ? "已播放" : playback.hasVideo && !playback.uncertain ? "尚未播放" : "播放状态未确认";
-      return { state: "ready", status: `已发现 ${mediaCount} 个来源 · ${playbackLabel}` };
+      return { state: "found", status: `已发现 ${mediaCount} 个来源 · ${playbackLabel}` };
     }
-    if (phase === "waiting") return { state: "waiting", status: "等待播放 · 请先在网页点击播放", title: "点击播放，开始识别", description: "已找到播放器，尚未观察到播放。请先在网页点击播放按钮。", hint: "出现视频来源后，即可在这里下载。" };
+    if (phase === "waiting") return { state: "waiting", status: "等待播放 · 请先在网页点击播放", title: "点击播放，开始识别", description: "已找到播放器，尚未观察到播放。请先在网页点击播放按钮。", hint: "找到视频来源后，可以在这里查看下载状态。" };
     if (phase === "sniffing") return { state: "sniffing", status: "已播放 · 正在识别视频来源…", title: "正在识别视频来源", description: capture.chunkCount ? "已检测到分段请求，正在等待可下载的播放清单。" : "已确认视频开始播放，正在查看播放器发出的视频请求。", hint: "若暂未找到来源，会在约 10 秒后显示结果。" };
     if (phase === "no-source") return { state: "no-source", status: "已播放 · 暂未识别到可下载来源", title: "这次还没有找到来源", description: "已观察到播放，但暂未找到可下载的视频地址。", hint: "可切换播放线路，或刷新网页后重新播放。" };
     if (phase === "no-video") return { state: "no-video", status: "暂未检测到播放器", title: "当前网页还没有播放器", description: "请打开视频播放页面，或等待网页加载播放器。", hint: "下载任务仍可在右侧页签查看。" };

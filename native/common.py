@@ -8,7 +8,7 @@ import unicodedata
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = '2.4.3'
+VERSION = '2.4.4'
 YTDLP_VERSION = '2026.10.26'
 MAX_CONCURRENCY = 375
 IDENTIFIER = re.compile(r'^[A-Za-z0-9_-]{1,128}$')

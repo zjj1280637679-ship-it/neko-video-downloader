@@ -3,9 +3,14 @@
   'use strict';
   if (!globalThis.NekoJobState && typeof importScripts === 'function') importScripts('engine/job-state.js');
   if (!globalThis.NekoNative && typeof importScripts === 'function') importScripts('engine/native-client.js');
+  if (!globalThis.NekoSourceReadiness && typeof importScripts === 'function') importScripts('engine/source-readiness.js');
   const jobState = globalThis.NekoJobState;
   const sites = globalThis.NekoSites;
   const native = globalThis.NekoNative?.createClient(chrome.runtime);
+  const readiness = globalThis.NekoSourceReadiness?.createBroker({
+    parse: value => sites.parse(value), getTab: id => chrome.tabs.get(id),
+    probe: payload => nativeRequest('probeBilibili', payload)
+  });
   const isNative = job => sites?.isNativeJob(job) === true;
   const JOBS_KEY = 'neko_jobs_v1';
   const SETTINGS_KEY = 'neko_settings_v1';
@@ -83,6 +88,9 @@
     if (jobs.get(job.id) !== job || removing.has(job.id)) return job;
     if (changes.state && changes.state !== 'downloading') changes = { ...changes, etaSeconds: null, etaBasis: 'unknown' };
     if (Object.entries(changes).every(([key, value]) => job[key] === value)) return job;
+    if (changes.state === 'interrupted' && job.state !== 'interrupted' && job.site === 'bilibili') {
+      readiness.invalidate(job.url);
+    }
     Object.assign(job, changes, { updatedAt: Date.now() });
     const write = persist();
     pendingWrites.set(job, write);
@@ -546,6 +554,16 @@
     const useNative = Boolean(identity);
     const useSession = message.useSiteSession === true || message.useYouTubeSession === true;
     if (identity) url = new URL(identity.url);
+    try {
+      if (message.requireReady === true) {
+        const evidence = await readiness.check({ url: url.href, tabId: message.tabId });
+        if (evidence.state !== 'ready') throw new Error(evidence.reason || '当前来源尚未验证就绪');
+      } else if (message.requireCurrentSource === true) {
+        await readiness.confirmCurrent(message);
+      }
+    } catch (error) {
+      return { success: false, error: error.message, readinessExpired: true };
+    }
     const pref = await settings();
     const duplicate = activeJobForUrl(url.href);
     if (duplicate) return { success: true, job: duplicate };
@@ -567,6 +585,7 @@
         if (job.cancelRequested) { update(job, { state: 'cancelled' }); return { success: true, job: { ...job } }; }
         const latest = await settings();
         update(job, { ...latest }); await pendingWrites.get(job);
+        if (message.requireCurrentSource === true) await readiness.confirmCurrent(message);
         const cookies = useSession ? await readSiteSession(site) : undefined;
         if (job.cancelRequested) { update(job, { state: 'cancelled' }); return { success: true, job: { ...job } }; }
         nativeDispatched = true;
@@ -735,7 +754,7 @@
   }
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || message.target === 'neko-offscreen') return;
-    const publicActions = ['startDownload', 'retryJob', 'discardJob', 'removeJob', 'getJobs', 'cancelJob', 'showJob', 'getSettings', 'saveSettings'];
+    const publicActions = ['probeSource', 'startDownload', 'retryJob', 'discardJob', 'removeJob', 'getJobs', 'cancelJob', 'showJob', 'getSettings', 'saveSettings'];
     const privateActions = ['jobProgress', 'saveBlob', 'getChromeDownload', 'cancelChromeDownload'];
     const isPublic = publicActions.includes(message.action);
     const isPrivate = message.target === 'neko-background' && privateActions.includes(message.action);
@@ -744,6 +763,7 @@
       sendResponse({ success: false, error: '请求来源未授权' }); return;
     }
     (async () => {
+      if (message.action === 'probeSource') return readiness.check(message);
       await ready;
       if (message.action === 'getSettings') return { success: true, settings: normalizeSettings(await settings()) };
       if (message.action === 'saveSettings') return saveSettings(message.settings);

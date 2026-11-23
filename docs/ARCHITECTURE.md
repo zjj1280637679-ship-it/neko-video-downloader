@@ -20,6 +20,7 @@
 | `ui/format.js`、`ui/capture.js`、`ui/explain.js` | 事实 → 展示文案 | 纯显示规则、状态解释、脱敏路径 |
 | `popup.js` | UI 事件/任务快照 → 控件更新 | 不执行 HLS，不因关闭弹窗取消任务 |
 | `engine/native-client.js` | 带请求 ID 的消息 ↔ 本机主机 | 相关性、超时、断连和重连；不传视频字节 |
+| `engine/source-readiness.js`、`native/probe.py` | 当前标签页与分 P → 有时限的匿名验证结果 | 合并同一来源的检查，试读选中媒体轨，在切换分 P 或下载中断时防止复用旧结果 |
 | `native/host.py` | 下载命令/子进程事件 → 原生任务快照 | 队列、版本化并发、取消进程树、临时成品交付 |
 | `native/worker.py`、`native/scheduler.py` | YouTube 视频 → 校验后的音视频文件 | 固定版本 yt-dlp 解析与 IO，动态分片准入，FFmpeg 合并及 ffprobe 校验 |
 | `native/artifacts.py` | 任务专属临时文件 → Chrome 下载响应 | 仅本机随机端口、随机令牌、只读 Range；无任意路径/命令接口 |

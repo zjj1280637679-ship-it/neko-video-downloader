@@ -40,7 +40,7 @@ h1 span { display: block; margin-top: 4px; color: var(--muted); font-size: 12px;
 .view-panel { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
 .status-bar, .jobs-hint { display: flex; align-items: center; gap: 8px; flex: none; min-height: 36px; margin: 0 var(--gutter); padding: 7px 0; color: var(--muted); font-size: 12px; }
 .status-radar { width: 8px; height: 8px; border: 2px solid #8c7198; border-radius: 50%; flex: none; }
-.status-bar[data-state="ready"] .status-radar { background: var(--accent); border-color: var(--accent); }
+.status-bar[data-state="found"] .status-radar { border-color: var(--accent); }
 .status-bar[data-state="sniffing"] .status-radar, .status-bar[data-state="checking"] .status-radar { animation: signal-pulse 1.8s ease-in-out infinite; }
 .status-bar[data-state="error"] { color: var(--error); }
 .status-bar[data-state="error"] .status-radar { background: var(--error); border-color: var(--error); }
@@ -65,6 +65,10 @@ h1 span { display: block; margin-top: 4px; color: var(--muted); font-size: 12px;
 .btn-secondary { color: var(--accent); background: #fbf6fd; border-color: #d8c5e3; }
 .btn-secondary:hover:not(:disabled) { background: var(--accent-soft); }
 .card-state { margin-top: 7px; color: var(--muted); font-size: 11px; }
+.media-card[data-readiness="ready"] .card-state { color: var(--success); }
+.media-card[data-readiness="unavailable"] .card-state, .media-card[data-readiness="unknown"] .card-state { color: var(--error); overflow-wrap: anywhere; }
+.source-retry { flex: 1; }
+.source-session:not([hidden]) + .source-retry { flex: none; }
 .card-state:empty { display: none; }
 .job-explain { border-top: 1px solid var(--line); margin-top: 11px; padding-top: 8px; }
 .explain-summary { min-height: 25px; padding: 3px 0; cursor: pointer; color: var(--muted); font-size: 12px; list-style-position: inside; }

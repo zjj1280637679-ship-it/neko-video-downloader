@@ -22,6 +22,27 @@ from scheduler import Cancelled, ordered_dynamic_map
 
 MAX_FRAGMENT_BYTES = 128 * 1024 * 1024
 PROGRESS_CONTROL_INTERVAL = 0.05
+VIDEO_FORMAT = 'bv[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4][vcodec^=avc1]/bv+ba/b'
+
+
+def extraction_params(config, site):
+    params = {
+        'logger': QuietLogger(), 'quiet': True, 'no_warnings': True, 'noprogress': True,
+        'noplaylist': True, 'ignoreerrors': False, 'allow_unplayable_formats': False,
+        # A Bilibili source may explicitly report that it is a silent video.
+        'format': VIDEO_FORMAT + ('/bv' if site == 'bilibili' else ''),
+        'ffmpeg_location': config['ffmpeg'], 'js_runtimes': {'node': {'path': config['node']}},
+    }
+    if isinstance(config.get('extractor_args'), dict):
+        params['extractor_args'] = config['extractor_args']
+    return params
+
+
+def validate_vod(info, *, incomplete=False):
+    if info.get('is_live') or info.get('live_status') in ('is_live', 'is_upcoming'):
+        raise ValueError('Live videos are not supported')
+    if info.get('has_drm') is True:
+        raise ValueError('DRM protected video')
 
 
 class Progress:
@@ -283,10 +304,7 @@ def run(config, request, control_path, cookies=None):
     metadata = {}
 
     def filter_video(info, *, incomplete=False):
-        if info.get('is_live') or info.get('live_status') in ('is_live', 'is_upcoming'):
-            raise ValueError('Live videos are not supported')
-        if info.get('has_drm') is True:
-            raise ValueError('DRM protected video')
+        validate_vod(info)
         if info.get('title'):
             metadata['title'] = info['title']
         if info.get('duration'):
@@ -300,22 +318,15 @@ def run(config, request, control_path, cookies=None):
             progress.emit(force=True, state='muxing', phase='muxing')
 
     params = {
-        'logger': QuietLogger(), 'quiet': True, 'no_warnings': True, 'noprogress': True,
-        'noplaylist': True, 'ignoreerrors': False, 'skip_unavailable_fragments': False,
+        **extraction_params(config, site), 'skip_unavailable_fragments': False,
         'continuedl': False, 'overwrites': True, 'retries': 2, 'fragment_retries': 2,
         '_no_ytdl_file': True,  # First version does not claim cross-process resume.
         'extractor_retries': 1, 'socket_timeout': 20, 'hls_prefer_native': True,
         'concurrent_fragment_downloads': 1,  # Scheduling is handled by DynamicFragments.
-        'format': 'bv[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4][vcodec^=avc1]/bv+ba/b',
         'merge_output_format': 'mp4/mkv', 'outtmpl': str(output / 'video.%(ext)s'),
-        'ffmpeg_location': config['ffmpeg'], 'js_runtimes': {'node': {'path': config['node']}},
         'progress_hooks': [progress.download_hook], 'postprocessor_hooks': [postprocessor],
-        'match_filter': filter_video, 'allow_unplayable_formats': False,
+        'match_filter': filter_video,
     }
-    # Optional provider arguments are fixed installation configuration, never
-    # arbitrary arguments received from a webpage or extension message.
-    if isinstance(config.get('extractor_args'), dict):
-        params['extractor_args'] = config['extractor_args']
     bili_extractor = None
     downloader = make_downloader(progress)
     if site == 'bilibili':
@@ -323,9 +334,6 @@ def run(config, request, control_path, cookies=None):
         bili_extractor = CurrentBilibiliIE(identity)
         downloader = with_bilibili_tracks(downloader)
         url = extraction_url(identity)
-        # Explicitly silent source formats need the video-only fallback. Output
-        # audio remains mandatory unless raw source metadata proves it is absent.
-        params['format'] += '/bv'
     with downloader(params) as ydl:
         if bili_extractor:
             ydl.add_info_extractor(bili_extractor)

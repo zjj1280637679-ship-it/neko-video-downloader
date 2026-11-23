@@ -17,7 +17,7 @@ async function setup(options = {}) {
     settings: options.settings || { concurrency: 64 }, deferJobs: Boolean(options.deferInitialJobs), deferMedia: false, recoveryError: options.recoveryError || null,
     settingsError: null, getSettingsError: options.getSettingsError || null, liveApplied: options.liveApplied, liveWarning: options.liveWarning, nextJob: 1, now: 1000,
     capturePhase: options.capturePhase || (options.media?.length ? 'found' : 'checking'), playback: options.playback || {}, chunkCount: 0,
-    permissionGranted: options.permissionGranted === true
+    permissionGranted: options.permissionGranted === true, probeResult: options.probeResult || { state: 'ready' }
   };
   const document = { hidden: false, activeElement: null, addEventListener(name, fn) { if (name === 'DOMContentLoaded') ready = fn; else documentListeners.set(name, fn); }, getElementById(id) { assert.ok(elements.has(id), `Missing HTML element ${id}`); return elements.get(id); } };
   class Element {
@@ -89,6 +89,12 @@ async function setup(options = {}) {
             if (!state.deferJobs) return callback(snapshot);
             const waiting = pendingActions.get('getJobs') || []; waiting.push(() => callback(snapshot)); pendingActions.set('getJobs', waiting); return;
           }
+          case 'probeSource': {
+            const snapshot = structuredClone({ success: true, checkedAt: state.now, ttlMs: 60000, ...state.probeResult });
+            if (!options.deferredActions?.includes('probeSource')) return callback(snapshot);
+            const waiting = pendingActions.get('probeSource') || [];
+            waiting.push(() => callback(snapshot)); pendingActions.set('probeSource', waiting); return;
+          }
           case 'getSettings': {
             const finish = () => callback(state.getSettingsError ? { success: false, error: state.getSettingsError } : { success: true, settings: state.settings });
             if (!options.deferredActions?.includes('getSettings')) return finish();
@@ -106,6 +112,7 @@ async function setup(options = {}) {
             return;
           }
           case 'startDownload': {
+            if (options.startFailure) return callback({ success: false, ...options.startFailure });
             const job = { ...message, id: `job-${state.nextJob++}`, state: 'queued', bytesReceived: 0 };
             state.jobs.unshift(job); return callback({ success: true, job });
           }
@@ -162,6 +169,7 @@ async function setup(options = {}) {
   };
 }
 const media = (isM3U8 = true) => ({ url: `https://cdn.test/video.${isM3U8 ? 'm3u8' : 'mp4'}`, suggestedFilename: `fixture.${isM3U8 ? 'm3u8' : 'mp4'}`, isM3U8, ext: isM3U8 ? 'm3u8' : 'mp4' });
+const biliMedia = page => ({ engine: 'bilibili-native', site: 'bilibili', page, url: `https://www.bilibili.com/video/BV13x41117TL/?p=${page}`, suggestedFilename: `P${page}.mp4` });
 
 test('both HLS and direct video start background jobs without opening a page', async () => {
   for (const isM3U8 of [true, false]) {
@@ -275,9 +283,119 @@ test('Bilibili source starts only its current part anonymously with the proper e
   await ui.click(ui.elements.get('mediaList').querySelector('.btn-primary'));
   const request = ui.messages.find(message => message.action === 'startDownload');
   assert.equal(request.engine, 'bilibili-native'); assert.equal(request.site, 'bilibili'); assert.equal(request.page, 3);
+  assert.equal(request.requireReady, true); assert.equal(request.tabId, 7);
   assert.equal(request.isM3U8, false); assert.equal(request.url, 'https://www.bilibili.com/video/BV13x41117TL/?p=3');
   assert.equal('useSiteSession' in request, false); assert.equal('useYouTubeSession' in request, false);
   assert.equal(ui.permissionCalls.length, 0, 'Existing cookie access never silently authenticates a fresh task');
+});
+
+test('discovery, checking and verified readiness are distinct, and a late part cannot unlock the current one', async () => {
+  const ui = await setup({ media: [biliMedia(1), media()], probeResult: { state: 'ready', qualityLabel: '1080p' }, deferredActions: ['probeSource'] });
+  const list = ui.elements.get('mediaList'), header = ui.elements.get('statusText');
+  const [p1, direct] = list.querySelectorAll('.media-card');
+  const probes = () => ui.messages.filter(message => message.action === 'probeSource');
+  assert.equal(p1.dataset.readiness, 'checking'); assert.equal(p1.querySelector('.btn-primary').disabled, true);
+  assert.match(header.textContent, /已发现 2 个来源.*已验证可下载 0 个/);
+  assert.equal(direct.dataset.readiness, 'detected'); assert.match(direct.querySelector('.card-state').textContent, /下载时检查/);
+  assert.equal(direct.querySelector('.btn-primary').disabled, false);
+  await ui.click(p1.querySelector('.btn-primary')); await ui.advance(4000); await ui.updateJobs();
+  assert.equal(probes().length, 1); assert.equal(ui.messages.some(message => message.action === 'startDownload'), false);
+  ui.state.media = [biliMedia(2)]; await ui.updateMedia();
+  const p2 = list.querySelector('.media-card'); assert.notEqual(p2, p1);
+  assert.deepEqual(probes().map(message => [message.tabId, message.url]), [[7, biliMedia(1).url], [7, biliMedia(2).url]]);
+  await ui.finishAction('probeSource');
+  assert.equal(p2.dataset.readiness, 'checking'); assert.equal(p2.querySelector('.btn-primary').disabled, true);
+  await ui.finishAction('probeSource');
+  assert.equal(p2.dataset.readiness, 'ready'); assert.equal(p2.querySelector('.btn-primary').disabled, false);
+  assert.match(p2.querySelector('.card-state').textContent, /已就绪.*1080p/);
+  assert.match(header.textContent, /已验证可下载 1 个/);
+  ui.state.now += 60000;
+  await ui.click(p2.querySelector('.btn-primary'));
+  assert.equal(p2.dataset.readiness, 'expired'); assert.equal(p2.querySelector('.btn-primary').disabled, true);
+  assert.equal(ui.messages.some(message => message.action === 'startDownload'), false);
+  assert.equal(probes().length, 2);
+  await ui.click(p2.querySelector('.source-retry')); assert.equal(probes().at(-1).force, true);
+  await ui.finishAction('probeSource'); assert.equal(p2.dataset.readiness, 'ready');
+});
+
+test('a background freshness rejection withdraws an apparently valid source immediately', async () => {
+  const ui = await setup({ media: [biliMedia(1)], startFailure: { readinessExpired: true, error: '请重新验证来源' } });
+  const card = ui.elements.get('mediaList').querySelector('.media-card');
+  assert.equal(card.dataset.readiness, 'ready');
+  await ui.click(card.querySelector('.btn-primary'));
+  assert.equal(card.dataset.readiness, 'expired'); assert.equal(card.querySelector('.btn-primary').disabled, true);
+  assert.equal(card.querySelector('.source-retry').hidden, false);
+  assert.match(ui.elements.get('statusText').textContent, /已验证可下载 0 个/);
+  assert.equal(ui.state.jobs.length, 0);
+});
+
+test('only a newer failure for this exact part withdraws a ready result, and polling cannot restore it', async () => {
+  const interrupted = { ...biliMedia(1), id: 'failed', state: 'interrupted', updatedAt: 900 };
+  const ui = await setup({ media: [biliMedia(1)], jobs: [interrupted] });
+  const card = ui.elements.get('mediaList').querySelector('.media-card');
+  assert.equal(card.dataset.readiness, 'ready', 'A fresh check supersedes an old failure');
+  ui.state.now += 100;
+  ui.state.jobs.unshift({ ...interrupted, ...biliMedia(2), id: 'other-part', updatedAt: ui.state.now });
+  await ui.updateJobs(); assert.equal(card.dataset.readiness, 'ready');
+  interrupted.updatedAt = ui.state.now; await ui.updateJobs();
+  assert.equal(card.dataset.readiness, 'recheck'); assert.match(card.querySelector('.card-state').textContent, /上次下载未完成/);
+  assert.equal(card.querySelector('.btn-primary').disabled, true);
+  await ui.advance(10000); await ui.updateJobs();
+  assert.equal(ui.messages.filter(message => message.action === 'probeSource').length, 1);
+  await ui.click(card.querySelector('.source-retry')); assert.equal(card.dataset.readiness, 'ready');
+  await ui.updateJobs(); assert.equal(card.dataset.readiness, 'ready', 'The same old failure cannot cancel a successful recheck');
+  await ui.click(card.querySelector('.btn-primary')); assert.equal(card.dataset.readiness, 'recheck');
+  assert.match(ui.elements.get('statusText').textContent, /已验证可下载 0 个/);
+  Object.assign(ui.state.jobs[0], { state: 'interrupted', updatedAt: ui.state.now }); await ui.updateJobs();
+  assert.equal(card.querySelector('.btn-primary').disabled, true); assert.equal(card.querySelector('.source-retry').hidden, false);
+  assert.equal(ui.messages.filter(message => message.action === 'probeSource').length, 2);
+});
+
+test('an in-flight proof cannot re-arm a source after its transfer has already started and failed', async () => {
+  const ui = await setup({ media: [biliMedia(1)], deferredActions: ['probeSource'] });
+  const card = ui.elements.get('mediaList').querySelector('.media-card');
+  ui.state.jobs.push({ ...biliMedia(1), id: 'transfer', state: 'downloading', updatedAt: ui.state.now });
+  await ui.updateJobs(); assert.equal(card.dataset.readiness, 'recheck');
+  Object.assign(ui.state.jobs[0], { state: 'interrupted', updatedAt: ui.state.now }); await ui.updateJobs();
+  await ui.finishAction('probeSource');
+  assert.equal(card.dataset.readiness, 'recheck'); assert.equal(card.querySelector('.btn-primary').disabled, true);
+});
+
+test('failed and unconfirmed probes stay retryable without polling or starting idle tasks', async () => {
+  const ui = await setup({ media: [biliMedia(1)], probeResult: { state: 'unknown', reason: '本机内核未响应' } });
+  const card = ui.elements.get('mediaList').querySelector('.media-card'), download = card.querySelector('.btn-primary');
+  assert.match(card.querySelector('.card-state').textContent, /暂时无法验证.*本机内核未响应/);
+  assert.equal(download.disabled, true); assert.equal(card.querySelector('.source-session').hidden, true);
+  await ui.advance(90000); await ui.updateMedia(); await ui.updateJobs();
+  assert.equal(ui.messages.filter(message => message.action === 'probeSource').length, 1);
+  ui.state.probeResult = { state: 'unavailable', reason: '视频流暂不可用' };
+  await ui.click(card.querySelector('.source-retry'));
+  assert.equal(download.disabled, true); assert.match(card.querySelector('.card-state').textContent, /未就绪.*视频流暂不可用/);
+  assert.equal(ui.messages.some(message => message.action === 'startDownload'), false);
+  assert.deepEqual(ui.permissionCalls, []);
+});
+
+test('a login-required source only starts after an explicit grant for that exact source', async () => {
+  const probeResult = { state: 'unavailable', authRequired: true, reason: '需要登录' };
+  for (const outcome of ['denied', 'granted', 'new-part']) {
+    const ui = await setup({ media: [biliMedia(1)], probeResult, permissionGranted: outcome !== 'denied', deferPermission: true });
+    const card = ui.elements.get('mediaList').querySelector('.media-card');
+    const button = card.querySelector('.source-session');
+    assert.equal(button.hidden, false); assert.equal(card.querySelector('.btn-primary').disabled, true);
+    assert.match(card.querySelector('.card-state').textContent, /仅本次下载/);
+    assert.deepEqual(ui.permissionCalls, []);
+    const click = ui.click(button); await tick();
+    assert.deepEqual(ui.permissionCalls, [{ permissions: ['cookies'] }]);
+    assert.equal(ui.messages.some(message => message.action === 'startDownload'), false);
+    if (outcome === 'new-part') { ui.state.media = [biliMedia(2)]; await ui.updateMedia(); }
+    await ui.finishAction('permission'); await click;
+    const starts = ui.messages.filter(message => message.action === 'startDownload');
+    assert.equal(starts.length, outcome === 'granted' ? 1 : 0);
+    if (starts.length) {
+      assert.equal(starts[0].useSiteSession, true); assert.equal(starts[0].page, 1); assert.equal(starts[0].requireReady, undefined);
+      assert.equal(starts[0].requireCurrentSource, true); assert.equal(starts[0].tabId, 7);
+    }
+  }
 });
 
 test('task metrics show actual engine-supplied quality and never infer it from the website', async () => {

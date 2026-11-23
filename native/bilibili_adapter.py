@@ -20,6 +20,26 @@ def extraction_url(identity):
     return f'https://www.bilibili.com/zh-Hans/video/{identity["videoId"]}/?p={identity["page"]}'
 
 
+def track_headers(ydl, info):
+    headers = HTTPHeaderDict(info['http_headers'] if info.get('http_headers') is not None else ydl._calc_headers(info))
+    if info.get('yangmo_bilibili_track'):
+        headers.setdefault('Range', 'bytes=0-')
+    return headers
+
+
+def validate_track_range(response, request_range, expected_size):
+    requested = re.fullmatch(r'bytes=(\d+)-', request_range or '', re.I)
+    received = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', response.headers.get('Content-Range', ''), re.I)
+    if requested and received:
+        start, end, total = map(int, received.groups())
+        length = response.headers.get('Content-Length')
+        if (start == int(requested[1]) and start <= end == total - 1
+                and (length is None or length == str(total - start))
+                and (not expected_size or expected_size == total)):
+            return total
+    raise ValueError('Bilibili incomplete HTTP track')
+
+
 def with_bilibili_tracks(base):
     """Keep whole-track byte ranges out of the fragment scheduler."""
     class BilibiliDownloader(base):
@@ -28,10 +48,9 @@ def with_bilibili_tracks(base):
         def dl(self, name, info, subtitle=False, test=False):
             if test or subtitle or not info.get('yangmo_bilibili_track'):
                 return super().dl(name, info, subtitle=subtitle, test=test)
-            headers = HTTPHeaderDict(info['http_headers'] if info.get('http_headers') is not None else self._calc_headers(info))
-            if 'Range' in headers and headers['Range'] != 'bytes=0-':
+            headers = track_headers(self, info)
+            if headers['Range'] != 'bytes=0-':
                 return super().dl(name, info, subtitle=subtitle, test=test)
-            headers['Range'] = 'bytes=0-'
             self._track_url = info['url']
             self._track_size = info.get('filesize')
             try:
@@ -45,18 +64,11 @@ def with_bilibili_tracks(base):
         def urlopen(self, request):
             response = super().urlopen(request)
             if self._track_url and getattr(request, 'url', None) == self._track_url and response.status == 206:
-                requested = re.fullmatch(r'bytes=(\d+)-', request.headers.get('Range', ''), re.I)
-                received = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', response.headers.get('Content-Range', ''), re.I)
-                if requested and received:
-                    start, end, total = map(int, received.groups())
-                    length = response.headers.get('Content-Length')
-                    if (start == int(requested[1]) and start <= end == total - 1
-                            and (length is None or length == str(total - start))
-                            and (not self._track_size or self._track_size == total)):
-                        self._track_size = total
-                        return response
-                response.close()
-                raise ValueError('Bilibili incomplete HTTP track')
+                try:
+                    self._track_size = validate_track_range(response, request.headers.get('Range'), self._track_size)
+                except ValueError:
+                    response.close()
+                    raise
             return response
 
     return BilibiliDownloader
