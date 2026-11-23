@@ -62,6 +62,12 @@ h1 span { display: block; margin-top: 4px; color: var(--muted); font-size: 12px;
 .btn, .job-button { display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 6px 12px; border: 1px solid transparent; border-radius: 8px; font-size: 12px; font-weight: 600; }
 .btn-primary { flex: 1; background: linear-gradient(105deg, #70378d, #80418f 64%, #904274); color: white; }
 .btn-primary:hover:not(:disabled) { background: #5c2f86; }
+.source-download { gap: 7px; }
+.source-download[aria-busy="true"] { opacity: 1; color: #62506d; background: #f5eff8; border: 1px dashed #ae96bb; cursor: progress; }
+.source-download[aria-busy="true"]::before { content: ""; width: 14px; height: 14px; box-sizing: border-box; border: 2px solid #cebcd6; border-top-color: currentColor; border-radius: 50%; animation: source-check-spin 1s linear infinite; }
+@keyframes source-check-spin { to { transform: rotate(1turn); } }
+.media-card[data-readiness="ready"] .source-download:enabled { font-weight: 700; }
+.media-card[data-readiness="ready"] .source-download:enabled::before { content: "↓" / ""; font-size: 16px; line-height: 1; }
 .btn-secondary { color: var(--accent); background: #fbf6fd; border-color: #d8c5e3; }
 .btn-secondary:hover:not(:disabled) { background: var(--accent-soft); }
 .card-state { margin-top: 7px; color: var(--muted); font-size: 11px; }
@@ -175,6 +181,7 @@ h1 span { display: block; margin-top: 4px; color: var(--muted); font-size: 12px;
   .media-list, .job-list { flex: none; overflow: visible; }
 }
 @media (forced-colors: active) {
+  .source-download[aria-busy="true"]::before { border-color: GrayText; border-top-color: transparent; }
   .view-tab[aria-selected="true"] { border: 2px solid Highlight; }
   .job-progress { border: 1px solid CanvasText; }
   .job-progress-fill { forced-color-adjust: none; background: Highlight !important; }

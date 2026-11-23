@@ -151,7 +151,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     const badge = node("span", "badge-tag"), number = node("span", "source-number"), size = node("span", "media-size");
     identity.append(badge, number); header.append(identity, size);
     const title = node("h2", "file-name"), host = node("div", "source-host");
-    const actions = node("div", "card-actions"), download = node("button", "btn btn-primary"), copy = node("button", "btn btn-secondary", "复制链接"), state = node("div", "card-state");
+    const actions = node("div", "card-actions"), download = node("button", "btn btn-primary source-download"), copy = node("button", "btn btn-secondary", "复制链接"), state = node("div", "card-state");
     const retry = node("button", "btn btn-secondary source-retry", "重新验证");
     const session = node("button", "btn btn-primary source-session", "使用 B站登录状态下载");
     state.setAttribute("role", "status");
@@ -242,7 +242,15 @@ document.addEventListener("DOMContentLoaded", async () => {
       entry.retry.hidden = !retryable;
       entry.session.hidden = !(retryable && entry.probe.authRequired);
       entry.retry.disabled = entry.session.disabled = entry.starting;
-      setText(entry.download, job ? stateLabels[job.state] : "↓ 下载视频");
+      let label = "↓ 下载视频";
+      if (job) label = stateLabels[job.state];
+      else if (entry.starting) label = "正在创建任务…";
+      else if (state === "checking") label = "正在验证…";
+      else if (state === "ready") label = "立即下载";
+      else if (bili) label = "等待验证";
+      const busy = !job && !retryable && (entry.starting || state === "checking");
+      entry.download.setAttribute("aria-busy", String(busy));
+      setText(entry.download, label);
       let status = sourceLabels[state];
       if (state === "ready" && entry.probe.quality) status += " · " + entry.probe.quality;
       if (retryable && entry.probe.reason) status += " · " + entry.probe.reason;

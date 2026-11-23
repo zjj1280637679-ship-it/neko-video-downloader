@@ -113,8 +113,13 @@ async function setup(options = {}) {
           }
           case 'startDownload': {
             if (options.startFailure) return callback({ success: false, ...options.startFailure });
-            const job = { ...message, id: `job-${state.nextJob++}`, state: 'queued', bytesReceived: 0 };
-            state.jobs.unshift(job); return callback({ success: true, job });
+            const finish = () => {
+              const job = { ...message, id: `job-${state.nextJob++}`, state: 'queued', bytesReceived: 0 };
+              state.jobs.unshift(job); callback({ success: true, job });
+            };
+            if (options.deferredActions?.includes('startDownload')) pendingActions.set('startDownload', finish);
+            else finish();
+            return;
           }
           case 'cancelJob': case 'retryJob': case 'discardJob': case 'removeJob': {
             const finish = () => {
@@ -295,6 +300,8 @@ test('discovery, checking and verified readiness are distinct, and a late part c
   const [p1, direct] = list.querySelectorAll('.media-card');
   const probes = () => ui.messages.filter(message => message.action === 'probeSource');
   assert.equal(p1.dataset.readiness, 'checking'); assert.equal(p1.querySelector('.btn-primary').disabled, true);
+  assert.equal(p1.querySelector('.source-download').textContent, '正在验证…');
+  assert.equal(p1.querySelector('.source-download').getAttribute('aria-busy'), 'true');
   assert.match(header.textContent, /已发现 2 个来源.*已验证可下载 0 个/);
   assert.equal(direct.dataset.readiness, 'detected'); assert.match(direct.querySelector('.card-state').textContent, /下载时检查/);
   assert.equal(direct.querySelector('.btn-primary').disabled, false);
@@ -307,6 +314,8 @@ test('discovery, checking and verified readiness are distinct, and a late part c
   assert.equal(p2.dataset.readiness, 'checking'); assert.equal(p2.querySelector('.btn-primary').disabled, true);
   await ui.finishAction('probeSource');
   assert.equal(p2.dataset.readiness, 'ready'); assert.equal(p2.querySelector('.btn-primary').disabled, false);
+  assert.equal(p2.querySelector('.source-download').textContent, '立即下载');
+  assert.equal(p2.querySelector('.source-download').getAttribute('aria-busy'), 'false');
   assert.match(p2.querySelector('.card-state').textContent, /已就绪.*1080p/);
   assert.match(header.textContent, /已验证可下载 1 个/);
   ui.state.now += 60000;
@@ -316,6 +325,22 @@ test('discovery, checking and verified readiness are distinct, and a late part c
   assert.equal(probes().length, 2);
   await ui.click(p2.querySelector('.source-retry')); assert.equal(probes().at(-1).force, true);
   await ui.finishAction('probeSource'); assert.equal(p2.dataset.readiness, 'ready');
+});
+
+test('the ready button acknowledges a click until its single task is registered', async () => {
+  const ui = await setup({ media: [biliMedia(1)], deferredActions: ['startDownload'] });
+  const button = ui.elements.get('mediaList').querySelector('.source-download');
+  const firstClick = ui.click(button);
+  await tick();
+  assert.equal(button.disabled, true);
+  assert.equal(button.textContent, '正在创建任务…');
+  assert.equal(button.getAttribute('aria-busy'), 'true');
+  await ui.click(button);
+  assert.equal(ui.messages.filter(message => message.action === 'startDownload').length, 1);
+  await ui.finishAction('startDownload');
+  await firstClick;
+  assert.equal(button.textContent, '等待下载');
+  assert.equal(button.getAttribute('aria-busy'), 'false');
 });
 
 test('a background freshness rejection withdraws an apparently valid source immediately', async () => {
